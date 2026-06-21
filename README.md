@@ -8,7 +8,7 @@ Out of the box, a page reference always shows the page's real title, and there's
 
 ## How to use
 
-1. Put your cursor on a page reference (anywhere on its line).
+1. Select the page reference you want to alias.
 2. Open the Command Palette (`Cmd+P` / `Ctrl+P`) and run **Set alias for reference**.
 3. A small box appears at the reference. Type an alias and press **Enter**.
    - **Change** it later: run the command again — the box is pre-filled with the current alias.
