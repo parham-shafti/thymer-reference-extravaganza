@@ -1,7 +1,7 @@
 // Reference Aliases — v1 (page references)
 //
 // Adds a command-palette command "Set alias for reference" that lets you rename
-// what a reference chip displays. Put your cursor on a page reference, run the
+// what a reference chip displays. Select a page reference, run the
 // command, type an alias (or clear it to revert to the page's real name).
 //
 // An "alias" in Thymer is just the `title` field on a `ref` segment
@@ -121,7 +121,7 @@ class Plugin extends AppPlugin {
         refIdx = refs.reduce((a, b) => (Math.abs(b - hit.segIndex) < Math.abs(a - hit.segIndex) ? b : a), refs[0]);
       }
     }
-    if (refIdx < 0) return "Put your cursor on a reference first.";
+    if (refIdx < 0) return "Select a reference first.";
 
     const seg = segs[refIdx];
     const targetGuid = seg.text && seg.text.guid;
@@ -154,7 +154,7 @@ class Plugin extends AppPlugin {
 
   async _onCommand() {
     const hit = this._detect();
-    if (!hit) return this._toast("Place your cursor on a reference first.");
+    if (!hit) return this._toast("Select a reference first.");
     const r = await this._resolveRef(hit);
     if (typeof r === "string") return this._toast(r);
     this._openPopup(r);
