@@ -1,0 +1,6 @@
+{
+	"ver": 1,
+	"name": "Reference Aliases",
+	"icon": "ti-pencil",
+	"description": "Set an alias on a page reference — change what the reference chip shows without recreating the link. Put your cursor on a reference and run \"Set alias for reference\"."
+}
