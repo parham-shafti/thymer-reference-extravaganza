@@ -17,6 +17,12 @@ Out of the box, a page reference always shows the page's real title, and there's
 
 The popup follows your theme — light or dark — and the input's focus colour matches Thymer's accent.
 
+## Keyboard shortcut
+
+The command is also bound to a keyboard shortcut — by default **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux).
+
+To change it, edit `custom.shortcut` in the plugin's **Configuration** tab and save. Combine keys with `+`; `Mod` means Cmd on macOS and Ctrl elsewhere. Examples: `Mod+Shift+L`, `Ctrl+Alt+A`, `Mod+Shift+R`. (At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
+
 ## Installation
 
 1. In Thymer, open the Command Palette (`Cmd+P` / `Ctrl+P`), run **Plugins**, and click **Create Plugin** under Global Plugins.
@@ -31,7 +37,7 @@ Don't enable Hot Reload — it's a development feature and can leave the plugin 
 
 - An "alias" in Thymer is just the `title` field on a reference segment (`{type:"ref", text:{guid, title?}}`). The plugin reads and writes that field — set it to your alias, or clear it to fall back to the page's name. Nothing else on the line is touched, and the link target never changes.
 - It finds the reference you're on from the editor's current selection when you run the command.
-- **Zero idle cost:** the plugin only does work when you invoke its command — no background observers, polling, or global listeners — so it never affects Thymer's typing or scrolling performance.
+- **Negligible idle cost:** the only always-on code is a single keydown listener for the shortcut, and its first line is a modifier check that returns immediately for every non-matching keystroke — so normal typing pays a single comparison. No observers, no polling, no work on scroll or render.
 
 ## License
 

@@ -2,5 +2,8 @@
 	"ver": 1,
 	"name": "Reference Aliases",
 	"icon": "ti-pencil",
-	"description": "Set an alias on a page reference — change what the reference chip shows without recreating the link. Select a reference and run \"Set alias for reference\"."
+	"description": "Set an alias on a page reference — change what the reference chip shows without recreating the link. Select a reference and run \"Set alias for reference\".",
+	"custom": {
+		"shortcut": "Mod+Shift+A"
+	}
 }

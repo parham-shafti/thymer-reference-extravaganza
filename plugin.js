@@ -1,24 +1,43 @@
-// Reference Aliases — v1 (page references)
+// Reference Aliases — page references
 //
-// Adds a command-palette command "Set alias for reference" that lets you rename
-// what a reference chip displays. Select a page reference, run the
-// command, type an alias (or clear it to revert to the page's real name).
+// Adds a command "Set alias for reference" (in the command palette and on a
+// configurable keyboard shortcut) that lets you rename what a reference chip
+// displays. Select a page reference, run the command, type an alias (or clear
+// it to revert to the page's real name).
 //
 // An "alias" in Thymer is just the `title` field on a `ref` segment
 // ({type:"ref", text:{guid, title?}}). This plugin reads/writes that field.
 //
-// PERFORMANCE: zero idle cost. The plugin does work ONLY when its command is
-// invoked. No MutationObservers, no polling, no requestAnimationFrame loops,
-// no global selection/keydown listeners. When you are not actively aliasing a
-// reference it contributes nothing to Thymer's typing/scroll/render hot paths.
-// The only transient listeners live on the little popup's own <input> and are
-// removed the moment the popup closes.
+// PERFORMANCE: the plugin is idle until you act. Its only always-on cost is a
+// single keydown listener for the shortcut, whose first line is a modifier
+// check that returns immediately for every non-matching keystroke — so normal
+// typing pays one boolean comparison and nothing else. No MutationObservers,
+// no polling, no requestAnimationFrame loops, no work on scroll or render. The
+// shortcut is set in the plugin's Configuration tab (custom.shortcut); default
+// Mod+Shift+A (Cmd on macOS, Ctrl elsewhere).
 
 class Plugin extends AppPlugin {
   // Instance state as class fields (Thymer may call onUnload on an instance
   // whose onLoad never ran — never rely on onLoad to initialise these).
   _cmd = null;
   _popup = null;
+  _hotkey = null;
+  _isMac = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "");
+
+  // The one always-on listener (capture phase). Cheap-first guard: the modifier
+  // checks reject the vast majority of keystrokes (plain typing) on line 1.
+  _handleKeydown = (e) => {
+    const h = this._hotkey;
+    if (!h) return;
+    if (e.metaKey !== h.meta) return;
+    if (e.ctrlKey !== h.ctrl) return;
+    if (e.shiftKey !== h.shift) return;
+    if (e.altKey !== h.alt) return;
+    if (e.code !== h.code && (e.key || "").toLowerCase() !== h.key) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    this._onCommand();
+  };
 
   onLoad() {
     this.ui.injectCSS(`
@@ -62,12 +81,44 @@ class Plugin extends AppPlugin {
       icon: "ti-pencil",
       onSelected: () => { this._onCommand(); },
     });
+
+    // Keyboard shortcut: read the user's combo from config (default Mod+Shift+A).
+    const cfg = (this.getConfiguration && this.getConfiguration()) || {};
+    const shortcutStr = (cfg.custom && cfg.custom.shortcut) || "Mod+Shift+A";
+    this._hotkey = this._parseShortcut(shortcutStr);
+    if (this._hotkey) window.addEventListener("keydown", this._handleKeydown, true);
   }
 
   onUnload() {
+    window.removeEventListener("keydown", this._handleKeydown, true);
+    this._hotkey = null;
     if (this._cmd && this._cmd.remove) this._cmd.remove();
     this._cmd = null;
     this._closePopup();
+  }
+
+  // Parse a shortcut like "Mod+Shift+A" into exact modifier flags + key.
+  // "Mod" = Cmd on macOS, Ctrl elsewhere. Requires at least one of Cmd/Ctrl/Alt
+  // (so a stray config can't hijack plain typing). Returns null if unusable.
+  _parseShortcut(str) {
+    if (!str || typeof str !== "string") return null;
+    const parts = str.split("+").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const h = { meta: false, ctrl: false, shift: false, alt: false, key: null, code: null };
+    for (const p of parts) {
+      if (p === "mod") { if (this._isMac) h.meta = true; else h.ctrl = true; }
+      else if (p === "cmd" || p === "meta" || p === "super" || p === "win") h.meta = true;
+      else if (p === "ctrl" || p === "control") h.ctrl = true;
+      else if (p === "shift") h.shift = true;
+      else if (p === "alt" || p === "option" || p === "opt") h.alt = true;
+      else {
+        h.key = p;
+        if (/^[a-z]$/.test(p)) h.code = "Key" + p.toUpperCase();
+        else if (/^[0-9]$/.test(p)) h.code = "Digit" + p;
+      }
+    }
+    if (!h.key) return null;
+    if (!h.meta && !h.ctrl && !h.alt) return null;
+    return h;
   }
 
   // Read the editor selection from the focus-independent global registry.
