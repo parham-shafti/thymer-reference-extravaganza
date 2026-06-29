@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.0 — 2026-06-29
+
+- New command **Set alias keyboard shortcut** — rebind the shortcut from a small "press your keys" dialog; applies immediately, no JSON or restart.
+- The alias box now opens **right under the reference**, themed (light/dark), rounded, with an accent Save button.
+- The box is **pre-filled with the page's title** (or your current alias) so you can trim it to the part you want; a **×** clears it to type a fresh alias.
+
 ## v1.1.0 — 2026-06-29
 
 - The **Set alias for reference** command now also runs from a keyboard shortcut — default **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux). Change it in the **Configuration** tab via `custom.shortcut` (e.g. `Mod+Shift+L`); `Mod` = Cmd on macOS, Ctrl elsewhere.

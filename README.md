@@ -10,18 +10,19 @@ Out of the box, a page reference always shows the page's real title, and there's
 
 1. Select the page reference you want to alias.
 2. Open the Command Palette (`Cmd+P` / `Ctrl+P`) and run **Set alias for reference**.
-3. A small box appears at the reference. Type an alias and press **Enter**.
-   - **Change** it later: run the command again — the box is pre-filled with the current alias.
-   - **Clear** it: empty the box and press **Enter** — the chip reverts to the page's real name.
-   - **Esc** cancels without changing anything.
+3. A small box opens right under the reference, pre-filled with the page's title (or your current alias, if you've already set one).
+   - **Keep part of the title:** trim the box down to just what you want — no retyping.
+   - **Type a fresh alias:** click the **×** to clear the box, then type.
+   - **Remove the alias:** clear the box and press **Enter** — the chip reverts to the page's real name.
+   - Save with **Enter**, cancel with **Esc**.
 
-The popup follows your theme — light or dark — and the input's focus colour matches Thymer's accent.
+The box opens under the reference, follows your theme — light or dark — and uses Thymer's accent for the Save button.
 
 ## Keyboard shortcut
 
 The command is also bound to a keyboard shortcut — by default **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux).
 
-To change it, edit `custom.shortcut` in the plugin's **Configuration** tab and save. Combine keys with `+`; `Mod` means Cmd on macOS and Ctrl elsewhere. Examples: `Mod+Shift+L`, `Ctrl+Alt+A`, `Mod+Shift+R`. (At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
+To change it, run **Set alias keyboard shortcut** from the Command Palette, press the keys you want, and click Save — it applies immediately, no restart and no JSON. (You can also set `custom.shortcut` directly in the **Configuration** tab, e.g. `Mod+Shift+L`; `Mod` = Cmd on macOS, Ctrl elsewhere. At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
 
 ## Installation
 
