@@ -2,7 +2,7 @@
 
 ## v2.1.0 — 2026-06-30
 
-- **Expand a reference in place.** Select a reference and press **Cmd+Down** (**Ctrl+Down** on Windows/Linux) to reveal what it points to, inline and nested right under it: a line reference shows that line and its children, a page reference shows the page's content. It's the real editor, so you can edit in place and changes save to the source. **Cmd+Up** / **Ctrl+Up** collapses it. (Built on Thymer's native transclusion; a page's properties aren't part of a transclusion, so an expanded page shows its body rather than its fields.)
+- **Inline Transclusion.** Select a reference and press **Cmd+Down** (**Ctrl+Down** on Windows/Linux) to expand what it points to, inline and nested right under it: a line reference shows that line and its children, a page reference shows the page's content. It's the real editor, so you can edit in place and changes save to the source. **Cmd+Up** / **Ctrl+Up** collapses it. (Built on Thymer's native transclusion; a page's properties aren't part of a transclusion, so an expanded page shows its body rather than its fields.)
 
 ## v2.0.1 — 2026-06-30
 

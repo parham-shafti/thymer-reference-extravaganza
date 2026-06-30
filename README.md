@@ -4,7 +4,7 @@ Reference Extravaganza is a [Thymer](https://thymer.com) plugin for references. 
 
 - **Reference a line of text inline:** type `[[`, search, and link any line in your workspace.
 - **Alias a reference:** change what any reference chip displays (a page reference or an inline `[[` text reference), without retyping or recreating the link.
-- **Expand a reference in place:** select a reference and press a key to reveal the referenced content inline, right under it, then collapse it again.
+- **Inline Transclusion:** expand a selected reference in place to reveal what it points to inline, right under it, then collapse it again.
 
 ## Reference a line of text with `[[`
 
@@ -37,7 +37,7 @@ The box opens under the reference, follows your theme (light or dark), and uses 
 
 The default is **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux). To rebind it, run **Set alias keyboard shortcut** from the Command Palette, press the keys you want, and click Save. It applies immediately, with no restart and no JSON. (You can also set `custom.shortcut` directly in the **Configuration** tab, e.g. `Mod+Shift+L`; `Mod` = Cmd on macOS, Ctrl elsewhere. At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
 
-## Expand a reference in place
+## Inline Transclusion
 
 See what a reference points to without leaving the page you're on.
 
