@@ -352,7 +352,13 @@ class Plugin extends AppPlugin {
       query: "",
       pop, list, results: [], sel: 0, token: 0,
     };
-    this._positionPopover(pop, [info.caretEl, info.anchorNode]);
+    // Anchor under the triggered LINE, left-aligned to its editor column. (The
+    // caret sits at the end of "[[query", far to the right, so anchoring there
+    // pushed a wide box across a split-view divider and over the other panel.)
+    const lineNode = (info.anchorNode && info.anchorNode.closest && info.anchorNode.closest(".listitem"))
+      || (info.caretEl && info.caretEl.closest && info.caretEl.closest(".listitem"))
+      || null;
+    this._positionPopover(pop, [lineNode, info.caretEl, info.anchorNode]);
     window.addEventListener("keydown", this._linkKey, true);
     document.addEventListener("mousedown", this._linkClickOutside, true);
     this._renderLink();
@@ -424,23 +430,49 @@ class Plugin extends AppPlugin {
       const w = p.split(/\s+/).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)[0];
       if (w) terms.add(w);
     }
+    const seen = new Set();
+    const out = [];
+    const curLine = link.lineGuid;
+    const consider = (guid, segments, pageFn) => {
+      if (!guid || guid === curLine || seen.has(guid)) return; // never the line you're on
+      seen.add(guid);
+      const text = this._displayText(segments).trim();
+      if (!text) return;
+      const lt = norm(text);
+      if (!parts.every((p) => lt.includes(p))) return; // every "+" part must appear
+      let page = "";
+      try { page = pageFn() || ""; } catch (e) {}
+      out.push({ guid, text, page });
+    };
     const gather = async () => {
-      const seen = new Set();
-      const out = [];
+      seen.clear();
+      out.length = 0;
+      // 1) Scan the loaded lines directly. This gives reliable substring AND
+      //    matching and, crucially, sees lines you JUST typed — Thymer's search
+      //    index lags behind, so searchByQuery often misses fresh content (the
+      //    main "+ doesn't work" cause). Limited to loaded lines; (2) covers the
+      //    rest of the workspace.
+      const byGuid = (window.g_universe && window.g_universe.itemsByGuid) || {};
+      for (const guid in byGuid) {
+        const it = byGuid[guid];
+        if (!it || it.is_deleted || it.is_trashed || it.type === "document") continue;
+        if (!it.text_segments || !it.text_segments.length) continue;
+        consider(it.guid || guid, this._segmentsFromState(it), () => {
+          const r = it.rguid && this.data.getRecord(it.rguid);
+          return r && r.getName && r.getName();
+        });
+        if (out.length >= 40) break;
+      }
+      // 2) Workspace-wide search for anything not currently loaded.
       for (const sq of terms) {
         let res;
         try { res = await this.data.searchByQuery(sq, 60); } catch (e) { res = { lines: [] }; }
         if (this._link !== link || my !== link.token) return null;
         for (const li of res.lines || []) {
-          if (seen.has(li.guid)) continue;
-          seen.add(li.guid);
-          const text = this._displayText(li.segments).trim();
-          if (!text) continue;
-          const lt = norm(text);
-          if (!parts.every((p) => lt.includes(p))) continue;
-          let page = "";
-          try { const r = li.getRecord && li.getRecord(); page = (r && r.getName && r.getName()) || ""; } catch (e) {}
-          out.push({ guid: li.guid, text, page });
+          consider(li.guid, li.segments, () => {
+            const r = li.getRecord && li.getRecord();
+            return r && r.getName && r.getName();
+          });
         }
       }
       return out;
@@ -788,29 +820,43 @@ class Plugin extends AppPlugin {
     setTimeout(() => { try { input.focus(); const n = input.value.length; input.setSelectionRange(n, n); } catch (e) {} }, 0);
   }
 
-  // Place the popover just below the reference (flips above if it would overflow).
+  // Place the popover just below the anchor (flips above if it would overflow),
+  // kept inside the anchor's own panel so it never spills into a neighbouring
+  // split-view panel and covers its text.
   _positionPopover(pop, anchors) {
     const list = (Array.isArray(anchors) ? anchors : [anchors]).filter(Boolean);
-    let rect = null;
+    let rect = null, anchorEl = null;
     for (const a of list) {
       try {
         if (!a.getBoundingClientRect || !document.contains(a)) continue;
         const r = a.getBoundingClientRect();
-        if ((r.width || r.height) && r.top >= 0 && r.top < window.innerHeight && r.left >= 0) { rect = r; break; }
+        if ((r.width || r.height) && r.top >= 0 && r.top < window.innerHeight && r.left >= 0) { rect = r; anchorEl = a; break; }
       } catch (e) {}
     }
+    const m = 12;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    // Horizontal bounds = the panel the anchor lives in (fall back to viewport).
+    let bL = m, bR = vw - m;
+    try {
+      const panel = anchorEl && anchorEl.closest && anchorEl.closest(".panel");
+      if (panel) { const pr = panel.getBoundingClientRect(); if (pr.width) { bL = Math.max(m, pr.left + 8); bR = Math.min(vw - m, pr.right - 8); } }
+    } catch (e) {}
     if (!rect) {
-      pop.style.left = "50%"; pop.style.top = "18vh"; pop.style.transform = "translateX(-50%)";
+      const fw = pop.offsetWidth || 320;
+      pop.style.left = Math.round(Math.max(bL, (bL + bR) / 2 - fw / 2)) + "px";
+      pop.style.top = "18vh"; pop.style.transform = "none";
       return;
     }
-    const m = 12;
-    const w = pop.offsetWidth || 320;
+    // Shrink to fit the column if the popover is wider than the panel.
+    let w = pop.offsetWidth || 320;
+    const maxW = bR - bL;
+    if (w > maxW) { pop.style.width = Math.round(maxW) + "px"; w = maxW; }
     const h = pop.offsetHeight || 90;
     let left = rect.left;
-    if (left + w > window.innerWidth - m) left = window.innerWidth - w - m;
-    if (left < m) left = m;
+    if (left + w > bR) left = bR - w;
+    if (left < bL) left = bL;
     let top = rect.bottom + 6;
-    if (top + h > window.innerHeight - m && rect.top - h - 6 >= m) top = rect.top - h - 6;
+    if (top + h > vh - m && rect.top - h - 6 >= m) top = rect.top - h - 6;
     pop.style.left = Math.round(left) + "px";
     pop.style.top = Math.round(top) + "px";
   }
