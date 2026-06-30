@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.0.1 — 2026-06-30
+
+- **Fixed: `+` (multi-term) search in the `[[` picker** now reliably finds matching lines, including ones you just typed. It scans your loaded lines directly instead of relying only on Thymer's search index, which lags behind fresh edits.
+- **Fixed: the `[[` search box now stays inside its own panel** in split view, opening under the line you typed on, instead of spilling across the divider and covering the other panel's text.
+
 ## v2.0.0 — 2026-06-30
 
 Renamed from **Reference Aliases** to **Reference Extravaganza**: the plugin now creates references, not just aliases them.
