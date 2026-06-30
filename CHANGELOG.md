@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.2.0 — 2026-07-01
+
+- Declared a plugin **version** so Thymer shows the plugin's version and updates correctly (earlier releases declared none, which showed as "undefined").
+- The expand-a-reference feature introduced in 2.1.0 is now called **Inline Transclusion**.
+
 ## v2.1.0 — 2026-06-30
 
 - **Inline Transclusion.** Select a reference and press **Cmd+Down** (**Ctrl+Down** on Windows/Linux) to expand what it points to, inline and nested right under it: a line reference shows that line and its children, a page reference shows the page's content. It's the real editor, so you can edit in place and changes save to the source. **Cmd+Up** / **Ctrl+Up** collapses it. (Built on Thymer's native transclusion; a page's properties aren't part of a transclusion, so an expanded page shows its body rather than its fields.)
