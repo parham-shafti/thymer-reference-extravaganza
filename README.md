@@ -3,7 +3,7 @@
 Reference Extravaganza is a [Thymer](https://thymer.com) plugin for references. It does two things:
 
 - **Reference a line of text inline:** type `[[`, search, and link any line in your workspace.
-- **Alias a reference:** change what a reference chip displays, without retyping or recreating the link.
+- **Alias a reference:** change what any reference chip displays (a page reference or an inline `[[` text reference), without retyping or recreating the link.
 
 Out of the box, a reference always shows the target's real text, and there's no way to give it a different label. This plugin lets you set, change, or clear that label whenever you want.
 

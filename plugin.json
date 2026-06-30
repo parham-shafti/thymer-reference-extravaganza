@@ -2,7 +2,7 @@
 	"ver": 1,
 	"name": "Reference Extravaganza",
 	"icon": "ti-pencil",
-	"description": "Supercharge Thymer references. Type [[ to reference any line of text inline, and set an alias on any reference (page or line) to change what its chip shows without recreating the link.",
+	"description": "Supercharge Thymer references. Type [[ to reference any line of text inline (search, pick, insert). Set an alias on any reference, page or line, to change what its chip shows without recreating the link: the box pre-fills with the current title so you can trim it down. Commands: \"Set alias for reference\" (shortcut Cmd/Ctrl+Shift+A, rebindable in-app via \"Set alias keyboard shortcut\").",
 	"custom": {
 		"shortcut": "Mod+Shift+A"
 	}
