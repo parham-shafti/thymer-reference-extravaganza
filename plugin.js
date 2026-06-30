@@ -22,6 +22,7 @@ class Plugin extends AppPlugin {
   _shortcutCmd = null;
   _modal = null;
   _link = null;
+  _expand = null;
   _lastBracketTs = 0;
   _hotkey = null;
   _isMac = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "");
@@ -93,6 +94,34 @@ class Plugin extends AppPlugin {
     this._exitLinkMode();
   };
 
+  // Expand/collapse a selected reference (Tana-style). Cmd/Ctrl+Down expands the
+  // selected reference inline as a native transclusion (the target with its
+  // children, editable); Cmd/Ctrl+Up collapses it. Cheap-first guards: only acts
+  // on the exact chord, and only when a reference is actually selected (expand) or
+  // something is open (collapse), so the keystroke otherwise falls through to
+  // Thymer's native behaviour untouched.
+  _handleExpandKey = (e) => {
+    const primary = this._isMac ? e.metaKey : e.ctrlKey;
+    if (!primary || e.shiftKey || e.altKey) return;
+    const isDown = e.key === "ArrowDown", isUp = e.key === "ArrowUp";
+    if (!isDown && !isUp) return;
+    if (this._modal || this._link) return;
+    if (isUp) {
+      if (!this._expand) return; // nothing open → let native Cmd+Up through
+      e.preventDefault(); e.stopImmediatePropagation();
+      this._collapseRef();
+      return;
+    }
+    // Cmd+Down: expand, but only if a reference is selected.
+    const hit = this._detect();
+    if (!hit) return;
+    const ref = this._selectedRef(hit);
+    if (!ref) return; // not on a reference → let native Cmd+Down through
+    if (this._expand && this._expand.targetGuid === ref.targetGuid) { e.preventDefault(); e.stopImmediatePropagation(); return; }
+    e.preventDefault(); e.stopImmediatePropagation();
+    this._expandRef(hit, ref);
+  };
+
   onLoad() {
     this._injectStyle();
 
@@ -112,11 +141,14 @@ class Plugin extends AppPlugin {
     this._hotkey = this._parseShortcut(shortcutStr);
     window.addEventListener("keydown", this._handleKeydown, true);
     window.addEventListener("keydown", this._handleBracketKey, true);
+    window.addEventListener("keydown", this._handleExpandKey, true);
   }
 
   onUnload() {
     window.removeEventListener("keydown", this._handleKeydown, true);
     window.removeEventListener("keydown", this._handleBracketKey, true);
+    window.removeEventListener("keydown", this._handleExpandKey, true);
+    this._collapseRef();
     this._exitLinkMode();
     this._hotkey = null;
     if (this._cmd && this._cmd.remove) this._cmd.remove();
@@ -268,6 +300,58 @@ class Plugin extends AppPlugin {
     const r = await this._resolveRef(hit);
     if (typeof r === "string") return this._toast(r);
     this._openAliasModal(r);
+  }
+
+  // ------------------------------------------------ expand/collapse references
+
+  // Synchronously work out which reference (if any) is selected on the current
+  // line, and its target. No async (no getLineItems) so the keydown handler can
+  // decide instantly whether to intercept. Mirrors _resolveRef's ref-picking
+  // (segment_index is a pair index → /2; pick the targeted ref by order).
+  _selectedRef(hit) {
+    const live = this._liveSegs(hit.lineGuid);
+    if (!live || !live.length) return null;
+    const refs = live.map((s, i) => (s.type === "ref" ? i : -1)).filter((i) => i >= 0);
+    if (!refs.length) return null;
+    const ai = typeof hit.segIndex === "number" ? Math.floor(hit.segIndex / 2) : null;
+    let idx = -1;
+    if (hit.linespanType === "ref" && ai != null && live[ai] && live[ai].type === "ref") idx = ai;
+    else if (refs.length === 1) idx = refs[0];
+    else if (ai != null) idx = refs.reduce((a, b) => (Math.abs(b - ai) < Math.abs(a - ai) ? b : a), refs[0]);
+    if (idx < 0) return null;
+    const targetGuid = live[idx].text && live[idx].text.guid;
+    if (!targetGuid) return null;
+    return { targetGuid, isText: !this.data.getRecord(targetGuid) };
+  }
+
+  // Expand: insert a native transclusion of the reference's target as a child of
+  // the block the reference sits in — for line AND page references. Thymer renders
+  // it inline (target as a heading with its children, or a page's body), editable
+  // and native-styled, exactly like its built-in transclusions. One at a time.
+  // NOTE: this adds a real line to the document (synced + undoable); _collapseRef
+  // deletes it. A transclusion is `type:"transclusion"` with `props.itemref` = the
+  // target guid (the same model as Thymer's own block references).
+  async _expandRef(hit, ref) {
+    await this._collapseRef();
+    const rec = this.data.getRecord(hit.pageGuid);
+    if (!rec) return this._toast("Couldn't find the current page.");
+    let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
+    const block = items.find((x) => x.guid === hit.lineGuid);
+    if (!block) return this._toast("Couldn't find the line you're on.");
+    const kids = block.children || [];
+    const after = kids.length ? kids[kids.length - 1] : null; // append at the bottom of the block
+    let line = null;
+    try { line = await rec.createLineItem(block, after, "transclusion"); } catch (e) {}
+    if (!line) return this._toast("Couldn't expand the reference.");
+    try { line.setMetaProperty("itemref", ref.targetGuid); } catch (e) {}
+    this._expand = { line, targetGuid: ref.targetGuid };
+  }
+
+  async _collapseRef() {
+    const ex = this._expand;
+    if (!ex) return;
+    this._expand = null;
+    try { if (ex.line && ex.line.delete) await ex.line.delete(); } catch (e) {}
   }
 
   // ------------------------------------------------- inline [[ text references
