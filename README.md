@@ -25,20 +25,18 @@ The box opens at the caret and the editor keeps focus, so it works mid-sentence 
 Works on both page references and the line references you create with `[[`.
 
 1. Select the reference you want to alias.
-2. Open the Command Palette (`Cmd+P` / `Ctrl+P`) and run **Set alias for reference** (or use the shortcut below).
+2. Run **Set alias for reference**, either from the Command Palette (`Cmd+P` / `Ctrl+P`) or with its keyboard shortcut, **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux).
 3. A small box opens right under the reference, pre-filled with its current text (or your current alias, if you've already set one).
-   - **Keep part of the text:** trim the box down to just what you want — no retyping.
+   - **Keep part of the text:** trim the box down to just what you want, no retyping.
    - **Type a fresh alias:** click the **×** to clear the box, then type.
    - **Clear the alias:** clear the box and press **Enter**. A page reference reverts to the page's real name; a line reference re-syncs to the target line's current text.
    - Save with **Enter**, cancel with **Esc**.
 
-The box opens under the reference, follows your theme — light or dark — and uses Thymer's accent for the Save button.
+The box opens under the reference, follows your theme (light or dark), and uses Thymer's accent for the Save button.
 
-## Keyboard shortcut
+### Changing the keyboard shortcut
 
-The command is also bound to a keyboard shortcut — by default **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux).
-
-To change it, run **Set alias keyboard shortcut** from the Command Palette, press the keys you want, and click Save — it applies immediately, no restart and no JSON. (You can also set `custom.shortcut` directly in the **Configuration** tab, e.g. `Mod+Shift+L`; `Mod` = Cmd on macOS, Ctrl elsewhere. At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
+The default is **Cmd+Shift+A** (macOS) / **Ctrl+Shift+A** (Windows/Linux). To rebind it, run **Set alias keyboard shortcut** from the Command Palette, press the keys you want, and click Save. It applies immediately, with no restart and no JSON. (You can also set `custom.shortcut` directly in the **Configuration** tab, e.g. `Mod+Shift+L`; `Mod` = Cmd on macOS, Ctrl elsewhere. At least one of Cmd/Ctrl/Alt is required, so the shortcut can't clash with plain typing.)
 
 ## Installation
 
