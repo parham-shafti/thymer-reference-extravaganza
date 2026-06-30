@@ -1,8 +1,8 @@
 {
 	"ver": 1,
-	"name": "Reference Aliases",
+	"name": "Reference Extravaganza",
 	"icon": "ti-pencil",
-	"description": "Set an alias on a page reference — change what the reference chip shows without recreating the link. Select a reference and run \"Set alias for reference\".",
+	"description": "Supercharge Thymer references. Type [[ to reference any line of text inline, and set an alias on any reference (page or line) to change what its chip shows without recreating the link.",
 	"custom": {
 		"shortcut": "Mod+Shift+A"
 	}

@@ -1,19 +1,35 @@
-# Reference Aliases
+# Reference Extravaganza
 
-Reference Aliases is a [Thymer](https://thymer.com) plugin that lets you set an **alias** on a page reference — change what the reference chip displays, without retyping or recreating the link.
+Reference Extravaganza is a [Thymer](https://thymer.com) plugin for references. It does two things:
 
-Out of the box, a page reference always shows the page's real title, and there's no way to give it a different label. This plugin adds a command to set, change, or clear that label whenever you want.
+- **Reference a line of text inline:** type `[[`, search, and link any line in your workspace.
+- **Alias a reference:** change what a reference chip displays, without retyping or recreating the link.
 
-> This release covers **page** references. Aliasing plain-text references is planned for a later version.
+Out of the box, a reference always shows the target's real text, and there's no way to give it a different label. This plugin lets you set, change, or clear that label whenever you want.
 
-## How to use
+## Reference a line of text with `[[`
 
-1. Select the page reference you want to alias.
-2. Open the Command Palette (`Cmd+P` / `Ctrl+P`) and run **Set alias for reference**.
-3. A small box opens right under the reference, pre-filled with the page's title (or your current alias, if you've already set one).
-   - **Keep part of the title:** trim the box down to just what you want — no retyping.
+Thymer references a whole page out of the box; this adds references to an individual line.
+
+1. Type `[[` anywhere in a line. A search box opens right at your cursor.
+2. Keep typing to search. Results show a snippet centred on the match (matched words highlighted) with the source page beneath.
+   - **Phrase search:** results match the phrase you type.
+   - **Multi-term search:** use `+` to require several terms in the same line, in any order (for example `bestäm + leda`).
+3. Pick a line with **↑/↓ then Enter**, or click it. A reference to that line is inserted, displaying the line's text.
+4. **Esc** cancels and removes the `[[` you typed.
+
+The box opens at the caret and the editor keeps focus, so it works mid-sentence and with several references in one paragraph.
+
+## Alias a reference
+
+Works on both page references and the line references you create with `[[`.
+
+1. Select the reference you want to alias.
+2. Open the Command Palette (`Cmd+P` / `Ctrl+P`) and run **Set alias for reference** (or use the shortcut below).
+3. A small box opens right under the reference, pre-filled with its current text (or your current alias, if you've already set one).
+   - **Keep part of the text:** trim the box down to just what you want — no retyping.
    - **Type a fresh alias:** click the **×** to clear the box, then type.
-   - **Remove the alias:** clear the box and press **Enter** — the chip reverts to the page's real name.
+   - **Clear the alias:** clear the box and press **Enter**. A page reference reverts to the page's real name; a line reference re-syncs to the target line's current text.
    - Save with **Enter**, cancel with **Esc**.
 
 The box opens under the reference, follows your theme — light or dark — and uses Thymer's accent for the Save button.
@@ -36,7 +52,8 @@ Don't enable Hot Reload — it's a development feature and can leave the plugin 
 
 ## How it works
 
-- An "alias" in Thymer is just the `title` field on a reference segment (`{type:"ref", text:{guid, title?}}`). The plugin reads and writes that field — set it to your alias, or clear it to fall back to the page's name. Nothing else on the line is touched, and the link target never changes.
+- An "alias" in Thymer is just the `title` field on a reference segment (`{type:"ref", text:{guid, title?}}`). The plugin reads and writes that field — set it to your alias, or clear it to fall back to the target's name (the page's title for a page reference, the line's current text for a line reference). Nothing else on the line is touched, and the link target never changes.
+- A `[[` line reference targets a line item rather than a page; the plugin inserts it as the same `ref` segment, with the line's text as the initial title.
 - It finds the reference you're on from the editor's current selection when you run the command.
 - **Negligible idle cost:** the only always-on code is a single keydown listener for the shortcut, and its first line is a modifier check that returns immediately for every non-matching keystroke — so normal typing pays a single comparison. No observers, no polling, no work on scroll or render.
 
