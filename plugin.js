@@ -41,6 +41,13 @@ class Plugin extends AppPlugin {
   // result row; the observer re-parks it when a re-render moves/replaces either.
   _queryEmbeds = new Map();
   _queryRaf = 0;
+  // Standalone LINE-ref embeds (embedLineGuid -> {node?}). A [[ line ref whose
+  // target has no children of its own renders just that one line; we give it the
+  // same "click the strip to add an indented child" affordance the live-search
+  // line embeds have. Marked with .refx-lineembed (the CSS writing strip) and
+  // wired via _wireEmbedBodyClick; the observer re-marks after a re-render.
+  _lineEmbeds = new Map();
+  _lineRaf = 0;
   _themeObs = null; // re-copies card colours on data-theme change
   _blobUrls = new Map(); // file-prop blob guid -> {url} (object URLs, revoked on unload)
   _cardObs = null;
@@ -243,7 +250,7 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.2.1"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.3.0"; } catch (e) {} // live-version tell for debugging
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     this._injectStyle();
     this._ensureThemeObserver();
@@ -459,10 +466,45 @@ class Plugin extends AppPlugin {
     };
   }
 
+  // Resolve a page guid to its record, including UNMATERIALIZED journal days.
+  // A journal day that does not exist yet (tomorrow and later) has a SYNTHETIC
+  // page guid — S-<collectionGuid>-P…-YYYYMMDD — that data.getRecord() cannot
+  // resolve, so every command run on such a page (alias, convert, expand,
+  // collapse, the [[ picker) died with "Couldn't find the current page."
+  // getJournalRecord() is the way in. The user ref MUST carry the USER guid —
+  // passing the collection guid silently creates a duplicate journal page.
+  // Same fix as reschedule's journalRecord().
+  async _pageRecord(pageGuid) {
+    const rec = this.data.getRecord(pageGuid);
+    if (rec) return rec;
+    const m = /^S-([A-Z0-9]+)-.+-(\d{8})$/.exec(pageGuid || "");
+    if (!m) return null;
+    try {
+      const cols = await this.data.getAllCollections();
+      const journals = (cols || []).filter((c) => { try { return c.isJournalPlugin && c.isJournalPlugin(); } catch (e) { return false; } });
+      const col = journals.find((c) => { try { return (c.getGuid ? c.getGuid() : null) === m[1]; } catch (e) { return false; } }) || journals[0];
+      if (!col) return null;
+      let userGuid = null;
+      try { userGuid = (window.g_universe && window.g_universe.userId) || null; } catch (e) {}
+      if (!userGuid) {
+        try {
+          const us = await this.data.getActiveUsers();
+          const self = (us || []).find((u) => u && (u.is_self || (u._getRow && u._getRow().is_self))) || (us || [])[0];
+          userGuid = self && (self.guid || (self._getRow && self._getRow().guid));
+        } catch (e) {}
+      }
+      if (!userGuid) return null;
+      const wsGuid = (window.g_universe && window.g_universe.workspaceGuid) || null;
+      const y = +m[2].slice(0, 4), mo = +m[2].slice(4, 6) - 1, d = +m[2].slice(6, 8);
+      // getJournalRecord only ever calls .toDate() on its date argument
+      return await col.getJournalRecord({ workspaceGuid: wsGuid, guid: userGuid }, { toDate: () => new Date(y, mo, d) });
+    } catch (e) { return null; }
+  }
+
   // Resolve the targeted reference segment via the stable Data API.
   // Returns a result object, or an error string for the toaster.
   async _resolveRef(hit) {
-    const rec = this.data.getRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid);
     if (!rec) return "Couldn't find the current page.";
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, hit.lineGuid);
@@ -607,7 +649,7 @@ class Plugin extends AppPlugin {
   // Recreate the caret's line as `newType`, run `apply(newLine)` to fill it, then
   // delete the original. Preserves parent + position, including for nested lines.
   async _replaceLine(hit, newType, apply, okMsg) {
-    const rec = this.data.getRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid);
     if (!rec) return this._toast("Couldn't find the current page.");
     let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
     const found = this._findWithParent(items, hit.lineGuid, null);
@@ -673,7 +715,7 @@ class Plugin extends AppPlugin {
     if (this._expandInFlight.has(key)) return; // debounce double-create on fast keys
     this._expandInFlight.add(key);
     try {
-      const rec = this.data.getRecord(hit.pageGuid);
+      const rec = await this._pageRecord(hit.pageGuid);
       if (!rec) return this._toast("Couldn't find the current page.");
       let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
       // DEEP lookup — a plain items.find() only saw top-level lines, so
@@ -708,6 +750,13 @@ class Plugin extends AppPlugin {
         this._cards.set(line.guid, { recordGuid: ref.targetGuid, line });
         this._ensureCardObserver();
         this._attachPropCard(line.guid, ref.targetGuid);
+      } else {
+        // LINE reference → no card, but give it the writing strip so a childless
+        // target can still gain an indented child by clicking the embed's dead
+        // space (same affordance the live-search line embeds already have).
+        this._lineEmbeds.set(line.guid, { node: null });
+        this._ensureCardObserver();
+        this._markLineEmbed(line.guid, 0);
       }
       // If the host line sits FOLDED (native fold state persists per line), the
       // fresh embed renders hidden behind "…" dots — unfold so it shows.
@@ -737,7 +786,7 @@ class Plugin extends AppPlugin {
     this._expandInFlight.add(key);
     try {
       if (targetGuid === hit.queryHostGuid) return this._toast("Can't embed a page inside itself.");
-      const host = this.data.getRecord(hit.queryHostGuid);
+      const host = await this._pageRecord(hit.queryHostGuid);
       if (!host) return this._toast("Couldn't find the page holding this search.");
       let items; try { items = await host.getLineItems(); } catch (e) { items = []; }
       const byGuid = {};
@@ -791,6 +840,27 @@ class Plugin extends AppPlugin {
     qe.node = emb || null; qe.row = null; qe.parked = true;
   }
 
+  // Mark a STANDALONE line-ref embed's rendered node: add the .refx-lineembed
+  // class (its CSS writing strip) and wire the dead-space click handler. Unlike a
+  // query embed there's NO reparent — the node already sits at its model position
+  // (a real sibling child of the ref line). The node renders async and Thymer
+  // REPLACES it on every re-render, so retry until it appears; the observer
+  // re-marks a replacement node afterwards.
+  _markLineEmbed(embedGuid, attempt) {
+    attempt = attempt || 0;
+    if (this._unloaded) return;
+    const le = this._lineEmbeds.get(embedGuid);
+    if (!le) return;
+    const node = this._transclusionNode(embedGuid);
+    if (node) {
+      try { node.classList.add("refx-lineembed"); } catch (e) {}
+      this._wireEmbedBodyClick(node, embedGuid);
+      le.node = node;
+      return;
+    }
+    if (attempt < 15) setTimeout(() => this._markLineEmbed(embedGuid, attempt + 1), 120);
+  }
+
   // The rendered row node of a live-search result, found by the REAL line it
   // points at (row guids are ephemeral V-guids — never key on them). Two traps,
   // both hit live: (1) the page listview's getItems() does NOT include the
@@ -828,7 +898,7 @@ class Plugin extends AppPlugin {
     // (refx_at tag) — they live on the host page, not under the result line's
     // source block.
     if (hit.queryLineGuid && hit.queryHostGuid) {
-      const host = this.data.getRecord(hit.queryHostGuid);
+      const host = await this._pageRecord(hit.queryHostGuid);
       if (host) {
         let hitems = null; try { hitems = await host.getLineItems(); } catch (e) {}
         const ours = [];
@@ -838,7 +908,7 @@ class Plugin extends AppPlugin {
       }
       return;
     }
-    const rec = this.data.getRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid);
     let items = null;
     if (rec) { try { items = await rec.getLineItems(); } catch (e) {} }
     const ref = this._selectedRef(hit);
@@ -1047,6 +1117,7 @@ class Plugin extends AppPlugin {
     const savedEntry = this._cards.get(g) || null;
     this._cards.delete(g);
     this._queryEmbeds.delete(g);
+    this._lineEmbeds.delete(g);
     if (this._cardNav && this._cardNav.lineGuid === g) this._exitCardNav();
     this._removeCardEl(g);
     try {
@@ -1061,7 +1132,7 @@ class Plugin extends AppPlugin {
         return;
       }
     } catch (e) {}
-    if (!this._cards.size) this._teardownCardObserver();
+    if (!this._cards.size && !this._queryEmbeds.size && !this._lineEmbeds.size) this._teardownCardObserver();
   }
 
   async _collapseAllOnPage() {
@@ -1191,12 +1262,14 @@ class Plugin extends AppPlugin {
     this._removeAllCardEls();
     this._cards.clear();
     this._queryEmbeds.clear();
+    this._lineEmbeds.clear();
     await this._indexEmbeds();
     if (this._unloaded) return;
-    if (this._cards.size || this._queryEmbeds.size) {
+    if (this._cards.size || this._queryEmbeds.size || this._lineEmbeds.size) {
       this._ensureCardObserver();
       this._reattachAllCards();
       for (const [g, qe] of this._queryEmbeds) this._placeQueryEmbed(g, qe.resultRealGuid, 0);
+      for (const g of this._lineEmbeds.keys()) this._markLineEmbed(g, 0);
     } else this._teardownCardObserver();
   }
 
@@ -1228,7 +1301,7 @@ class Plugin extends AppPlugin {
     const recs = [];
     for (const p of panels) { let r = null; try { r = p.getActiveRecord && p.getActiveRecord(); } catch (e) {} if (r) recs.push(r); }
     if (!recs.length) { const r = this._activeRecord(); if (r) recs.push(r); }
-    const found = new Map(), foundQ = new Map();
+    const found = new Map(), foundQ = new Map(), foundL = new Map();
     const walk = (arr) => {
       for (const it of arr || []) {
         if (!it) continue;
@@ -1237,6 +1310,8 @@ class Plugin extends AppPlugin {
         // Cmd+Up from inside a discover-adopted embed a swallowed dead key.
         if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.itemref && this.data.getRecord(it.props.itemref)) found.set(it.guid, { ref: it.props.itemref, line: it });
         if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.refx_at) foundQ.set(it.guid, { at: it.props.refx_at, from: it.props.refx_from || null });
+        // Standalone line-ref embed: line target (not a record), not a query embed.
+        if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.itemref && !it.props.refx_at && !this.data.getRecord(it.props.itemref)) foundL.set(it.guid, true);
         if (it.children) walk(it.children);
       }
     };
@@ -1281,7 +1356,15 @@ class Plugin extends AppPlugin {
     for (const g of [...this._queryEmbeds.keys()]) {
       if (!foundQ.has(g) && !this._transclusionNode(g)) this._queryEmbeds.delete(g);
     }
-    if (this._cards.size || this._queryEmbeds.size) this._ensureCardObserver(); else this._teardownCardObserver();
+    // Standalone line-ref embeds: (re)register + re-mark; drop gone lines.
+    for (const g of foundL.keys()) {
+      if (!this._lineEmbeds.has(g)) this._lineEmbeds.set(g, { node: null });
+      this._markLineEmbed(g, 0);
+    }
+    for (const g of [...this._lineEmbeds.keys()]) {
+      if (!foundL.has(g) && !this._transclusionNode(g)) this._lineEmbeds.delete(g);
+    }
+    if (this._cards.size || this._queryEmbeds.size || this._lineEmbeds.size) this._ensureCardObserver(); else this._teardownCardObserver();
   }
 
   async _indexEmbeds() {
@@ -1302,6 +1385,10 @@ class Plugin extends AppPlugin {
         // Query-spawned embeds (line targets included) re-register for parking.
         if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.refx_at) {
           this._queryEmbeds.set(it.guid, { resultRealGuid: it.props.refx_at, queryLineGuid: it.props.refx_from || null });
+        }
+        // Standalone line-ref embeds (line target, not a query embed) re-register.
+        if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.itemref && !it.props.refx_at && !this.data.getRecord(it.props.itemref)) {
+          this._lineEmbeds.set(it.guid, { node: null });
         }
         if (it.children) walk(it.children);
       }
@@ -1348,7 +1435,7 @@ class Plugin extends AppPlugin {
         try { const g = col.getGuid && col.getGuid(); if (g) colByGuid[g] = col; } catch (e) {}
         for (const f of (cfg && cfg.fields) || []) {
           if (!f) continue;
-          if (f.id != null) { map[f.id] = f.type; meta[f.id] = { type: f.type, filter_colguid: f.filter_colguid || null, many: !!f.many, read_only: !!f.read_only, icon: f.icon || null }; }
+          if (f.id != null) { map[f.id] = f.type; meta[f.id] = { type: f.type, filter_colguid: f.filter_colguid || null, many: !!f.many, read_only: !!f.read_only, icon: f.icon || null, active: f.active !== false }; }
           if (f.label) {
             const lk = "label:" + String(f.label).toLowerCase();
             if (lk in byLabel && byLabel[lk] !== f.type) conflicted.add(lk);
@@ -1517,6 +1604,12 @@ class Plugin extends AppPlugin {
     if (!/^F[0-9A-Z]{8,}$/.test(id)) return false;
     const name = String((p && p.name) || "");
     if (/^Deleted\s*\(/.test(name)) return false;
+    // Native's property pane hides ARCHIVED fields (schema `active:false`) — e.g. a
+    // retired "Seeds" field still kept in the collection config. getAllProperties()
+    // returns them anyway (sometimes duplicated by label), so mirror native and drop
+    // them. Fail-open when the schema map isn't built yet (self-heals next render).
+    const meta = this._fieldMeta && id ? this._fieldMeta[id] : null;
+    if (meta && meta.active === false) return false;
     return true;
   }
 
@@ -2288,7 +2381,7 @@ class Plugin extends AppPlugin {
     // a real .listitem line, filtered out below).
     const deadSpace = (e) => {
       if (e.button !== 0 || this._unloaded) return false;
-      if (!this._cards.has(lineGuid) && !this._queryEmbeds.has(lineGuid)) return false;
+      if (!this._cards.has(lineGuid) && !this._queryEmbeds.has(lineGuid) && !this._lineEmbeds.has(lineGuid)) return false;
       const t = e.target;
       if (!(t instanceof Element)) return false;
       if (t.closest("." + this._CARD_CLASS)) return false; // the card owns its clicks
@@ -2518,7 +2611,7 @@ class Plugin extends AppPlugin {
     // keep this idle-free whenever no embeds are open.
     const target = document.body;
     const obs = new MutationObserver(() => {
-      if (!this._cards.size && !this._queryEmbeds.size) return;
+      if (!this._cards.size && !this._queryEmbeds.size && !this._lineEmbeds.size) return;
       // ZERO-FLASH keep-alive: MutationObserver callbacks are microtasks — they run
       // BEFORE the browser paints the mutation. If a native re-render just dropped a
       // card, re-inserting the CACHED node here (synchronously) means no painted
@@ -2563,6 +2656,19 @@ class Plugin extends AppPlugin {
         this._queryRaf = 0;
         for (const [g, qe] of this._queryEmbeds) if (!qe.parked) this._placeQueryEmbed(g, qe.resultRealGuid, 0);
       });
+      // Standalone line-ref embeds: keep the marker class + dead-space wiring on
+      // each node. Thymer REPLACES the transclusion node on re-render, dropping
+      // both, so a lost class/flag means re-mark. O(1) isConnected/flag checks per
+      // entry; the actual re-mark runs rAF-debounced.
+      let needMark = false;
+      for (const le of this._lineEmbeds.values()) {
+        if (le.node && le.node.isConnected && le.node.__refxBodyClick && le.node.classList.contains("refx-lineembed")) continue;
+        needMark = true; break;
+      }
+      if (needMark && !this._lineRaf) this._lineRaf = requestAnimationFrame(() => {
+        this._lineRaf = 0;
+        for (const g of this._lineEmbeds.keys()) this._markLineEmbed(g, 0);
+      });
     });
     try { obs.observe(target, { childList: true, subtree: true }); } catch (e) {}
     this._cardObs = obs; this._cardObsTarget = target;
@@ -2585,6 +2691,7 @@ class Plugin extends AppPlugin {
     this._exitCardNav();
     if (this._cardRaf) { try { cancelAnimationFrame(this._cardRaf); } catch (e) {} this._cardRaf = 0; }
     if (this._queryRaf) { try { cancelAnimationFrame(this._queryRaf); } catch (e) {} this._queryRaf = 0; }
+    if (this._lineRaf) { try { cancelAnimationFrame(this._lineRaf); } catch (e) {} this._lineRaf = 0; }
     if (this._cardObs) { try { this._cardObs.disconnect(); } catch (e) {} }
     this._cardObs = null; this._cardObsTarget = null;
     if (window.__refxCardObs) { try { window.__refxCardObs.disconnect(); } catch (e) {} window.__refxCardObs = null; }
@@ -3064,9 +3171,21 @@ class Plugin extends AppPlugin {
         });
         list.append(row);
       }
-      // 2) suggestions (minus already-picked), each with its record icon
+      // 2) suggestions (minus already-picked), each with its record icon. When the
+      // user is SEARCHING, rank by relevance like native (exact → prefix → word-
+      // start → contains, shorter names first within a tier) instead of leaving the
+      // list in its browse order (alphabetical / recency), which buried exact hits
+      // (e.g. "Psychology" sat below "Bark scale (psychoacoustic…)").
       const src = browse || recent || [];
-      const matches = src.filter((ent) => !curGuids.has(ent.guid) && (!ql || ent.lower.includes(ql))).slice(0, 40);
+      let matches = src.filter((ent) => !curGuids.has(ent.guid) && (!ql || ent.lower.includes(ql)));
+      if (ql) {
+        const rank = (lo) => lo === ql ? 0 : (lo.startsWith(ql) ? 1 : (lo.split(/[^a-z0-9]+/).some((w) => w && w.startsWith(ql)) ? 2 : 3));
+        matches = matches
+          .map((ent) => ({ ent, rk: rank(ent.lower) }))
+          .sort((a, b) => a.rk - b.rk || a.ent.lower.length - b.ent.lower.length || a.ent.name.localeCompare(b.ent.name))
+          .map((x) => x.ent);
+      }
+      matches = matches.slice(0, 40);
       for (const ent of matches) {
         const row = this._el("div", "refalias-result");
         if (ent.icon) row.append(this._el("span", "refx-opt-ico ti " + ent.icon));
@@ -3443,7 +3562,7 @@ class Plugin extends AppPlugin {
     if (!link) return;
     const lineGuid = link.lineGuid, pageGuid = link.pageGuid, query = link.query;
     this._exitLinkMode();
-    const rec = this.data.getRecord(pageGuid);
+    const rec = await this._pageRecord(pageGuid);
     if (!rec) return;
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, lineGuid);
@@ -3681,7 +3800,7 @@ class Plugin extends AppPlugin {
     if (!link) return;
     const lineGuid = link.lineGuid, pageGuid = link.pageGuid, query = link.query;
     this._exitLinkMode();
-    const rec = this.data.getRecord(pageGuid);
+    const rec = await this._pageRecord(pageGuid);
     if (!rec) return;
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, lineGuid);
@@ -4385,15 +4504,17 @@ html.is-light .refalias-lp-text b { color: var(--color-primary-700, #2f8873); }
 .refx-propcard .page-prop-val { white-space: normal; }
 .refx-propcard .page-prop-val .prop-status-0p { white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; }
 .refx-propcard .refx-propcard-value { flex-wrap: wrap; }
-/* live-search embeds keep a writing strip at the bottom: clicking it appends a
-   new indented child under the transcluded line. ZERO-JUMP: the strip reserves
-   exactly one child line's worth of space (1lh + line margins), and the moment
-   the child appears the :has() rule collapses the strip to the container's
-   natural 12px padding — the collapse cancels the added line in the SAME layout
-   pass, so nothing below shifts (verified: box height unchanged across the add).
-   Once a child exists you extend with Enter (native, no strip needed). */
-.listitem-transclusion.refx-qembed .transclusion-container-div { padding-bottom: calc(1lh + 24px); cursor: text; }
-.listitem-transclusion.refx-qembed .transclusion-container-div:has(.listitem ~ .listitem) { padding-bottom: 12px; }
+/* live-search AND standalone line-ref embeds keep a writing strip at the bottom:
+   clicking it appends a new indented child under the transcluded line. ZERO-JUMP:
+   the strip reserves exactly one child line's worth of space (1lh + line margins),
+   and the moment the child appears the :has() rule collapses the strip to the
+   container's natural 12px padding — the collapse cancels the added line in the
+   SAME layout pass, so nothing below shifts (verified: box height unchanged across
+   the add). Once a child exists you extend with Enter (native, no strip needed). */
+.listitem-transclusion.refx-qembed .transclusion-container-div,
+.listitem-transclusion.refx-lineembed .transclusion-container-div { padding-bottom: calc(1lh + 24px); cursor: text; }
+.listitem-transclusion.refx-qembed .transclusion-container-div:has(.listitem ~ .listitem),
+.listitem-transclusion.refx-lineembed .transclusion-container-div:has(.listitem ~ .listitem) { padding-bottom: 12px; }
 /* file/image property values */
 .refx-propcard-img { width: 135px; max-width: 100%; height: auto; border-radius: 4px; display: block; cursor: pointer; }
 .refx-file-ico { margin-right: 5px; font-size: 12px; opacity: .8; }

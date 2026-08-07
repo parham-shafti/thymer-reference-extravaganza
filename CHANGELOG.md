@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.3.0 — 2026-07-18
+
+**New**
+- **Add indented lines under a standalone line embed.** When you expand a `[[` line reference whose target has no children of its own, the embed now shows a writing strip at the bottom. Click it to add an indented child line under the referenced line, with no layout jump (the same affordance live-search embeds already had).
+
+**Fixes**
+- **Property cards no longer show archived fields.** A retired collection field (one that's still in the schema but switched off, so it doesn't appear in the native property pane) was being listed on the embedded card, sometimes twice. Cards now mirror native and show only active fields.
+- **Relation picker search now ranks by relevance, like native.** Searching a record field (Habitat and the like) puts exact and prefix matches first instead of leaving the list alphabetical, so typing "psychology" surfaces "Psychology" at the top rather than burying it.
+
 ## v3.2.1 — 2026-07-16
 
 - **Fixed: dates went missing from a line's text.** In `[[` search results, the hover preview, and the alias box, a date on the line (like "Thu Jul 16") rendered blank, so it dropped out of the displayed text. Dates (and times, and granular labels like "Week 28") now show with their native-looking label.

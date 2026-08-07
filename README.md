@@ -56,7 +56,7 @@ Run **Convert reference ↔ embedded line** from the Command Palette, or press *
 See what a reference points to without leaving the page you're on — and open as many as you like.
 
 1. Select the reference (a page reference or a `[[` line reference).
-2. Press **Cmd+Down** (macOS) / **Ctrl+Down** (Windows/Linux) to expand it. The referenced content appears inline, nested right under the reference: a line reference shows that line and its children; a page reference shows the page's content. It's the real thing, so you can edit it in place and your changes save to the source.
+2. Press **Cmd+Down** (macOS) / **Ctrl+Down** (Windows/Linux) to expand it. The referenced content appears inline, nested right under the reference: a line reference shows that line and its children; a page reference shows the page's content. It's the real thing, so you can edit it in place and your changes save to the source. If a line reference points to a line with no children of its own, a writing strip at the bottom lets you add an indented child under it (with no layout jump).
 3. Press **Cmd+Up** / **Ctrl+Up** to collapse the embed for the reference under the caret (or the one the caret is inside). To clear them all, run **Collapse all embeds (this page)** from the Command Palette.
 
 **Many at once, and they persist.** Expanding a second reference no longer collapses the first — every embed stays open. Because each embed is a real line in your document, it survives a reload; it stays until you collapse it.
