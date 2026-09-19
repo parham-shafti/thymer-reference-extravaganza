@@ -371,12 +371,12 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.4.0"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.4.1"; } catch (e) {} // live-version tell for debugging
     // Build tag, bumped on every dev deploy: the app can serve a STALE plugin
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.4.0-release"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.4.1-release"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     this._injectStyle();
     // Restore the cached native indent-line geometry before the first paint, so a
@@ -606,7 +606,11 @@ class Plugin extends AppPlugin {
     if (!ld) return null;
     let descH = 0, padB = 0;
     try {
-      descH = parseFloat(getComputedStyle(ld, "::after").height) || 0;
+      const aCS = getComputedStyle(ld, "::after");
+      descH = parseFloat(aCS.height) || 0;
+      // border-box: computed height includes the cover padding — strip it so
+      // the double-click band matches the visible text, not the padded box.
+      if (aCS.boxSizing === "border-box") descH -= (parseFloat(aCS.paddingTop) || 0) + (parseFloat(aCS.paddingBottom) || 0);
       padB = parseFloat(getComputedStyle(ld).paddingBottom) || 0;
     } catch (err) { return null; }
     if (!descH) return null;
@@ -959,7 +963,14 @@ class Plugin extends AppPlugin {
         const lvl = (String(ld.className).match(/heading-h(\d)/) || [])[1];
         if (!lvl || lvlFix[lvl] !== undefined) continue;
         const after = getComputedStyle(ld, "::after");
-        const descH = parseFloat(after.height);
+        // CONTENT height. Thymer's global box-sizing is border-box, so computed
+        // height INCLUDES the ::after's own padding — and since v3.4.0 the
+        // bottom cover puts real padding there. Reading it raw inflated descH
+        // by ~9px, the equalizer "corrected" the gap it thought was too small,
+        // and every described heading sat ~9px too low (his report the same
+        // night). Strip the padding so the formulas mean the visible text box.
+        let descH = parseFloat(after.height);
+        if (after.boxSizing === "border-box") descH -= (parseFloat(after.paddingTop) || 0) + (parseFloat(after.paddingBottom) || 0);
         const cur = parseFloat(after.marginTop);
         if (!isFinite(descH) || !isFinite(cur)) continue;
         // Read the padding that actually landed, never the constant: Thymer's own

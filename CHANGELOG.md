@@ -1,5 +1,9 @@
 # Changelog
 
+## v3.4.1 — 2026-09-19
+
+- **Fixed: heading descriptions sat too low.** v3.4.0's selection cover added padding inside the description box, and the spacing pass read that padded height as text height (Thymer's global border-box sizing includes padding in computed height), so it pushed every described heading's subtitle about 9px down. The measurement now reads the visible text box, and the gap is back to its tuned 7px. The double-click-to-edit hit area follows the visible text again too.
+
 ## v3.4.0 — 2026-09-19
 
 **New: Line descriptions**
