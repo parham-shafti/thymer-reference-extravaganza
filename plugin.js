@@ -15,6 +15,80 @@
 // typing pays a single comparison. No MutationObservers, no polling, no rAF
 // loops, no work on scroll or render.
 
+/* ── VIEW OPTIONS: registration ─────────────────────────────────────────────
+ * The ⋯ chip on a line and the menu behind it belong to the View Options
+ * plugin. We contribute ONE provider record — plain data plus our own
+ * callbacks — and it does all of the rendering: the chip, the menu surface,
+ * the in-block filter, the geometry. Nothing here draws anything.
+ *
+ * With View Options not installed every call below is a no-op: there is no
+ * host to poke, our record simply sits in a list nobody reads, and this plugin
+ * keeps all its other features. That is the whole dependency, and it is on the
+ * plugin that provides the menu, not on another contributor.
+ *
+ * THIS SNIPPET IS STABLE — the contract is what is shared, not this code, so
+ * there is nothing to re-sync when the menu changes. Its canonical text, the
+ * provider shape and the contract live in
+ * Thymer_plugins/shared/SHARED-VIEW-OPTIONS.md. */
+const REFX_VO_GLOBAL = '__thymerViewOptions';
+const REFX_VO_CONTRACT = 1;
+/* OUR STABLE IDENTITY in the registry, and the one thing in this snippet a
+ * plugin must change: registering replaces the record with the same id, and
+ * unregistering removes it by id. */
+const REFX_VO_ID = 'reference-extravaganza.description';
+
+/* Either side may create the record — load order between plugins is nobody's
+ * to decide — so we seed it too. It holds DATA and never implementation, which
+ * is what makes that safe: nothing of ours can end up imposed on anyone else,
+ * whatever version each plugin happens to be. */
+function refxVoRoot() {
+	let R = null;
+	try { R = window[REFX_VO_GLOBAL]; } catch (e) { return null; }
+	if (!R) {
+		R = { contract: REFX_VO_CONTRACT, providers: [], rev: 0, host: null };
+		try { window[REFX_VO_GLOBAL] = R; } catch (e) { return null; }
+		return R;
+	}
+	/* a contract we do not know is a shape we cannot write safely: stand down
+	 * entirely rather than guess */
+	if (R.contract !== REFX_VO_CONTRACT) return null;
+	if (!Array.isArray(R.providers)) R.providers = [];
+	if (typeof R.rev !== 'number') R.rev = 0;
+	return R;
+}
+
+/* Registering REPLACES the record with the same id, which is what keeps a hot
+ * reload — a fresh evaluation of this file while the previous one's record is
+ * still in the registry — from contributing our rows twice. */
+function refxVoRegister(rec) {
+	const R = refxVoRoot();
+	if (!R || !rec || !rec.id) return;
+	const i = R.providers.findIndex((p) => p && p.id === rec.id);
+	if (i >= 0) R.providers.splice(i, 1, rec); else R.providers.push(rec);
+	refxVoPoke(R);
+}
+
+/* onUnload. Safe on an instance whose onLoad never ran (playbook §2). */
+function refxVoUnregister(id) {
+	const R = refxVoRoot();
+	if (!R) return;
+	const i = R.providers.findIndex((p) => p && p.id === id);
+	if (i >= 0) R.providers.splice(i, 1);
+	refxVoPoke(R);
+}
+
+/* "What I contribute just changed" — bump the shared rev and ask the renderer
+ * to repaint NOW. Its own cycle would get there on the next scroll or pointer
+ * release, which is fine for a passive change and reads as "it did nothing"
+ * after a direct user action (measured at ~0.5s, his report 2026-08-13). */
+function refxVoPoke(R) {
+	const RR = R || refxVoRoot();
+	if (!RR) return;
+	RR.rev++;
+	const h = RR.host;
+	if (h && typeof h.poke === 'function') { try { h.poke(); } catch (e) {} }
+}
+
 class Plugin extends AppPlugin {
   // Instance state as class fields (Thymer may call onUnload on an instance
   // whose onLoad never ran — never rely on onLoad to initialise these).
@@ -28,6 +102,7 @@ class Plugin extends AppPlugin {
   _lastBracketTs = 0;
   _hotkey = null;
   _convertCmd = null;
+  _descCmd = null;
   _convertHotkey = null;
   // Multiple embeds are real document lines (the source of truth); we keep no
   // single-slot state. _expandInFlight only debounces double-creates from fast
@@ -86,6 +161,52 @@ class Plugin extends AppPlugin {
   _cardNavResume = null;
   _isMac = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "");
   _STYLE_ID = "refalias-style";
+  // Line DESCRIPTIONS: a subtitle under a line, stored as the line's own meta
+  // property `refx_desc` and rendered ENTIRELY through a generated stylesheet
+  // (own <style> element, rebuilt on demand). Never a DOM node inside the line —
+  // the editor derives caret offsets from its own node tree, so an injected span
+  // flickers, eats Backspaces and walks the caret backwards (THYMER-LESSONS §1.2).
+  // CSS keyed on [data-guid] survives every re-render for free and costs nothing
+  // while typing, and the outline structure is untouched (no child line).
+  _DESC_STYLE_ID = "refx-desc-style";
+  _DESC_PROP = "refx_desc";
+  // Optical gap between a heading's glyphs and its description, in px. Tuned on H1
+  // (Parham approved that one), then applied to every level via _descMetrics.
+  _DESC_GAP = 2.8;
+  // Target heading->description gap, MEASURED from where the glyphs actually end.
+  // 8px is what h1 rendered at when Parham approved its spacing; the refine pass
+  // corrects every other level onto it.
+  _DESC_HEAD_GAP = 7;
+  // Extra space below the description, pushing the child block (and any progress
+  // bar drawn between) down so the line does not crowd its children.
+  _DESC_BLOCK_PUSH = 5;
+  // Non-heading (todo/plain) lines want the block tighter than headings do, so the
+  // progress bar sits closer under the description.
+  _DESC_BLOCK_PUSH_PLAIN = 0;
+  // How much lower a todo/plain description sits than a heading's, without giving
+  // the line any extra height (so nothing below it moves).
+  _DESC_PLAIN_NUDGE = 2;
+  // Ceiling on the per-heading-level gap equalisation (it only ever needs ~3px).
+  _DESC_EQUALISE_MAX = 4;
+  // Frozen indent-line geometry (see _refineDescClips) — approved look, no drift.
+  _DESC_NATIVE_FIXED = { above: -1.94, below: -1.28 };
+  // Shorten the indent line at the TOP only (bottom stays put), so there is a
+  // little air between the progress bar and where the line starts.
+  _DESC_LINE_TRIM = 2;
+  // How far ABOVE the first child the indent line starts. Matches the h2 look
+  // Parham approved and is applied to every level and plain lines alike.
+  _DESC_LINE_PAD = 4;
+  _descT = 0;      // debounce timer for stylesheet rebuilds
+  _descCSS = "";   // last emitted CSS — skip no-op DOM writes
+  _descClipCSS = ""; // measured indent-line clips, appended after the base rules
+  _descClipRaf = 0;
+  _descClipT = 0;
+  _descObs = null;   // re-measures the indent line when the outline changes
+  _descObsT = 0;
+  _descNative = null; // {above, below}: how far a NATIVE indent line overshoots its children
+  _descLastDown = null;    // first press of a possible double-click on a description
+  _descSwallowUntil = 0;   // eat the rest of that pointer sequence
+  _DESC_NATIVE_KEY = "refx-desc-native";
   _CARD_CLASS = "refx-propcard";
   _CARD_SKIP = new Set(["Created", "Modified", "Banner", "Icon", "Scene", "Canvas Text", "Assets", "Assets 2", "Assets 3", "Assets 4", "Scene Rev", "Scene Schema", "Source Note", "Chunks", "Manifest"]);
 
@@ -250,9 +371,17 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.3.0"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.4.0-dev"; } catch (e) {} // live-version tell for debugging
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     this._injectStyle();
+    // Restore the cached native indent-line geometry before the first paint, so a
+    // page with no undescribed parent still lands on real measurements.
+    try {
+      const raw = localStorage.getItem(this._DESC_NATIVE_KEY);
+      const v = raw ? JSON.parse(raw) : null;
+      if (v && isFinite(v.above) && isFinite(v.below)) this._descNative = v;
+    } catch (e) {}
+    this._rebuildDescCSS(); // line descriptions: paint before the first frame
     this._ensureThemeObserver();
     this._buildFieldTypes(); // async; schema-based property typing (empty fields)
 
@@ -283,6 +412,11 @@ class Plugin extends AppPlugin {
       icon: "ti-arrows-exchange",
       onSelected: () => { this._onConvert(); },
     });
+    this._descCmd = this.ui.addCommandPaletteCommand({
+      label: "Set Description for Line",
+      icon: "ti-file-description",
+      onSelected: () => { this._onDescCommand(); },
+    });
 
     const cfg = (this.getConfiguration && this.getConfiguration()) || {};
     const shortcutStr = (cfg.custom && cfg.custom.shortcut) || "Mod+Shift+A";
@@ -294,6 +428,8 @@ class Plugin extends AppPlugin {
     window.addEventListener("keydown", this._handleExpandKey, true);
     window.addEventListener("keydown", this._handleCardNavTrigger, true);
     window.addEventListener("keydown", this._handleConvertKey, true);
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) window.addEventListener(t, this._handleDescPointer, true);
+    window.__refxDescDbl = this._handleDescPointer; // hot-reload stash
     // Window-singleton stash of the always-on handlers: a hot-reload re-runs onLoad
     // on the SAME document without disposing the prior instance, so without this
     // every update stacks another copy of all four capture listeners (and the old
@@ -311,11 +447,19 @@ class Plugin extends AppPlugin {
     document.addEventListener("visibilitychange", this._discoverTrigger, false);
     window.addEventListener("focus", this._discoverTrigger, false);
     window.__refxDiscoverTrigger = this._discoverTrigger;
+    // The shared View Options menu, which the View Options PLUGIN renders.
+    // Registering REPLACES any record with our id (so a hot reload cannot
+    // duplicate the row) and pokes it so the row is offered at once. With View
+    // Options not installed this is a no-op and we simply have no menu row.
+    try { refxVoRegister(this._voProvider()); } catch (e) {}
     this._rehydrate(0);
   }
 
   _onRecordUpdated(ev) {
     let g = null; try { g = ev && ev.recordGuid; } catch (e) {}
+    // Descriptions can change on another client (or on a page that just loaded
+    // its lines) — a debounced stylesheet rebuild is the whole keep-alive.
+    this._scheduleDescCSS();
     // Refresh any open cards for the changed record IN PLACE (its title/props
     // changed) — no teardown, so a local edit (which fires record.updated too) or a
     // remote change doesn't flicker the card. COALESCED per lineGuid: typing in an
@@ -366,6 +510,10 @@ class Plugin extends AppPlugin {
     // on the emptied _cards, so a disabled instance can't resurrect itself or
     // clobber a newer instance's state.
     this._unloaded = true;
+    // Leave the shared View Options menu: drop our provider by id, so our row
+    // goes and View Options repaints without it. Safe on an instance whose
+    // onLoad never ran — the snippet guards that itself.
+    try { refxVoUnregister(REFX_VO_ID); } catch (e) {}
     if (this._rehydrateT) { try { clearTimeout(this._rehydrateT); } catch (e) {} this._rehydrateT = 0; }
     if (this._activeEdit) { try { this._activeEdit.cancel(); } catch (e) {} this._activeEdit = null; }
     for (const t of this._rowRefreshT.values()) { try { clearTimeout(t); } catch (e) {} }
@@ -382,6 +530,8 @@ class Plugin extends AppPlugin {
     window.removeEventListener("keydown", this._handleExpandKey, true);
     window.removeEventListener("keydown", this._handleCardNavTrigger, true);
     window.removeEventListener("keydown", this._handleConvertKey, true);
+    try { for (const t of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) window.removeEventListener(t, this._handleDescPointer, true); } catch (e) {}
+    window.__refxDescDbl = null;
     window.__refxKeyHandlers = null;
     this._exitCardNav();
     try { document.removeEventListener("visibilitychange", this._discoverTrigger, false); } catch (e) {}
@@ -400,10 +550,607 @@ class Plugin extends AppPlugin {
     if (this._collapseAllCmd && this._collapseAllCmd.remove) this._collapseAllCmd.remove();
     if (this._editRecordCmd && this._editRecordCmd.remove) this._editRecordCmd.remove();
     if (this._convertCmd && this._convertCmd.remove) this._convertCmd.remove();
-    this._cmd = this._shortcutCmd = this._collapseAllCmd = this._editRecordCmd = this._convertCmd = null;
+    if (this._descCmd && this._descCmd.remove) this._descCmd.remove();
+    this._cmd = this._shortcutCmd = this._collapseAllCmd = this._editRecordCmd = this._convertCmd = this._descCmd = null;
     this._closeModal();
     const st = document.getElementById(this._STYLE_ID);
     if (st) st.remove();
+    // Descriptions are plugin-rendered: with the plugin gone the lines go back to
+    // plain (the data stays in refx_desc, so it returns when it loads again).
+    if (this._descT) { try { clearTimeout(this._descT); } catch (e) {} this._descT = 0; }
+    if (this._descClipRaf) { try { cancelAnimationFrame(this._descClipRaf); } catch (e) {} this._descClipRaf = 0; }
+    if (this._descClipT) { try { clearTimeout(this._descClipT); } catch (e) {} this._descClipT = 0; }
+    this._teardownDescObserver();
+    this._descCSS = "";
+    this._descClipCSS = "";
+    const dst = document.getElementById(this._DESC_STYLE_ID);
+    if (dst) dst.remove();
+  }
+
+  // ------------------------------------------------------- line descriptions
+
+  // A description is a subtitle shown under a line. It is NOT a document line:
+  // it lives in the line's meta property `refx_desc`, so the outline structure
+  // is untouched (no child appears, nothing folds/moves/exports differently) and
+  // it cannot be deleted by a stray Backspace. It renders through a generated
+  // stylesheet — see the _DESC_STYLE_ID note for why nothing is ever injected
+  // into the line's DOM. Set/edit/remove it with the command (no hover, no
+  // placeholder: an unset line looks exactly like today).
+  _descTextFor(lineGuid) {
+    try {
+      const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[lineGuid];
+      const v = st && st.props && st.props[this._DESC_PROP];
+      return typeof v === "string" ? v : (v == null ? "" : String(v));
+    } catch (e) { return ""; }
+  }
+
+  // Double-click ON the description opens its editor. The description is a CSS
+  // ::after with pointer-events:none, so there is nothing to attach a listener to —
+  // instead watch presses on the line and test whether they landed inside the band
+  // the description occupies (the bottom of .line-div's content box, above the
+  // padding we add). Returns the line guid, or null when the press was elsewhere.
+  _descBandHit(e) {
+    if (this._unloaded || this._modal || this._link) return null;
+    if (e.button !== undefined && e.button !== 0) return null;
+    let li = null;
+    try { li = e.target && e.target.closest && e.target.closest(".listitem[data-guid]"); } catch (err) {}
+    if (!li) return null;
+    const guid = li.getAttribute("data-guid");
+    if (!guid || !this._descTextFor(guid)) return null;
+    const ld = li.querySelector(".line-div");
+    if (!ld) return null;
+    let descH = 0, padB = 0;
+    try {
+      descH = parseFloat(getComputedStyle(ld, "::after").height) || 0;
+      padB = parseFloat(getComputedStyle(ld).paddingBottom) || 0;
+    } catch (err) { return null; }
+    if (!descH) return null;
+    const r = ld.getBoundingClientRect();
+    const bandBottom = r.bottom - padB, bandTop = bandBottom - descH;
+    if (e.clientY < bandTop - 1 || e.clientY > bandBottom + 1) return null;
+    if (e.clientX < r.left || e.clientX > r.right) return null;
+    return { guid, li };
+  }
+
+  // Swallowing only `dblclick` was too late: by then Thymer had already handled the
+  // SECOND mousedown and selected the word (Parham saw the line highlight behind the
+  // modal). So detect the double ourselves on the press, eat that whole pointer
+  // sequence, and open the editor from there. The FIRST press is left alone, so a
+  // single click still behaves natively.
+  _handleDescPointer = (e) => {
+    const now = Date.now();
+    if (this._descSwallowUntil && now < this._descSwallowUntil) {
+      // tail of a double we already handled (mouseup / click / dblclick)
+      if (this._descBandHit(e)) { e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation(); }
+      return;
+    }
+    if (e.type !== "pointerdown" && e.type !== "mousedown") return;
+    const hit = this._descBandHit(e);
+    if (!hit) { this._descLastDown = null; return; }
+    const prev = this._descLastDown;
+    if (prev && prev.guid === hit.guid && now - prev.t < 450) {
+      this._descLastDown = null;
+      this._descSwallowUntil = now + 700;
+      e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
+      const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[hit.guid];
+      this._openDescModal({ lineGuid: hit.guid, pageGuid: st && st.rguid, lineNode: hit.li, anchorNode: null });
+      return;
+    }
+    this._descLastDown = { guid: hit.guid, t: now };
+  };
+
+  _onDescCommand() {
+    const hit = this._detect();
+    if (!hit || !hit.lineGuid) return this._toast("Put the cursor on a line first.");
+    // A live-search result row is virtual; _detect already remapped it to the
+    // real line, so the description lands on the source line (and shows in both).
+    this._openDescModal(hit);
+  }
+
+  // Popover editor anchored under the line. We tried an inline field rendered in
+  // place of the description; it never stopped shifting by a few pixels on open, so
+  // Parham called it: back to the popover, which at least never jumps.
+  _openDescModal(hit) {
+    this._closeModal();
+    const current = this._descTextFor(hit.lineGuid);
+    const catcher = this._el("div", "refalias-catch");
+    const pop = this._el("div", "refalias-pop");
+
+    const field = this._el("div", "refalias-field");
+    const input = this._el("input", "refalias-input");
+    input.type = "text";
+    input.value = current;
+    const clear = this._el("button", "refalias-clear", "×");
+    clear.title = "Clear";
+    clear.addEventListener("click", () => { input.value = ""; input.focus(); });
+    field.append(input, clear);
+
+    const foot = this._el("div", "refalias-foot");
+    foot.append(this._el("span", "refalias-hint", "Enter to save · Empty removes the description"));
+    const save = this._el("button", "refalias-btn refalias-primary refalias-save", "Save");
+    foot.append(save);
+
+    pop.append(field, foot);
+    catcher.append(pop);
+    document.body.append(catcher);
+    this._modal = { backdrop: catcher };
+
+    // The caret is sacred: a changed value leaves the user exactly where they
+    // stood, so closing only hands the keyboard back.
+    const close = () => { this._closeModal(); this._refocusEditor(); };
+    const doSave = () => { close(); this._writeDescription(hit, input.value); };
+    save.addEventListener("click", doSave);
+    catcher.addEventListener("mousedown", (e) => { if (e.target === catcher) close(); });
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); doSave(); }
+      else if (e.key === "Escape") { e.preventDefault(); close(); }
+    });
+
+    this._positionPopover(pop, [hit.lineNode, hit.anchorNode]);
+    setTimeout(() => { try { input.focus(); const n = input.value.length; input.setSelectionRange(n, n); } catch (e) {} }, 0);
+  }
+
+  async _writeDescription(hit, raw) {
+    const text = String(raw == null ? "" : raw).trim();
+    // _pageRecord, not getRecord: an unmaterialized future journal day has a
+    // synthetic page guid that getRecord cannot resolve.
+    const rec = await this._pageRecord(hit.pageGuid);
+    if (!rec) return this._toast("Couldn't find the current page.");
+    let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
+    const line = this._findLineDeep(items, hit.lineGuid);
+    if (!line) return this._toast("Couldn't find the line you're on.");
+    try { await line.setMetaProperty(this._DESC_PROP, text || null); } catch (e) { return this._toast("Couldn't save the description."); }
+    this._rebuildDescCSS(); // repaint now; the debounced hooks cover everything else
+    // which lines we claim in the shared menu just changed (we only claim lines
+    // that HAVE a description) — tell View Options to repaint now
+    try { refxVoPoke(); } catch (e) {}
+    this._toast(text ? "Description set" : "Description removed");
+  }
+
+  // ---- the shared View Options menu: this plugin's provider ----------------
+  // The "..." chip on a line is shared property (see the generated region at the
+  // top of this file). We contribute one row, "Description", and the module
+  // renders it next to whatever Supertask and anyone else contribute for the
+  // same line. The module never learns what the row does: onSelect is ours.
+  //
+  // TWO PREDICATES, and the split is the whole point (2026-08-13, his question
+  // "do I have to ask Reference Extravaganza to add a Description now?"):
+  //
+  //   appliesTo     — WE SUMMON A CHIP only on a line that already HAS a
+  //                   description. His rule for this feature is "no hover, no
+  //                   placeholder: an unset line looks exactly like today"
+  //                   (2026-08-12), and a chip on every text line would be both
+  //                   noise and a measurable cost on every scroll frame.
+  //   appliesToRow  — but wherever a chip is ALREADY there for someone else's
+  //                   reason, offering Description costs nothing and is the
+  //                   obvious place to reach for it. So the row shows on any
+  //                   line that can carry one, set or not.
+  //
+  // Net effect: a line with a chip can gain a description from the menu; a bare
+  // line still uses the command, because it has no chip to hang a menu on.
+  _voProvider() {
+    let version = "";
+    try { version = String(window.__REFX_VERSION || ""); } catch (e) {}
+    const live = (st) => !!st && !st.is_trashed && !st.is_deleted && !st.is_virtual;
+    return {
+      id: REFX_VO_ID,
+      version: version,
+      order: 20,
+      appliesTo: (ctx) => live(ctx.state) && !!this._descTextFor(ctx.guid),
+      appliesToRow: (ctx) => {
+        const st = ctx.state;
+        if (!live(st)) return false;
+        // An embed / transclusion row is a REAL line whose props.itemref points
+        // at the target: its description belongs to the TARGET, not to it.
+        if (st.props && st.props.itemref) return false;
+        return ctx.type === "heading" || ctx.type === "task" || ctx.type === "text";
+      },
+      build: (ctx) => [{
+        key: "desc",
+        label: "Description",
+        icon: "ti-file-description",
+        checked: !!this._descTextFor(ctx.guid), // accent when this line has one
+        onSelect: (c, api) => {
+          api.close();
+          const st = c.state || {};
+          // c.node is the exact rendered row the chip sat on, so the popover
+          // anchors under THAT copy of the line (a transclusion renders the
+          // same guid twice). Falls back to centred when the row has gone.
+          this._openDescModal({ lineGuid: c.guid, pageGuid: st.rguid, lineNode: c.node || null, anchorNode: null });
+        },
+      }],
+    };
+  }
+
+  _ensureDescStyle() {
+    let st = document.getElementById(this._DESC_STYLE_ID);
+    if (!st) { st = document.createElement("style"); st.id = this._DESC_STYLE_ID; document.head.appendChild(st); }
+    return st;
+  }
+
+  // Coalesce rebuilds (navigation + a burst of record.updated during typing).
+  _scheduleDescCSS() {
+    if (this._unloaded) return;
+    if (this._descT) { try { clearTimeout(this._descT); } catch (e) {} }
+    this._descT = setTimeout(() => { this._descT = 0; this._rebuildDescCSS(); }, 250);
+  }
+
+  // Rebuild the whole description stylesheet from the model. Rules are keyed on
+  // [data-guid], so they keep working through every re-render, apply to the line
+  // wherever it renders (including inside a transclusion), and are harmless when
+  // the line isn't on screen. The look is emitted ONCE as a selector list; only
+  // the content string is per line.
+  _rebuildDescCSS() {
+    if (this._unloaded) return;
+    const map = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const sels = [], heads = [], indents = [], rules = [], divs = [], divsPlain = [], selsPlain = [];
+    let firstGuid = null;
+    for (const g in map) {
+      const it = map[g];
+      if (!it || it.is_deleted || it.is_trashed) continue;
+      const v = it.props && it.props[this._DESC_PROP];
+      if (!v) continue;
+      if (!firstGuid) firstGuid = g;
+      const esc = this._escCssAttr(g);
+      // ON .line-div, NOT .lineitem-text: the text is an INLINE span, so a block
+      // ::after inside it breaks the inline flow and shoves anything trailing the
+      // text sideways/down — that is what displaced Supertask's per-line "…"
+      // button. .line-div is a block, so the description lands cleanly underneath
+      // and every inline decoration keeps its exact place.
+      const sel = '.listitem[data-guid="' + esc + '"] .line-div::after';
+      sels.push(sel);
+      if (it.type !== "heading") selsPlain.push(sel);
+      (it.type === "heading" ? divs : divsPlain).push('.listitem[data-guid="' + esc + '"] .line-div');
+      heads.push('.listitem-heading[data-guid="' + esc + '"] .line-div::after');
+      indents.push('.listitem[data-guid="' + esc + '"] .listitem-indentline');
+      rules.push(sel + '{content:"' + this._escCssString(String(v)) + '";}');
+    }
+    let css = "";
+    if (sels.length) {
+      const m = this._descMetrics(firstGuid);
+      css = sels.join(",") + "{display:block;margin-top:" + m.base.margin + "px;" +
+        "font-size:var(--text-size-small,12px);line-height:1.4;" +
+        "color:var(--text-muted,rgba(127,127,127,.9));white-space:pre-wrap;" +
+        "font-weight:400;font-style:normal;pointer-events:none;}\n" +
+        // The indent line is absolutely positioned inside .line-div at a FIXED top
+        // Thymer computed WITHOUT the description, so it starts too high and crosses
+        // it (and anything drawn under the line, e.g. Supertask's progress bar).
+        // CLIP the top rather than pushing with margin-top: margin moved the whole
+        // box, so its BOTTOM overshot into the row below. clip-path hides exactly
+        // the overlapping strip and leaves the box (and its bottom) where Thymer put
+        // it. The line is painted as a dotted border-left, which clip-path clips.
+        indents.join(",") + "{clip-path:inset(" + m.base.clip + "px 0 0 0);}\n" +
+        // Breathing room UNDER the description, so the whole child block (and the
+        // progress bar other plugins draw between them) sits a little lower —
+        // Parham: "du behöver skjuta hela childblocket ner pyttelite". Padding on
+        // .line-div grows the line, and Thymer's layout moves the rows below it.
+        (divs.length ? divs.join(",") + "{padding-bottom:" + this._DESC_BLOCK_PUSH + "px !important;}\n" : "") +
+        (divsPlain.length ? divsPlain.join(",") + "{padding-bottom:" + this._DESC_BLOCK_PUSH_PLAIN + "px !important;}\n" : "") +
+        // Todo/plain descriptions rest a touch lower (that is where Parham wants
+        // them). padding-top moves the TEXT down; the matching negative
+        // margin-bottom gives the height straight back, so the progress bar and the
+        // children below do not move at all.
+        (selsPlain.length ? selsPlain.join(",") + "{padding-top:" + this._DESC_PLAIN_NUDGE + "px;margin-bottom:-" + this._DESC_PLAIN_NUDGE + "px;}\n" : "") +
+        rules.join("\n");
+      // Per HEADING LEVEL, MEASURED live instead of one fixed nudge: every level has
+      // its own line box (h1 47px around 27.4px text, h2 30.4/21.3, h3 28.9/18.1,
+      // h4 28.4/16.3), so a single -7px hugged h1 nicely but bit into h2/h3/h4.
+      // Deriving the pull-up from each level's own half-leading keeps the SAME
+      // optical gap under every heading, and the clip follows what the description
+      // actually adds at that level.
+      for (const lvl in m.heads) {
+        const hm = m.heads[lvl];
+        css += "\n" + heads.map((s) => s.replace(".line-div::after", ".line-div.heading-h" + lvl + "::after")).join(",") +
+          "{margin-top:" + hm.margin + "px;}\n" +
+          indents.map((s) => s.replace(".listitem-indentline", ".line-div.heading-h" + lvl + " .listitem-indentline")).join(",") +
+          "{clip-path:inset(" + hm.clip + "px 0 0 0);}";
+      }
+    }
+    // With no described lines the refine pass never runs again (the else branch
+    // below tears the observer down), so drop the measured clip/chevron rules
+    // here — otherwise removing the LAST description left them applied forever.
+    if (css !== this._descCSS || (!sels.length && this._descClipCSS)) {
+      if (!sels.length) this._descClipCSS = "";
+      this._descCSS = css;
+      this._ensureDescStyle().textContent = css + this._descClipCSS;
+    }
+    // The analytic clip above only knows about OUR description. Anything else drawn
+    // between the line and its children (Supertask's progress bar) still gets
+    // crossed. Measuring against the first child instead is exact whatever sits in
+    // between, so refine on the next frame. clip-path does not affect layout, so
+    // this measure-then-clip pass cannot oscillate.
+    // Measure on the next frame AND once more shortly after: other plugins inject
+    // their own per-line decorations (Supertask's progress bar) after us, and an
+    // rAF-only pass caught a pre-decoration layout (it produced an 8px clip where
+    // ~36px was needed).
+    if (sels.length) {
+      this._ensureDescObserver();
+      if (!this._descClipRaf) {
+        this._descClipRaf = requestAnimationFrame(() => { this._descClipRaf = 0; this._refineDescClips(); });
+      }
+      // The timeout is scheduled UNCONDITIONALLY, never gated on the rAF flag:
+      // rAF is SUSPENDED while the window is occluded, so a pending frame can sit
+      // forever with _descClipRaf still set — and when the timeout lived inside
+      // that gate, every later rebuild skipped BOTH paths and the refine pass
+      // simply never ran again (seen live: the indent line stayed on the analytic
+      // clip, half cut off, with a child right there under it).
+      if (this._descClipT) { try { clearTimeout(this._descClipT); } catch (e) {} }
+      this._descClipT = setTimeout(() => { this._descClipT = 0; this._refineDescClips(); }, 350);
+    } else this._teardownDescObserver();
+  }
+
+  // Clip each described line's indent line so it STARTS exactly at the top of its
+  // first child ("i linje med översta childen") and keeps Thymer's own bottom, so
+  // it spans the children and stops before the next sibling.
+  _refineDescClips() {
+    if (this._unloaded) return;
+    const map = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const parts = [];
+    // FIXED, not measured. Calibrating against "a native line" looked principled
+    // but there is no single native value to match: undescribed lines measured
+    // -5.9, -3.9, +3.1 and +18 depending on type and context, so whichever one the
+    // pass happened to pick changed the geometry between repaints — that is the
+    // spacing Parham kept seeing shift on its own, including headings he had
+    // already approved and I had not touched. These two numbers are the values that
+    // were live when he approved the look. Do NOT replace this with a measurement.
+    const nat = this._DESC_NATIVE_FIXED;
+    const gapByLvl = {};
+    // Equalise the heading -> description gap ACROSS LEVELS by measuring what
+    // actually rendered and correcting the error. Deriving it from font metrics left
+    // h1 at 8.0px but h2/h3/h4 at 5.8-6.5px, because glyphs do not fill their em box
+    // the same way at every size. One sample per level is enough; the correction is
+    // exact, so it converges in a single pass and then stops emitting changes
+    // (identical CSS = no DOM write = no further mutation = no loop).
+    // FREEZE the per-level correction while an inline editor is open. Opening one
+    // re-runs this pass, and if a level's correction landed on a new value right
+    // then, the description shifted a pixel or two out from under the field — which
+    // is exactly the "heading 4 hoppar lite" he saw. Reuse the last settled values.
+    const lvlFix = {};
+    for (const g in map) {
+      const it = map[g];
+      if (!it || !(it.props && it.props[this._DESC_PROP])) continue;
+      try {
+        const n = document.querySelector('.listitem[data-guid="' + this._escCssAttr(g) + '"]');
+        const ld = n && n.querySelector(".line-div");
+        const tx = n && n.querySelector(".lineitem-text");
+        if (!ld || !tx) continue;
+        const lvl = (String(ld.className).match(/heading-h(\d)/) || [])[1];
+        if (!lvl || lvlFix[lvl] !== undefined) continue;
+        const after = getComputedStyle(ld, "::after");
+        const descH = parseFloat(after.height);
+        const cur = parseFloat(after.marginTop);
+        if (!isFinite(descH) || !isFinite(cur)) continue;
+        // Read the padding that actually landed, never the constant: Thymer's own
+        // heading rules can beat ours, and assuming 5px where 3.04px applied threw
+        // the correction off by ~2px (the 8px gap came out at 10px).
+        const padB = parseFloat(getComputedStyle(ld).paddingBottom) || 0;
+        const gap = (ld.getBoundingClientRect().bottom - padB - descH) - tx.getBoundingClientRect().bottom;
+        if (!isFinite(gap)) continue;
+        lvlFix[lvl] = Math.round((cur - (gap - this._DESC_HEAD_GAP)) * 100) / 100;
+      } catch (e) {}
+    }
+    for (const lvl in lvlFix) {
+      const hs = [];
+      for (const g in map) {
+        const it = map[g];
+        if (it && it.props && it.props[this._DESC_PROP]) hs.push('.listitem-heading[data-guid="' + this._escCssAttr(g) + '"] .line-div.heading-h' + lvl + "::after");
+      }
+      if (hs.length) parts.push(hs.join(",") + "{margin-top:" + lvlFix[lvl] + "px !important;}");
+    }
+    for (const g in map) {
+      const it = map[g];
+      if (!it || it.is_deleted || it.is_trashed) continue;
+      if (!(it.props && it.props[this._DESC_PROP])) continue;
+      try {
+        const esc = this._escCssAttr(g);
+        const node = document.querySelector('.listitem[data-guid="' + esc + '"]');
+        if (!node) continue;
+        // FOLD CHEVRON. Thymer positions it per line via an inline
+        // --line-fold-chevron-top-px it measures from the line's FULL rendered
+        // height — description included — so on a described line it centres on
+        // the whole taller box and lands well below the main row (8.8px low on
+        // the line Parham screenshotted). Re-centre it on the text's FIRST line
+        // fragment (getClientRects()[0], not the union rect: a wrapped line's
+        // union spans every row). Stylesheet !important beats the inline var,
+        // and correcting from the rendered rect converges in one pass.
+        const chev = node.querySelector(":scope > .line-fold-chevron");
+        const chTx = node.querySelector(".lineitem-text");
+        if (chev && chTx) {
+          const fr = chTx.getClientRects()[0] || chTx.getBoundingClientRect();
+          const cr = chev.getBoundingClientRect();
+          let chevCssTop = parseFloat(getComputedStyle(chev).top);
+          if (cr.height && fr.height && isFinite(chevCssTop)) {
+            const wantChevTop = (fr.top + fr.height / 2) - cr.height / 2;
+            const chevPx = Math.round((chevCssTop + (wantChevTop - cr.top)) * 100) / 100;
+            parts.push('.listitem[data-guid="' + esc + '"] > .line-fold-chevron{top:' + chevPx + "px !important;}");
+          }
+        }
+        const il = node.querySelector(".listitem-indentline");
+        if (!il) continue;
+        // Span of ALL rendered descendants. Lines render FLAT, so a child is a
+        // SIBLING node — never look for it inside the parent's node; walk the model.
+        let top = Infinity, bottom = -Infinity;
+        const walk = (parentGuid) => {
+          for (const k in map) {
+            const kid = map[k];
+            if (!kid || kid.is_deleted || kid.is_trashed) continue;
+            const pg = (kid.parent && kid.parent.guid) || kid.parent_guid;
+            if (pg !== parentGuid) continue;
+            const kn = document.querySelector('.listitem[data-guid="' + this._escCssAttr(k) + '"]');
+            if (kn) {
+              const r = kn.getBoundingClientRect();
+              if (r.height) { if (r.top < top) top = r.top; if (r.bottom > bottom) bottom = r.bottom; }
+            }
+            walk(k);
+          }
+        };
+        walk(g);
+        if (!isFinite(top) || !isFinite(bottom)) continue;
+        // SET BOTH ENDS from the measurement instead of clipping. clip-path can only
+        // REMOVE, and on a heading the box already starts BELOW the first child, so
+        // clipping could never reach UP to it (it computed 0 and the line stayed
+        // short — "inte i linje med översta childen"). Positioning it outright gives
+        // exactly the picture he drew: start a little before the first child, end a
+        // little after the last. The element is absolutely positioned inside
+        // .line-div, so writing top/height cannot feed back into layout. !important
+        // because the per-heading-level rule carries more specificity (5 vs 3).
+        const ld = node.querySelector(".line-div");
+        if (!ld) continue;
+        const r2 = (n) => Math.round(n * 100) / 100;
+        // Headings only — todo/plain lines keep Thymer's own line start.
+        // Trim the top on headings AND plain text lines, so a described line's
+        // indent line reads the same length as an undescribed one. NOT on todos —
+        // he explicitly excluded those, their bar/checkbox already sets the rhythm.
+        const trim = (it.type === "task") ? 0 : this._DESC_LINE_TRIM;
+        // Where we WANT the two ends, in viewport coords.
+        const wantTop = top - nat.above + trim;
+        const wantBottom = bottom + nat.below;
+        // CORRECT FROM WHERE IT ACTUALLY IS, rather than computing an offset from
+        // .line-div's top. That offset was measured before our own padding had
+        // landed, so the line ended up ~2.8px low on plain text lines (native −1.9,
+        // ours −4.7 — "bara pyttelite men ändå"). Feeding back from the rendered
+        // rect is immune to that ordering: top/height are absolute, so writing them
+        // never moves anything else, and the next pass lands exactly on target.
+        const cur = il.getBoundingClientRect();
+        let curTop = parseFloat(getComputedStyle(il).top);
+        if (!isFinite(curTop)) curTop = 0;
+        const topPx = r2(curTop + (wantTop - cur.top));
+        const hPx = r2(wantBottom - wantTop);
+        if (!(hPx > 0)) continue;
+        parts.push('.listitem[data-guid="' + esc + '"] .listitem-indentline{top:' + topPx + 'px !important;height:' + hPx + 'px !important;bottom:auto !important;clip-path:none !important;}');
+        // Thymer's OWN spacing between the end of the line box and the first child.
+        // It differs per heading level (h2 gives 12px where h1/h3/h4 give 15), which
+        // is what made h2 read tighter. Independent of our padding: padding moves the
+        // line box bottom and the child down by the same amount, so this stays put
+        // and equalising with it cannot feed back.
+        const lvl2 = (String(ld.className).match(/heading-h(\d)/) || [])[1];
+        if (lvl2) {
+          const tg = Math.round((top - ld.getBoundingClientRect().bottom) * 100) / 100;
+          // Only trust a PLAUSIBLE sample. A line measured mid-edit (or before its
+          // description had rendered) reported a near-zero gap, and the equaliser
+          // "compensated" with ~15px of padding — that is what shoved h4's children
+          // far down the page. Thymer's real spacing here is ~12-16px.
+          if (tg >= 6 && tg <= 30 && gapByLvl[lvl2] === undefined) gapByLvl[lvl2] = tg;
+        }
+      } catch (e) {}
+    }
+    // Equalise the description -> first-child gap across levels by topping up the
+    // padding on the levels Thymer spaces more tightly (h2).
+    const gaps = Object.keys(gapByLvl).map((k) => gapByLvl[k]).filter((v) => isFinite(v));
+    if (gaps.length > 1) {
+      const maxGap = Math.max.apply(null, gaps);
+      for (const lvl in gapByLvl) {
+        // Hard ceiling as a second guard: this correction exists to even out a ~3px
+        // difference between heading levels, never to move a block.
+        const extra = Math.min(this._DESC_EQUALISE_MAX, Math.round((maxGap - gapByLvl[lvl]) * 100) / 100);
+        if (!(extra > 0.1)) continue;
+        const sel = [];
+        for (const g2 in map) {
+          const it2 = map[g2];
+          if (!(it2 && it2.props && it2.props[this._DESC_PROP])) continue;
+          sel.push('.listitem[data-guid="' + this._escCssAttr(g2) + '"] .line-div.heading-h' + lvl);
+        }
+        if (sel.length) parts.push(sel.join(",") + "{padding-bottom:" + (this._DESC_BLOCK_PUSH + extra) + "px !important;}");
+      }
+    }
+    const clipCSS = parts.length ? "\n" + parts.join("\n") : "";
+    if (clipCSS === this._descClipCSS) return;
+    this._descClipCSS = clipCSS;
+    this._ensureDescStyle().textContent = this._descCSS + clipCSS;
+  }
+
+  // The measured top/height is a FIXED px pair, so it goes STALE the moment the
+  // outline under a described line changes — add a child and the line stops short
+  // of it (seen live: h2 ended before its second child). Re-measure on DOM changes.
+  // Sanctioned by THYMER-LESSONS §7: an observer that only regenerates a
+  // plugin-owned stylesheet, debounced, costs nothing — we never touch a line.
+  _ensureDescObserver() {
+    if (this._descObs || this._unloaded) return;
+    const obs = new MutationObserver((muts) => {
+      // No gate on _descClipCSS: it starts empty (a described line with no
+      // rendered children emits nothing), and gating on it made the observer
+      // permanently deaf — when the first child later arrived, the very mutation
+      // that should have triggered the measurement was the one being ignored.
+      if (this._unloaded) return;
+      // Only structural changes matter; typing mutates text nodes inside a line.
+      let structural = false;
+      for (const m of muts) { if (m.type === "childList" && (m.addedNodes.length || m.removedNodes.length)) { structural = true; break; } }
+      if (!structural) return;
+      if (this._descObsT) return; // already queued
+      this._descObsT = setTimeout(() => { this._descObsT = 0; this._refineDescClips(); }, 150);
+    });
+    try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+    this._descObs = obs;
+    window.__refxDescObs = obs; // hot-reload stash (onLoad re-runs without disposing)
+  }
+
+  _teardownDescObserver() {
+    if (this._descObsT) { try { clearTimeout(this._descObsT); } catch (e) {} this._descObsT = 0; }
+    if (this._descObs) { try { this._descObs.disconnect(); } catch (e) {} this._descObs = null; }
+    if (window.__refxDescObs) { try { window.__refxDescObs.disconnect(); } catch (e) {} window.__refxDescObs = null; }
+  }
+
+  // Measure what the description costs, from the LIVE styles rather than hardcoded
+  // numbers, so it follows his theme and type scale instead of drifting when either
+  // changes. Returns the pull-up margin and the indent-line clip for plain lines and
+  // for each heading level found on screen.
+  //   halfLeading = the empty space a line box leaves under its glyphs, (line-height
+  //   of .line-div − font-size of .lineitem-text) / 2. Sitting the description
+  //   _DESC_GAP below the glyphs means margin-top = _DESC_GAP − halfLeading.
+  //   clip = how much taller .line-div actually got = description line + that margin.
+  // KNOWN LIMIT: sized for a ONE-LINE description; a wrapped one under-clips.
+  _descMetrics(sampleGuid) {
+    const px = (v, d) => { const n = parseFloat(v); return isFinite(n) ? n : d; };
+    // --text-size-small is declared in REM in his theme, so a bare parseFloat read
+    // it as 0.875 and every derived number collapsed (the clip came out 0.22px and
+    // headings ended up not clipped at all). Resolve the unit properly.
+    let fs = 12;
+    try {
+      const rootCS = getComputedStyle(document.documentElement);
+      const rootFS = px(rootCS.fontSize, 16);
+      const raw = String(rootCS.getPropertyValue("--text-size-small") || "").trim();
+      const n = parseFloat(raw);
+      if (isFinite(n)) fs = /rem|em$/.test(raw) ? n * rootFS : n;
+    } catch (e) {}
+    // Prefer the size the browser actually resolved on a REAL rendered description
+    // (must be a described line — any other .line-div has no ::after of ours and
+    // would report the inherited size).
+    try {
+      if (sampleGuid) {
+        const el = document.querySelector('.listitem[data-guid="' + this._escCssAttr(sampleGuid) + '"] .line-div');
+        const got = el ? px(getComputedStyle(el, "::after").fontSize, NaN) : NaN;
+        if (isFinite(got) && got > 4) fs = got;
+      }
+    } catch (e) {}
+    const lh = fs * 1.4;
+    const round = (n) => Math.round(n * 100) / 100;
+    const out = { base: { margin: -1, clip: Math.max(0, round(lh - 1)) }, heads: {} };
+    for (let n = 1; n <= 6; n++) {
+      try {
+        const ld = document.querySelector(".line-div.heading-h" + n);
+        if (!ld) continue;
+        const t = ld.querySelector(".lineitem-text");
+        if (!t) continue;
+        const boxLH = px(getComputedStyle(ld).lineHeight, NaN);
+        const textFS = px(getComputedStyle(t).fontSize, NaN);
+        if (!isFinite(boxLH) || !isFinite(textFS)) continue;
+        const margin = round(this._DESC_GAP - (boxLH - textFS) / 2);
+        out.heads[n] = { margin, clip: Math.max(0, round(lh + margin)) };
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  _escCssAttr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
+
+  // CSS string escaping for content: backslash and quote escape, newlines become
+  // the CSS newline escape (rendered thanks to white-space:pre-wrap).
+  _escCssString(s) {
+    return String(s)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\r\n|\r|\n/g, "\\A ");
   }
 
   // ---------------------------------------------------------------- detection
@@ -413,14 +1160,27 @@ class Plugin extends AppPlugin {
   // on the listview, not on the focused component.
   _detect() {
     const lvs = (window.g_universe && window.g_universe.listviews) || [];
-    let best = null;
+    // Pick the listview DELIBERATELY (THYMER-LESSONS §3). hasFocus() is false for
+    // EVERY listview while a dialog or the command palette holds focus, and the
+    // FIRST listview carrying a caret is the WRONG panel in a split view — it
+    // still holds a stale caret from the last time you typed there. That is how a
+    // command run from the palette edited a line in the OTHER panel instead of the
+    // one under the caret (verified live: with the palette open every hasFocus()
+    // was false, yet the right panel still carried .has-focus/.is-target).
+    // Rank: focused > inside the active panel > merely has a caret.
+    let best = null, bestRank = -1;
     for (const lv of lvs) {
       try {
         const pos = lv.selection && lv.selection._caret && lv.selection._caret.pos;
         if (!pos || !pos.list_item || !pos.list_item.state) continue;
-        const cand = { pos, focused: !!(lv.hasFocus && lv.hasFocus()) };
-        if (cand.focused) { best = cand; break; }
-        if (!best) best = cand;
+        let rank = 0;
+        try {
+          const pnl = lv.$container && lv.$container.closest && lv.$container.closest(".panel");
+          if (pnl && (pnl.classList.contains("has-focus") || pnl.classList.contains("is-target") || pnl.classList.contains("focused-panel"))) rank = 1;
+        } catch (e) {}
+        if (lv.hasFocus && lv.hasFocus()) rank = 2;
+        if (rank > bestRank) { best = { pos }; bestRank = rank; }
+        if (rank === 2) break;
       } catch (e) {}
     }
     if (!best) return null;
@@ -493,7 +1253,9 @@ class Plugin extends AppPlugin {
           userGuid = self && (self.guid || (self._getRow && self._getRow().guid));
         } catch (e) {}
       }
-      if (!userGuid) return null;
+      // ref.guid is interpolated into the record id, so a non-string mints a page
+      // called S-<coll>-[object Object]-0-<date> that breaks Markdown Mirror sync
+      if (typeof userGuid !== 'string' || !userGuid) return null;
       const wsGuid = (window.g_universe && window.g_universe.workspaceGuid) || null;
       const y = +m[2].slice(0, 4), mo = +m[2].slice(4, 6) - 1, d = +m[2].slice(6, 8);
       // getJournalRecord only ever calls .toDate() on its date argument
@@ -1252,6 +2014,7 @@ class Plugin extends AppPlugin {
 
   async _onNavigated() {
     if (this._unloaded) return;
+    this._scheduleDescCSS(); // a new page's lines just entered the model
     // Close any UI tied to the page we just left — UNCONDITIONALLY (previously only
     // the zero-embed branch cleaned up, so programmatic navigation to a page that
     // also had embeds left the nav key-handler armed for a gone card, and an open
@@ -2707,9 +3470,13 @@ class Plugin extends AppPlugin {
     window.__refxCardObs = null;
     try { if (window.__refxThemeObs && window.__refxThemeObs.disconnect) window.__refxThemeObs.disconnect(); } catch (e) {}
     window.__refxThemeObs = null;
+    try { if (window.__refxDescObs && window.__refxDescObs.disconnect) window.__refxDescObs.disconnect(); } catch (e) {}
+    window.__refxDescObs = null;
     // The prior instance's ALWAYS-ON capture listeners (its arrow-field refs are
     // unreachable — only the window stash can remove them).
     try { for (const h of window.__refxKeyHandlers || []) window.removeEventListener("keydown", h, true); } catch (e) {}
+    try { for (const t of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) { if (window.__refxDescDbl) window.removeEventListener(t, window.__refxDescDbl, true); } } catch (e) {}
+    window.__refxDescDbl = null;
     window.__refxKeyHandlers = null;
     // Session listeners a prior instance may have left mid-interaction.
     try { if (window.__refxCardNavKey) window.removeEventListener("keydown", window.__refxCardNavKey, true); } catch (e) {}
@@ -4227,7 +4994,7 @@ class Plugin extends AppPlugin {
   background: var(--modal-bg, var(--cmdpal-bg-color, #fcfcfd));
   border: 1px solid rgba(127,127,127,.30);
   box-shadow: var(--shadow-dialog, 0 20px 70px rgba(0,0,0,.45));
-  border-radius: 14px; overflow: hidden;
+  border-radius: 4px; overflow: hidden;
   color: var(--text-color, #555958);
   font-size: 13px; line-height: 1.5;
 }
@@ -4239,7 +5006,7 @@ class Plugin extends AppPlugin {
 .refalias-x {
   border: 0; background: transparent; color: inherit; cursor: pointer;
   font-size: 20px; line-height: 1; opacity: .55; width: 28px; height: 28px;
-  border-radius: 7px; display: flex; align-items: center; justify-content: center;
+  border-radius: 4px; display: flex; align-items: center; justify-content: center;
 }
 .refalias-x:hover { background: rgba(127,127,127,.18); opacity: 1; }
 .refalias-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
@@ -4247,7 +5014,7 @@ class Plugin extends AppPlugin {
 .refalias-sub b { font-weight: 600; opacity: .95; }
 .refalias-input, .refalias-capture {
   width: 100%; box-sizing: border-box;
-  padding: 11px 12px; border-radius: 9px;
+  padding: 11px 12px; border-radius: 4px;
   border: 1px solid rgba(127,127,127,.28); background: rgba(127,127,127,.08);
   color: inherit; font-size: 13px; outline: none;
 }
@@ -4266,7 +5033,7 @@ class Plugin extends AppPlugin {
   background: var(--modal-bg, var(--cmdpal-bg-color, #fcfcfd));
   border: 1px solid rgba(127,127,127,.30);
   box-shadow: var(--shadow-dialog, 0 12px 40px rgba(0,0,0,.35));
-  border-radius: 12px; color: var(--text-color, #555958);
+  border-radius: 4px; color: var(--text-color, #555958);
   font-size: 13px; line-height: 1.5;
 }
 .refalias-field { position: relative; display: flex; align-items: center; }
@@ -4274,7 +5041,7 @@ class Plugin extends AppPlugin {
 .refalias-clear {
   position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
   border: 0; background: transparent; color: inherit; cursor: pointer; opacity: .5;
-  width: 22px; height: 22px; border-radius: 6px; font-size: 16px; line-height: 1;
+  width: 22px; height: 22px; border-radius: 4px; font-size: 16px; line-height: 1;
   display: flex; align-items: center; justify-content: center;
 }
 .refalias-clear:hover { background: rgba(127,127,127,.18); opacity: 1; }
@@ -4286,7 +5053,7 @@ class Plugin extends AppPlugin {
    command-palette look below; card popups override via .refx-cardpop) */
 .refalias-results { display: flex; flex-direction: column; gap: 3px; max-height: 300px; overflow-y: auto; }
 .refalias-result {
-  padding: 8px 11px; border-radius: 7px; cursor: pointer; line-height: 1.3;
+  padding: 8px 11px; border-radius: 4px; cursor: pointer; line-height: 1.3;
   display: flex; flex-direction: column; gap: 3px;
 }
 .refalias-result-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -4349,7 +5116,7 @@ html.is-light .refalias-lp-text b { color: var(--color-primary-700, #2f8873); }
 }
 .refalias-btn {
   border: 1px solid rgba(127,127,127,.28); background: var(--ed-button-bg, transparent);
-  color: inherit; cursor: pointer; border-radius: 9px; padding: 8px 16px; font-size: 13px;
+  color: inherit; cursor: pointer; border-radius: 4px; padding: 8px 16px; font-size: 13px;
 }
 .refalias-btn:hover { background: rgba(127,127,127,.14); }
 .refalias-primary {
