@@ -86,7 +86,7 @@ Give any line a small muted subtitle, rendered just under it.
 
 A description is **not a child line**: your outline structure is untouched, the caret can never land in it, and it can't be deleted by accident while editing around it. It's stored as the line's own metadata, so it syncs across devices and undoes like any other change, and it renders wherever the line renders, inline transclusions included. Selecting the line highlights only the line itself, never the description, and things other plugins draw under a line (a task-progress bar, say) stay visible below it.
 
-With the [View Options](https://github.com/parham-shafti/thymer-view-options) plugin installed, a line with a description also gets a **Description** row in the shared ⋯ line menu. Without it, everything above still works in full.
+The Description row is also part of the shared ⋯ line menu in [View Options](https://github.com/parham-shafti/thymer-view-options), a companion plugin providing a common line menu that any plugin can contribute rows to. With View Options installed, a line with a description gets the ⋯ chip and a **Description** row there; without it, everything above still works in full.
 
 *Under the hood:* the description is a meta property on the line, drawn entirely from a generated per-line stylesheet — no node is ever inserted into the line, which is what keeps the caret and editing unaffected. The plugin measures the rendered result (chevron, indent line, selection overlay) and emits tiny per-line corrections, so the geometry follows your theme and type scale.
 
