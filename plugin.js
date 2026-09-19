@@ -371,7 +371,12 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.4.0-dev"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.4.0"; } catch (e) {} // live-version tell for debugging
+    // Build tag, bumped on every dev deploy: the app can serve a STALE plugin
+    // snapshot right after a restart (server had the new code, the renderer ran
+    // the old), so deploy verification must check THIS in the live page, not
+    // just md5 the server copy.
+    try { window.__REFX_BUILD = "3.4.0-release"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     this._injectStyle();
     // Restore the cached native indent-line geometry before the first paint, so a
@@ -784,7 +789,7 @@ class Plugin extends AppPlugin {
   _rebuildDescCSS() {
     if (this._unloaded) return;
     const map = (window.g_universe && window.g_universe.itemsByGuid) || {};
-    const sels = [], heads = [], indents = [], rules = [], divs = [], divsPlain = [], selsPlain = [];
+    const sels = [], heads = [], indents = [], rules = [], divs = [], divsPlain = [], selsPlain = [], selsTrans = [], bars = [];
     let firstGuid = null;
     for (const g in map) {
       const it = map[g];
@@ -800,10 +805,19 @@ class Plugin extends AppPlugin {
       // and every inline decoration keeps its exact place.
       const sel = '.listitem[data-guid="' + esc + '"] .line-div::after';
       sels.push(sel);
+      selsTrans.push('.transclusion-container-div ' + sel);
       if (it.type !== "heading") selsPlain.push(sel);
       (it.type === "heading" ? divs : divsPlain).push('.listitem[data-guid="' + esc + '"] .line-div');
       heads.push('.listitem-heading[data-guid="' + esc + '"] .line-div::after');
       indents.push('.listitem[data-guid="' + esc + '"] .listitem-indentline');
+      // Supertask draws its progress bar as absolutely positioned ::before /
+      // ::after pseudos ON THE LISTITEM. .line-div is position:relative, so it
+      // (and our opaque description background inside it) paints AFTER those
+      // pseudos in tree order and was HIDING the bar ("nu har du ritat över
+      // Progress baren också"). z-index:1 lifts them back above the background;
+      // they are already pointer-events:none, and on lines without a bar the
+      // pseudos have no content, so this is a no-op there.
+      bars.push('.listitem[data-guid="' + esc + '"]::before,.listitem[data-guid="' + esc + '"]::after');
       rules.push(sel + '{content:"' + this._escCssString(String(v)) + '";}');
     }
     let css = "";
@@ -812,7 +826,21 @@ class Plugin extends AppPlugin {
       css = sels.join(",") + "{display:block;margin-top:" + m.base.margin + "px;" +
         "font-size:var(--text-size-small,12px);line-height:1.4;" +
         "color:var(--text-muted,rgba(127,127,127,.9));white-space:pre-wrap;" +
+        // OPAQUE page-coloured background: the text-selection overlay paints
+        // BELOW the line content, so selecting a described line tinted the
+        // description too, and every timing-based countermeasure lost a race
+        // somewhere (per-rect clip = one unclipped frame per resize, filmed
+        // twice; a mask on the overlay layer is impossible - the layer is
+        // 0px tall, so mask-clip either hides everything or masks nothing).
+        // A background on the ::after simply COVERS whatever the overlay
+        // paints under it, with no timing involved. Same var the panel
+        // paints behind lines, so it is invisible until a selection passes
+        // underneath; transclusions layer their translucent container tint
+        // on top, mirrored in the extra rule below.
+        "background:var(--panel-bg-color,transparent);" +
         "font-weight:400;font-style:normal;pointer-events:none;}\n" +
+        (selsTrans.length ? selsTrans.join(",") + "{background:linear-gradient(var(--ed-container-bg-color,transparent),var(--ed-container-bg-color,transparent)),var(--panel-bg-color,transparent);}\n" : "") +
+        (bars.length ? bars.join(",") + "{z-index:1;}\n" : "") +
         // The indent line is absolutely positioned inside .line-div at a FIXED top
         // Thymer computed WITHOUT the description, so it starts too high and crosses
         // it (and anything drawn under the line, e.g. Supertask's progress bar).
@@ -830,8 +858,14 @@ class Plugin extends AppPlugin {
         // Todo/plain descriptions rest a touch lower (that is where Parham wants
         // them). padding-top moves the TEXT down; the matching negative
         // margin-bottom gives the height straight back, so the progress bar and the
-        // children below do not move at all.
-        (selsPlain.length ? selsPlain.join(",") + "{padding-top:" + this._DESC_PLAIN_NUDGE + "px;margin-bottom:-" + this._DESC_PLAIN_NUDGE + "px;}\n" : "") +
+        // children below do not move at all. padding-BOTTOM stretches the opaque
+        // background down to the line's real bottom edge (the negative-margin zone
+        // otherwise shows a slim selection-coloured line under the description,
+        // which Parham spotted), and the widened margin compensates the height.
+        (selsPlain.length ? selsPlain.join(",") + "{padding-top:" + this._DESC_PLAIN_NUDGE + "px;padding-bottom:" + this._DESC_PLAIN_NUDGE + "px;margin-bottom:-" + (2 * this._DESC_PLAIN_NUDGE) + "px;}\n" : "") +
+        // Same background stretch for HEADINGS, whose line-div carries
+        // _DESC_BLOCK_PUSH px of padding below the description box.
+        (heads.length ? heads.join(",") + "{padding-bottom:" + this._DESC_BLOCK_PUSH + "px;margin-bottom:-" + this._DESC_BLOCK_PUSH + "px;}\n" : "") +
         rules.join("\n");
       // Per HEADING LEVEL, MEASURED live instead of one fixed nudge: every level has
       // its own line box (h1 47px around 27.4px text, h2 30.4/21.3, h3 28.9/18.1,
@@ -864,6 +898,13 @@ class Plugin extends AppPlugin {
     // their own per-line decorations (Supertask's progress bar) after us, and an
     // rAF-only pass caught a pre-decoration layout (it produced an 8px clip where
     // ~36px was needed).
+    // One-time repair: a 2026-09-19 build wrote inline mask-image on the
+    // selection overlay layers, which HID every selection on pages with a
+    // described line (the layer is 0px tall, so the mask swallowed all of it).
+    // Its observer also survives hot reloads as a zombie that keeps rewriting
+    // the mask, so disconnect the stash too. Safe to remove after a few releases.
+    try { if (window.__refxSelObs) { window.__refxSelObs.disconnect(); window.__refxSelObs = null; } } catch (e) {}
+    try { for (const l of document.querySelectorAll(".listview-selections")) { if (l.style.maskImage || l.style.webkitMaskImage) { l.style.maskImage = ""; l.style.webkitMaskImage = ""; l.style.maskSize = ""; l.style.maskRepeat = ""; l.style.maskClip = ""; } } } catch (e) {}
     if (sels.length) {
       this._ensureDescObserver();
       if (!this._descClipRaf) {
@@ -964,6 +1005,80 @@ class Plugin extends AppPlugin {
             const wantChevTop = (fr.top + fr.height / 2) - cr.height / 2;
             const chevPx = Math.round((chevCssTop + (wantChevTop - cr.top)) * 100) / 100;
             parts.push('.listitem[data-guid="' + esc + '"] > .line-fold-chevron{top:' + chevPx + "px !important;}");
+          }
+        }
+        // GUTTER COVER. Thymer paints a second, narrow selection rect for the
+        // control column (checkbox/bullet) left of .line-div, at full line
+        // height, so a teal strip showed beside the description. Stretch the
+        // opaque background over exactly that measured gutter: the strip spans
+        // only THIS line's own column, and ancestor indent lines run left of
+        // this listitem's box, so nothing that must stay visible is covered.
+        {
+          const ldEl = node.querySelector(".line-div");
+          if (ldEl) {
+            // The cover may not cross an ANCESTOR's indent line: those are
+            // drawn with negative left offsets and reach INTO this line's
+            // gutter (measured: a parent's line at x 291.3 inside a child box
+            // starting at 289.3), and an opaque cover would cut a hole in them
+            // at the description rows. Start the cover just right of the
+            // rightmost ancestor line instead of at the listitem edge.
+            let coverLeft = node.getBoundingClientRect().left;
+            try {
+              let pg = (it.parent && it.parent.guid) || it.parent_guid;
+              let hops = 0;
+              while (pg && map[pg] && hops++ < 20) {
+                const pn = document.querySelector('.listitem[data-guid="' + this._escCssAttr(pg) + '"]');
+                const pil = pn && pn.querySelector(".listitem-indentline");
+                if (pil) { const pr = pil.getBoundingClientRect(); if (pr.width && pr.right + 1 > coverLeft) coverLeft = pr.right + 1; }
+                const pit = map[pg];
+                pg = (pit.parent && pit.parent.guid) || pit.parent_guid;
+              }
+            } catch (e) {}
+            const gut = Math.round((ldEl.getBoundingClientRect().left - coverLeft) * 100) / 100;
+            if (gut > 0.5) parts.push('.listitem[data-guid="' + esc + '"] .line-div::after{margin-left:-' + gut + "px;padding-left:" + gut + "px;}");
+            // BOTTOM COVER, measured. The static padding stretch assumes the
+            // description ends the line box, but another plugin can grow the
+            // LISTITEM below the line-div itself: Supertask's progress bar adds
+            // ~15px there, and the selection showed straight through that strip
+            // ("Om det blir en progress bar under sa lacker den igenom").
+            // Stretch the background down to the LISTITEM's bottom edge, plus
+            // the usual 2px. Where the box actually ends CANNOT be derived from
+            // the box model: line-div carries an EXPLICIT height, so the flow
+            // equations lied by ~7px and a thin selection line still peeked out
+            // under the bar (his fourth screenshot). Measure the rendered flow
+            // bottom instead — line-div top + scrollHeight IS the ::after's
+            // border bottom, the lowest in-flow box — and correct the padding
+            // by the difference, feedback-style like the chevron and indent
+            // line. scrollHeight rounds to whole px, so only re-emit when the
+            // error is beyond that noise; margin-bottom keeps handing the
+            // height back so nothing below moves.
+            try {
+              const aCS = getComputedStyle(ldEl, "::after");
+              const pt = parseFloat(aCS.paddingTop) || 0;
+              const pbCur = parseFloat(aCS.paddingBottom) || 0;
+              // scrollHeight also spans absolutely positioned children, and OUR
+              // repositioned indent line runs far below the line (it poisoned
+              // the first read: 118 vs a 62px listitem, so the correction went
+              // negative and never fired). Collapse it for the read — same
+              // task, nothing paints in between — with !important, because our
+              // own stylesheet rule for it carries !important and would win
+              // over a plain inline write. Then scrollHeight is the in-flow
+              // extent: the ::after's border bottom plus line-div's padding.
+              const il2 = node.querySelector(".listitem-indentline");
+              let flowBottom;
+              try {
+                if (il2) { il2.style.setProperty("height", "0px", "important"); il2.style.setProperty("top", "0px", "important"); }
+                const ldPadB2 = parseFloat(getComputedStyle(ldEl).paddingBottom) || 0;
+                flowBottom = ldEl.getBoundingClientRect().top + ldEl.scrollHeight - ldPadB2;
+              } finally {
+                if (il2) { il2.style.removeProperty("height"); il2.style.removeProperty("top"); }
+              }
+              const delta = (node.getBoundingClientRect().bottom + 2) - flowBottom;
+              let pbNew = pbCur;
+              if (Math.abs(delta) > 1.5) pbNew = Math.max(0, Math.round((pbCur + delta) * 100) / 100);
+              const mbNew = Math.round((-(pt + pbNew)) * 100) / 100;
+              if (pbNew > 0.5) parts.push('.listitem[data-guid="' + esc + '"] .line-div::after{padding-bottom:' + pbNew + "px;margin-bottom:" + mbNew + "px;}");
+            } catch (e) {}
           }
         }
         const il = node.querySelector(".listitem-indentline");
@@ -1089,6 +1204,12 @@ class Plugin extends AppPlugin {
     if (this._descObsT) { try { clearTimeout(this._descObsT); } catch (e) {} this._descObsT = 0; }
     if (this._descObs) { try { this._descObs.disconnect(); } catch (e) {} this._descObs = null; }
     if (window.__refxDescObs) { try { window.__refxDescObs.disconnect(); } catch (e) {} window.__refxDescObs = null; }
+    // Strip anything the retired selection-overlay experiments left behind
+    // (inline masks on the layers, clip-path on individual rects).
+    try {
+      for (const layer of document.querySelectorAll(".listview-selections")) { if (layer.style.maskImage || layer.style.webkitMaskImage) { layer.style.maskImage = ""; layer.style.webkitMaskImage = ""; layer.style.maskSize = ""; layer.style.maskRepeat = ""; layer.style.maskClip = ""; } }
+      for (const el of document.querySelectorAll(".listview-selections .text-selection, .listview-selections .text-selection-self")) { if (el.style.clipPath) el.style.clipPath = ""; }
+    } catch (e) {}
   }
 
   // Measure what the description costs, from the LIVE styles rather than hardcoded

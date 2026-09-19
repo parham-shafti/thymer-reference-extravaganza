@@ -1,6 +1,22 @@
 # Changelog
 
-## v3.3.0 — 2026-07-18
+## v3.4.0 — 2026-09-19
+
+**New: Line descriptions**
+- **Give any line a description.** Run **"Set Description for Line"** from the command palette to put a small muted subtitle under the current line. It works on headings, todos and plain text alike.
+- A description is **not** a child line: your outline structure is untouched, the caret can never land in it, and it cannot be deleted by accident while editing. It is stored as the line's own metadata, so it syncs across devices and undoes like any other change.
+- **Double-click a description to edit it.** Enter saves, Esc cancels, saving an empty value removes it. The caret stays where it was.
+- Descriptions render wherever the line renders, inline transclusions included.
+- The look is tuned by hand: the fold chevron stays aligned with the main row, the indent line spans the children exactly, and selecting the line highlights only the line itself, never the description.
+- Plays nicely with plugins that draw under a line: a task-progress bar (such as Supertask's) stays visible and unselected below the description.
+
+**Changed**
+- **The shared ⋯ line menu now lives in its own plugin, [View Options](https://github.com/parham-shafti/thymer-view-options).** With View Options installed, a line with a description gets a Description row in the shared ⋯ menu. Without it, descriptions still work in full through the command and double-click editing.
+
+**Fixes**
+- **A malformed journal reference can no longer halt Markdown Mirror.** A non-string journal reference minted a broken page id, which then aborted every sync run for the whole workspace. The journal lookup now only accepts a proper id.
+
+## v3.3.0 — 2026-09-19
 
 **New**
 - **Add indented lines under a standalone line embed.** When you expand a `[[` line reference whose target has no children of its own, the embed now shows a writing strip at the bottom. Click it to add an indented child line under the referenced line, with no layout jump (the same affordance live-search embeds already had).

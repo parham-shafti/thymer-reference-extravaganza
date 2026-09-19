@@ -76,8 +76,23 @@ Changes save straight to the record. A **Properties · All ⌄** chooser on the 
 
 *Under the hood:* expanding inserts a native Thymer transclusion as a child of the reference's block, tagged so the plugin only ever finds and collapses its own embeds — never Thymer's native ones. Collapsing is stateless (it locates the matching embed line in the document and deletes it), so it works even after a reload when no in-memory state survives. Native transclusions are body-only, so the property card is drawn by the plugin above the body, kept in sync by a lightweight observer that exists only while at least one embed is open.
 
+## Line descriptions
+
+Give any line a small muted subtitle, rendered just under it.
+
+1. Put the caret on a line and run **Set Description for Line** from the Command Palette.
+2. Type the description and press **Enter**. **Esc** cancels.
+3. To change or remove it later, **double-click the description** (saving an empty value removes it), or run the command again.
+
+A description is **not a child line**: your outline structure is untouched, the caret can never land in it, and it can't be deleted by accident while editing around it. It's stored as the line's own metadata, so it syncs across devices and undoes like any other change, and it renders wherever the line renders, inline transclusions included. Selecting the line highlights only the line itself, never the description, and things other plugins draw under a line (a task-progress bar, say) stay visible below it.
+
+With the [View Options](https://github.com/parham-shafti/thymer-view-options) plugin installed, a line with a description also gets a **Description** row in the shared ⋯ line menu. Without it, everything above still works in full.
+
+*Under the hood:* the description is a meta property on the line, drawn entirely from a generated per-line stylesheet — no node is ever inserted into the line, which is what keeps the caret and editing unaffected. The plugin measures the rendered result (chevron, indent line, selection overlay) and emits tiny per-line corrections, so the geometry follows your theme and type scale.
+
 ## Notes & limitations
 
+- **Descriptions are sized for one line of text.** A description long enough to wrap can render with slightly off spacing below it.
 - **Property cards show the record's user-defined fields** (system/internal and deleted fields are hidden, exactly like the native pane). Use the card's **Properties** chooser to switch All / Filled in / Custom. The view choice is per device (it isn't synced content).
 - **Cards are drawn per client**, not synced content: on a device that didn't open the embed, the card appears after discovery (typically well under a second after a change, or on focus/navigation) rather than instantly.
 - **Schema changes made mid-session** (a brand-new property or collection) may take one interaction to be picked up — the plugin refreshes its schema map in the background and self-corrects.
