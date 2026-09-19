@@ -1,3 +1,204 @@
+## v4.64.1 — 2026-09-19
+
+### Fixed
+
+- **Hover card footer overlap.** The recursive card body had `min-height: 0` inside a flex column, so it shrank below its content while overflow stayed visible and painted over the mentions footer; the card now scrolls as a whole (`flex-shrink: 0` on card children).
+- **Done tasks / native ref items in linked references.** Journal pages store completed tasks as `{ type: "ref", props: { itemref: <task line guid> } }` lines; these now count in `_queryRefLines` for LINE targets alongside `@linkto` exact search hits.
+- **Glued datetime in hover card title.** Line-target card titles now render live segments (including `.lineitem-datetime`) instead of plain `_readableLineTitle` text that ran a datetime into the following words.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.64.0 — 2026-09-18
+
+### Added
+
+- **Recursive hover card.** Dwell 350 ms on any reference chip and an interactive card opens with a truncated native body window — real reference chips, ancestor crumbs, scroll, and optional pin. Hover a chip inside the card to open a nested card (depth cap, visited-set cycle guard, close grace, palette/dialog gate). Settings: `custom.hover.recursive`, `custom.hover.nestDepth`, `custom.hover.closeMs`. Inspired by Obsidian-at-Home (content-first hover where links inside the preview hover again).
+- **Incoming mentions footer.** After the body paints, the card appends `↙ N mentions`: the first five referencing lines render as path + excerpt (the same row model as inline linked references), heading ancestors in crumbs are emphasized, and **Show all** opens the inline section or adds a Workbench linked-references item. Kill switch: `custom.hover.mentions`.
+- **Thinking trails.** Hover, click, and jump entries carry `kind`, `parent`, and `dwellMs` on a 200-entry ring; persistence goes to a **RefX Trails** record in Settings (one line per day). Query via `window.__refx.trails.recent()`, `.query({ guid, kind, since, until, parent, limit })`, and `.before(guid, { kind, windowMs })`. The Workbench trail strip shows ○ hovers and ● commits with a commits-only toggle.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.63.2 — 2026-09-16
+
+### Added
+
+- **Activity Timer rows in the Extensions flyout.** Activity Timer v2 exposes `window.__activityTimer` but has no RefX integration of its own (v1 rows were lost in the rewrite), so RefX registers four rows — Start timer on this line, Switch timer to this line, Stop timer, and Open timer dock — via `_registerActivityTimerMenuExtensions` on bridge-ready and when AT loads after RefX. Owner `refx:activity-timer` prunes the rows when Activity Timer is absent.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.63.1 — 2026-09-16
+
+### Fixed
+
+- **RefX block menu inside Workbench items.** Right-click on a line nested in a Workbench transclusion used to fall through to Thymer's native Cut/Copy/Paste menu because `_handleContextMenu` excluded every line inside `.listitem-transclusion`. The guard now opens RefX's block menu when the hit line is inside `.refx-wb-item` (but not when the hit is the shelf `.listitem-transclusion` row itself). `_pageGuidFromDom` rejects the Workbench backing record guid centrally so page resolution stays on the transcluded owner.
+- **Extensions flyout after a RefX reinstall.** Version Ledger and similar registrants keep `refxMenuDisposers` from the old bridge and bail on `if (this.refxMenuDisposers.length) return`, so `window.__refxMenuExtensions` stays empty. `_wbPokeMenuRegistrants` scans `window` for `__*` objects exposing `_registerRefxMenuExtensions` / `registerRefxMenuExtensions`, runs stale disposers once per bridge generation, re-registers, and records into `window.__REFX_WB_BOOT_DIAG.registrants`. Called after bridge creation and when the Extensions registry is missing or empty.
+
+### Changed
+
+- **Verified native `lineitem.*` event shape.** `_wbCtxEventLineGuid` prefers `lineItemGuid` first; `_wbCtxInvalidateForLineEvent` also treats `parentGuid` as a hit so moves that reparent an ancestor invalidate the shelf trail.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.63.0 — 2026-09-16
+
+### Fixed
+
+- **Focus ring encloses the bullet and checkbox.** The yellow outline was an `outline` on `.line-div`, which starts 5 px to the right of the task checkbox (measured: `.line-div` at x=222 with `padding-left: 20px; margin-left: -4px`, checkbox at x=217–231 as a sibling outside `.line-div`). `_wbLiveFocusRulesSync` now draws a `::before` pseudo-element on `.line-div` with `border: 2px solid var(--refx-wb-focus-ring)` and `left: -10px; right: -6px`, so the ring wraps bullet and text on plain lines and checkbox and text on task lines.
+- **Extensions flyout after reinstall.** Teardown in 4.62.1 kept the shared registries alive; RefX now also drains `window.__refxMenuExtensionProviders` when `window.__refx` appears, fires `refx:bridge-ready` (`detail.version`), and drains again before each Extensions menu build so other plugins can register whether they load before or after RefX.
+
+### Changed
+
+- **Instant trail on cold start.** On each successful context paint RefX caches the ancestor chain to the line meta property `refx_chain` (up to eight crumbs, 28-character text cap). On the next open, if the in-memory registry is still warming, the cached chain paints synchronously on first decorate while warm resolve continues with a faster retry ladder `[120, 250, 500, 1000, 2000, 4000, 8000, 13000, 21000]`, a registry kick when `g_universe` crosses from empty to populated, and `window.__REFX_WB_BOOT_DIAG.trail[lineGuid]` timing (`cachedAt`, `liveAt`, `source`, `attempts`).
+- **Native `events.on` invalidates context chains.** When `this.events?.on` is available, RefX subscribes to `lineitem.moved` and `lineitem.updated`; if the moved or updated line is a shelf item's target or appears in its `ctxChain`, the header's chain is cleared and warm resolve reruns (debounced 150 ms per header). `panel.closed` drops `_wbCrumbHoverBound`. Handler ids are stored and `events.off` on teardown.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.62.1 — 2026-09-16
+
+### Fixed
+
+- **Reinstall must not wipe other plugins' menu extensions.** Plugins-Manager reinstall ran RefX `onUnload`, which cleared `window.__refxMenuExtensions` and `window.__refxPopupSections` and emptied the Extensions flyout until every other plugin reloaded. Teardown now only sets `window.__refx = null`; the shared registries stay alive and `_availableMenuExtensions` still prunes dead owners on read.
+- **No dangling leading › in the Workbench trail.** When `_wbCtxDropRedundantOwner` dropped the record crumb, `_appendFlatAncestorTrail` still prepended `›` before the first ancestor, so the trail read `› Thu Sep 10 › @author › …`. `_wbLiveRenderContextPaint` now removes a leading separator after the trail is built.
+
+### Changed
+
+- **Gradual zoom back in.** Alt+→ already stepped one level down toward the line you opened; that logic is now `_wbLiveZoomInOne(it)`. The header shows `⤵` (before `⤓ back`, outside the narrow-panel `-more` collapse) when `focus !== target`, and the ⋯ menu adds "Zoom in one level" under the same condition.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.62.0 — 2026-09-15
+
+### Changed
+
+- **Workbench crumbs zoom out in place.** A line item's context trail now behaves like Roam's sidebar Block Outline. Plain click on any crumb, including the record crumb, re-roots the item at that ancestor: the body becomes the ancestor's subtree and the trail shortens to its path. Shift+click opens the ancestor in a new side panel; ⌘/Ctrl+click jumps the main panel there. A plain click never leaves the Workbench. The crumb title reads "Zoom out to here · Shift: side panel · ⌘: jump".
+- **The trail is the full path and wraps.** `_wbCtxTrailPlan` shows up to eight ancestors (`…` survives only past that) and `.refx-wb-ctx` wraps onto a second line instead of truncating to two crumbs. Crumbs keep the 28-character cap with the full text in `title`.
+- **The line you opened keeps a yellow outline.** After zooming out, `_wbLiveFocusRulesSync` draws `outline: 2px solid var(--refx-wb-focus-ring)` around the original line's `.line-div`, an outline and no fill, as Roam has done since 2022. The ring appears only once the item's focus differs from its root; a freshly opened line has no ring. The dark theme uses a slightly deeper amber. After a re-root the focus line is scrolled into view once, keyed off the navigation, never off a repaint.
+- **Hover a crumb to preview its outline.** Dwell 350 ms on a crumb and a read-only `.refx-wb-crumbpop` shows that ancestor's outline with the focus line highlighted and its path unfolded; the record crumb previews the record's first lines. It leaves on mouse-out, scroll, Escape or any click and never takes focus. `custom.workbench.crumbHover = false` turns it off. The loader is the former peek fill, lifted into `_wbCtxAncestorTree`.
+- **Focus path is never folded.** In a Children-only item the depth clamp skips every ancestor of the focus line, so a re-rooted item always shows the outlined line while sibling branches still fold.
+- **Alt+←/→ zoom from a focused header.** With a shelf header focused (Alt+↑/↓), Alt+← re-roots one level up and Alt+→ steps back down the path toward the line you opened; Alt+→ is a no-op when the focus is already the root. Keys without a focused header pass through.
+- **Header and ⋯ menu.** `⤓ Back to original` stays on the header of a re-rooted item; Roam has no way back, we do. The ⋯ menu gains "Zoom out one level" whenever a chain exists and "Back to original" on re-rooted items.
+
+### Removed
+
+- The **sibling peek strip** and its per-crumb `▸` twisty. It sat between the trail and the body, showed only one level, and its verdict from the user was "not clear"; the crumb click is now the reveal and the hover preview covers the glance. `_wbLiveToggleCtxPeek`, the keep-alive insert, the Escape listener and the `.refx-wb-ctx-peek*` CSS are gone.
+- The **`⤒` button** on the header and on crumb hover actions. The crumb itself is the control.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.61.0 — 2026-09-15
+
+### Changed
+
+- **Workbench items stay record-local.** A Full or Children-only item used to pass Thymer's native transclusion body through unfiltered, so a shelf line that was mostly a reference chip could drag another record's body into the indent. The item's home record is resolved once; lines the host pulled in from a different record are hidden with a marker class on the native `.listitem` and collapse into one disclosure row, `▸ N lines from <Record>`, at the foot of the item. Clicking it brings them back, still natively editable. Transclusions the user placed inside the target's own subtree are never clamped. Nothing is hidden when the home record cannot be resolved. `window.__refxWbClampDiag` records total, foreign and seeded-fold counts per item so the clamp's premise can be measured on the real shelf (`custom.workbench.clampForeign = false` turns it off).
+- **Children only shows direct children at their fold state.** Instead of a second hide class, the depth clamp seeds the existing fold map, so the lines at the clamp depth start folded with `▸` and unfold with the ordinary twisty. Fold twisties now work in the Children-only view as well as Full. A **Depth** group on the item's `⋯` menu (Direct children / Two levels / Everything) sets a per-item `refx_depth` that also drives the Card variant's outline.
+- **Outlines open direct children only.** `_buildRefChildTree` and the Card child tree now expand one level by default and put deeper levels behind `▸`; the zoom path still unfolds a highlighted line's ancestors, and the Workbench context peek keeps its explicit two levels. `custom.refRows.expandDepth` changes the default.
+- **Chip counts are retired.** A reference row shows one quiet count, the line's own; counts after each chip inside the content are off by default. The chip's target is one plain click away and that row carries its own count. Restore them with `custom.counter.chipCounts = true` or the "Chip reference counts" settings row.
+- **Tree keys on counts.** With a count focused, ArrowRight opens it (or, when open, moves focus to the first count inside its box), ArrowLeft collapses it (or, when closed, focuses the count that opened the enclosing box), and Escape collapses the innermost open box and focuses its count. Enter and Space still toggle. Every other key passes through to the editor untouched.
+- **`⧉` in a linked-references header adds the Linked-references view.** The button in an inline "↙ N Linked References" header now adds that view of the target to the Workbench instead of a Full item you had to convert. The group-header `⧉` still adds the group's source page.
+- **Hop from a Workbench line.** Lines inside a Workbench item show their own count badge (`custom.workbench.lineBadges = false` to hide). Clicking one opens that line's linked references inline, under the line, inside the item, and the chain hops from there. Only when the badge has no identifiable host line does the click add a Linked-references shelf item for that line instead. Every other transclusion stays badge-free as before.
+- **The header collapses on narrow panels.** Under 420 px the pin, re-root and swap-to-main buttons hide; `⋯` and `✕` stay, and the hidden actions appear as rows in the `⋯` menu.
+- **Clear all is armed before it clears.** The filter bar's Clear all first changes its label to `Clear N?`; a second click within 4 s clears the shelf, and Escape, a click elsewhere, or the timeout disarms it. The reopen ring is unchanged.
+
+Follow-up: the Card variant's tree builder in `_wbFillChildTree` still duplicates `_buildRefChildTree`; folding them together is a refactor with no visible change and is left for a later release.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.60.0 — 2026-09-14
+
+### Changed
+
+- **Infinite hopping in linked references.** Every line drawn in a reference row (the referencing line, each child-tree and zoom-tree line, and the ○ of a self-reference row) now shows its own quiet reference count. Activating it (click, or Enter/Space when focused) opens that line's references directly under it, and every nested row does the same, with no depth limit. This replaces the v4.52.0 "two levels deep" cap. Counts for anything already open above a row are not drawn, so a chip that points back at the panel target no longer reopens the same list.
+- Nested boxes page 30 rows with Show more; rows past the eighth source get `▸ context` instead of becoming dead ends. Crumb, record and dot clicks inside a nested row zoom that row, not its ancestor. Zoom parks open boxes and "Back to the reference" restores them with counts.
+- Counts reveal through `data-count` (no DOM churn per result), follow the badge size/opacity/weight presets, and have an invisible 3px/4px hit area with unchanged line geometry. At most 4 nested count lookups run at once, 24 per row and 60 per list before viewport gating.
+
+Verification: `node --check plugin.js && node --test test/*.cjs`.
+
+## v4.59.6 — 2026-09-12
+
+### Fixed
+
+- **Closed context peek reappeared as an empty strip** — `_wbLiveCloseCtxPeek` detached the peek, then the panel keep-alive observer saw a disconnected `h.peek` and re-inserted it with no content (a 6 px gap under the trail). `_wbLiveInsertCtxPeek` now refuses to attach a peek whose `ctxPeekAnc` is cleared; every open path sets it first.
+
+## v4.59.5 — 2026-09-12
+
+### Fixed
+
+- **Workbench boot cloak never engaged** — measured live: `panel.getElement()` on a freshly created panel returns its `.empty-panel` placeholder (`empty-panel < layout-margin < panel-body < panel-scroller-y < panel`), which navigation replaces, so the `.panel[data-refx-wb-boot]` rule could never match and the raw "Reference Workbench State" heading still flashed. The cloak now attaches to the enclosing `.panel` host. It also lifts only once the panel is on the backing record and at least one shelf item is decorated (or the shelf is empty); an early refresh used to lift it before the host had rendered the record. The 1500 ms failsafe is unchanged.
+
+## v4.59.4 — 2026-09-12
+
+### Fixed
+
+- **Workbench boot cloak attach (U6)** — `_wbApplyBootCloak` retries on `requestAnimationFrame` until the panel element exists (bounded to 40 frames), called after both `createPanel` and `navigateTo`; rAF is cancelled on teardown and `_wbClearBootCloak`. Immediate open refresh bypasses the cooperative background queue (storm checks retained) so RefX chrome is not deferred behind other idle work. Central `_wbCtxResolveOwner` guard rejects the backing record from every candidate source (including `_pageGuidFromDom`). `window.__REFX_WB_BOOT_DIAG` records the last open timeline for live verification.
+
+Verification: `node --check plugin.js`; `node --test test/v459-wb-owner.test.cjs test/v459-wb-peek.test.cjs test/v458-wb-context.test.cjs test/v454-workbench.test.cjs test/performance-guards.test.cjs test/plugin.test.cjs`.
+
+## v4.59.3 — 2026-09-12
+
+### Fixed
+
+- **Workbench context trail owner resolution (U5)** — `_wbCtxOwnerFromShelfDom` no longer returns the Workbench backing record (rule-15 outer `.listview-items` trap); owner resolution falls through to page/SDK hints. Warm retry liveness is decoupled from `_wbRefreshSeq` (same defect class as U4 peek toggle) and uses bounded backoff through 21 s so cold registry boots can still paint trails.
+
+Verification: `node --check plugin.js`; `node --test test/v459-wb-owner.test.cjs test/v459-wb-peek.test.cjs test/v458-wb-context.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`.
+
+## v4.59.2 — 2026-09-12
+
+### Fixed
+
+- **Workbench context peek toggle (U4)** — Chevron clicks no longer bail when a refresh is scheduled but not yet painted. `_wbLiveToggleCtxPeek` gates on header mounted-ness (`_wbHeaders`, `h.ctx.isConnected`) instead of the paint-generation `alive()` token (`_wbRefreshSeq` bumps at schedule time). Async peek fill still uses peek-scoped liveness from U1.
+
+Verification: `node --check plugin.js`; `node --test test/v459-wb-peek.test.cjs test/v458-wb-peek.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`.
+
+## v4.59.1 — 2026-09-12
+
+### Fixed
+
+- **Workbench boot cloak (U3)** — Cloak now hides `.panel-heading` and `.panel-body` (record title and filter/items chrome) instead of nested transclusion `.listview-items`; tab bar stays visible. Startup sweep, unload, and the 1.5 s failsafe unconditionally strip every `data-refx-wb-boot` attribute so hot-reload cannot leave a panel permanently invisible.
+
+Verification: `node --check plugin.js`; `node --test test/v459-wb-peek.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`.
+
+## v4.59.0 — 2026-09-12
+
+### Fixed
+
+- **Workbench context peek (U1)** — Crumb twisties now have a ≥20×17 px hit target with hover affordance; peek fill lifetime is scoped to the open header/ancestor instead of the refresh token, so mid-await refreshes no longer leave an empty 6 px box. Every failure path renders a one-line note; sibling outlines expand two levels with the target branch highlighted.
+- **Workbench open flash (U2)** — Opening pre-warms the shelf before the panel paints, cloaks undecorated list items via `data-refx-wb-boot` + `visibility:hidden` until the first successful refresh (with a 1.5 s failsafe), and schedules the first decorate pass immediately without bypassing the storm breaker.
+
+Verification: `node --check plugin.js`; `node --test test/v459-wb-peek.test.cjs test/v458-wb-peek.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`.
+
+## v4.58.2 — 2026-09-11
+
+### Fixed
+
+- **Workbench context trail on cold boot (U7)** — After a full app relaunch `g_universe` is empty while shelf transclusions already render; the ancestor trail now resolves the owning record via live state, shelf DOM, or SDK hints (never `getTreeContext()`), then hydrates the chain through `getLineItems(false)`. Bounded backoff retries (400 ms → 5 s, six attempts) and existing Workbench refresh/nav signals re-attempt until the registry warms; zero layout while unresolved.
+
+Verification: `node --check plugin.js`; `node --test test/v458-wb-context.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`.
+
+## v4.58.1 — 2026-09-11
+
+### Fixed
+
+- **Workbench context trail layout (U5)** — Ancestor crumbs no longer wrap to multiple lines; the trail row is a single flex line with per-crumb ellipsis under `.refx-wb-ctx` only.
+- **Redundant owner crumb (U5)** — When a comments record is named after the line it comments on, the owner crumb is omitted so the deepest ancestor is not shown twice.
+- **Crumb display cap (U5)** — Workbench trail crumbs show at most 28 visible characters (full text in `title` on hover); reference rows and popovers are unchanged.
+
+Verification: `node --check plugin.js`; `node --test test/v458-wb-context.test.cjs test/v451-roam-rows.test.cjs test/plugin.test.cjs`.
+
+## v4.58.0 — 2026-09-11
+
+### Added
+
+- **Workbench context trail (U1)** — Line-target shelf items show a read-only ancestor chain (`Record › … › parent`) above the native transclusion by default. The chain walks registry `parent` links synchronously (zero I/O); cold records paint once after `getLineItems(false)`. Collapsed items hide the trail; record targets mount nothing.
+- **Re-root in place (U2)** — `⤒` on the header or a crumb rewrites the shelf line to an ancestor while keeping `refx_focus` on the original line (highlighted via managed `data-guid` rules). `⤓ back` restores the prior target.
+- **Shared-ancestor grouping (U3)** — When two or more shelf items share a lowest common ancestor, that crumb gets a `⧉N` pill; click narrows the shelf to the group (Esc in the filter clears it). Shared prefix crumbs dim on subsequent items.
+- **Sibling peek under crumbs (U4)** — Each ancestor crumb gets a twisty that opens a read-only outline of that ancestor's children below the trail, with the path to the shelf target expanded and highlighted. One peek per item; re-click or Escape closes.
+
+### Fixed
+
+- **Connection index parent links (U1 Part A)** — `_connIndexes` now reads `st.parent.guid` when `parent_guid` is absent on live registry states, so `childrenByLine` and containment hops populate correctly for lines whose parent is only an object reference.
+
+Verification: `node --check plugin.js`; `node --test test/v458-wb-context.test.cjs test/v458-wb-reroot.test.cjs test/v458-wb-groups.test.cjs test/v458-wb-peek.test.cjs test/v454-workbench.test.cjs test/plugin.test.cjs`; live on Thymer Desktop — line-target item shows ancestor trail, `⤒`/`⤓` slide without navigation, `⧉N` filters shared context, crumb twisty peeks siblings with target highlighted.
+
 ## v4.57.2 — 2026-09-10
 
 ### Fixed

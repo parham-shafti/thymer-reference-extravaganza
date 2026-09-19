@@ -175,7 +175,7 @@ test('v4.51.0 _isPureSelfRef matches target guid only', () => {
 });
 
 test('v4.51.0 source slices: trail self-ref, flat groups, no outline remnants', () => {
-  assert.match(source, /_appendFlatAncestorTrail\(crumbEl, chain, ctx, mkAncActions, \{ selfRef, lineGuid \}\)/);
+  assert.match(source, /_appendFlatAncestorTrail\(crumbEl, chain, ctx, mkAncActions, \{ selfRef, lineGuid, targetLine: target \}\)/);
   assert.match(source, /ctx\.sourceRecordGuid = srcGuid/);
   assert.match(source, /trc-ref-crumb-self/);
   assert.doesNotMatch(source, /refx-ref-children-heading/);

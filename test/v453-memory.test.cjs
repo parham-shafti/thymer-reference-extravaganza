@@ -256,11 +256,11 @@ test('_applyInlineRefsFilter matches s3 against season 3 row text', () => {
   assert.ok(!row.classList.contains('refx-hidden'));
 });
 
-test('v4.57.2 source guards', () => {
+test('v4.64.1 source guards', () => {
   assert.match(source, /_pickMemoryRecord\(/);
   assert.match(source, /_pickMemoryHits\(/);
   assert.match(source, /refx_pick_memory_v1:/);
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
 });

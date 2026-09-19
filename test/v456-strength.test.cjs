@@ -215,11 +215,11 @@ test('traversal boost bounded to [0, 60]', () => {
   assert.ok(boost >= 0 && boost <= 60, `Boost ${boost} out of [0, 60]`);
 });
 
-test('v4.57.2 version locks', () => {
+test('v4.64.1 version locks', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
   assert.ok(source.includes('custom.connections.strength'));
   assert.ok(source.includes('_wbLiveSharedEnsure'));
 });

@@ -159,28 +159,44 @@ function installFakeDom(context) {
         return null;
       },
       querySelector(selector) {
+        const scoped = selector.startsWith(':scope > ');
+        const rest = scoped ? selector.slice(9) : selector;
+        const roots = scoped ? (this.children || []) : [this];
         const walk = (node) => {
           for (const child of node.children || []) {
             if (selector.includes('.bridge-marker') && child.classList?.contains('bridge-marker')) return child;
-            const attr = selector.match(/\[data-guid="([^"]+)"\]/);
-            if (attr && child.dataset?.guid === attr[1] && matchSelector(child, selector.split('[')[0])) return child;
-            if (matchSelector(child, selector)) return child;
+            const attr = rest.match(/^\[data-guid="([^"]+)"\]/);
+            if (attr && child.dataset?.guid === attr[1]) return child;
+            if (matchSelector(child, rest.split('[')[0]) || matchSelector(child, rest)) return child;
             const hit = walk(child);
             if (hit) return hit;
           }
           return null;
         };
-        return walk(this);
+        if (scoped) {
+          for (const child of this.children || []) {
+            if (matchSelector(child, rest.split('[')[0]) || matchSelector(child, rest)) return child;
+          }
+          return null;
+        }
+        for (const root of roots) {
+          const hit = walk(root);
+          if (hit) return hit;
+        }
+        return null;
       },
       querySelectorAll(selector) {
         const out = [];
-        const walk = (node) => {
+        const scoped = selector.startsWith(':scope > ');
+        const rest = scoped ? selector.slice(9) : selector;
+        const walk = (node, directOnly) => {
           for (const child of node.children || []) {
-            if (matchSelector(child, selector) || matchMultiSelector(child, selector)) out.push(child);
-            walk(child);
+            if (matchSelector(child, rest) || matchMultiSelector(child, rest)) out.push(child);
+            if (!directOnly) walk(child, false);
           }
         };
-        walk(this);
+        if (scoped) walk(this, true);
+        else walk(this, false);
         return out;
       },
       remove() {
@@ -244,6 +260,7 @@ function setupRendererPlugin() {
     return e && typeof e.count === 'number' ? e : null;
   };
   plugin.getCountInfoForGuid = (g) => Promise.resolve(plugin.getCachedCountInfo(g) || { count: 0, capped: false, sdkPropCount: 0 });
+  plugin._refChipCounts = true;
   return { plugin, makeEl, context };
 }
 
@@ -329,12 +346,12 @@ test('WO-9 WO-6 selector and nested counts find own chips', async () => {
   await new Promise((r) => setTimeout(r, 5));
   const count = row.querySelector('.refx-nested-count');
   assert.ok(count, 'nested count appended');
-  assert.equal(count.textContent, '4');
+  assert.equal(count.getAttribute('data-count'), '4');
 });
 
 test('WO-9 version locks', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
 });

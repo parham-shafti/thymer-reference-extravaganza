@@ -674,9 +674,9 @@ test('_connSharedNeighbours reports shared owner distinctly from shared referenc
   assert.notEqual(refHit.sharedVia, 'owner');
 });
 
-test('v4.57.2 version locks', () => {
+test('v4.64.1 version locks', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
 });

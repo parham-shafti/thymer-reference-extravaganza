@@ -264,6 +264,7 @@ function setupChipPlugin() {
     { guid: 'NEST1', record: { guid: 'PAGE' }, segments: [{ type: 'text', text: 'nested ref' }] },
   ]);
   plugin.data = { getRecord: () => null };
+  plugin._refChipCounts = true;
   return { plugin, makeEl, context };
 }
 
@@ -354,7 +355,11 @@ test('WO-6 crumb chip is ignored by content chip handler', () => {
   assert.equal(zooms.length, 0);
 });
 
-test('WO-6 nested count appears only when count > 0 and not at nest depth 2', () => {
+function revealed(root) {
+  return [...root.querySelectorAll('.refx-nested-count')].filter((e) => e.getAttribute('data-count'));
+}
+
+test('WO-6 nested count reveals only when count > 0 and not for guids on the nest path', async () => {
   const { plugin, makeEl } = setupChipPlugin();
   const { row, full, chip } = buildChipFixture(makeEl, plugin, { chipGuid: 'ZERO' });
   plugin._countCache.set('ZERO', { count: 0 });
@@ -366,12 +371,13 @@ test('WO-6 nested count appears only when count > 0 and not at nest depth 2', ()
   full.appendChild(chip3);
 
   plugin._paintRefRowNestedCounts(row, row.__refxCtx);
-  assert.equal(row.querySelectorAll('.refx-nested-count').length, 1);
-  assert.equal(row.querySelector('.refx-nested-count').textContent, '3');
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(revealed(row).length, 1);
+  assert.equal(revealed(row)[0].getAttribute('data-count'), '3');
 
-  row.__refxNestDepth = 2;
+  row.__refxCtx.nestPath = Object.freeze(['REF', 'THREE']);
   plugin._paintRefRowNestedCounts(row, row.__refxCtx);
-  assert.equal(row.querySelectorAll('.refx-nested-count').length, 0);
+  assert.equal(revealed(row).length, 0);
 });
 
 test('WO-6 nested count click toggles nested refs with nest depth 1', async () => {
@@ -474,5 +480,5 @@ test('WO-6 later zoom invalidates stale async nested count paint', async () => {
   row.__refxNestedCountGen = (row.__refxNestedCountGen || 0) + 1;
   resolveLate();
   await new Promise((r) => setTimeout(r, 5));
-  assert.equal(row.querySelector('.refx-nested-count'), null);
+  assert.equal(revealed(row).length, 0);
 });

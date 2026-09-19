@@ -139,10 +139,10 @@ function instance() {
   return { ...h, plugin, calls };
 }
 
-test('version locks 4.57.2', () => {
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'), 'first line must be // v4.57.2');
-  assert.match(source, /window\.__REFX_VERSION = "4\.57\.2"/);
+test('version locks 4.64.1', () => {
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'), 'first line must be // v4.64.1');
+  assert.match(source, /window\.__REFX_VERSION = "4\.64\.1"/);
 });
 
 test('settings modal scrolls when the window is short', () => {

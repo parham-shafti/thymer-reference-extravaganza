@@ -52,7 +52,10 @@ function loadPlugin(workspace = 'WS_TRAIL') {
   vm.runInNewContext(source + '\nthis.PluginUnderTest = Plugin;', context, { filename: 'plugin.js' });
   const plugin = new context.PluginUnderTest();
   plugin._unloaded = false;
-  plugin._refxTrail = { ring: [], cap: 50 };
+  plugin._refxTrail = { ring: [], cap: 200 };
+  plugin._trailsEnabled = true;
+  plugin._trailsLoadedFromRecord = true;
+  plugin._trailsEnsureLoaded = async () => {};
   plugin._wbTrailEnabled = true;
   plugin._wbWorkspaceGuid = () => workspace;
   plugin._wbOwner = { token: 1 };
@@ -115,22 +118,28 @@ function makePanel(plugin) {
   return { panelEl, scroller };
 }
 
-test('trail ring caps at 50 and persists debounced', async () => {
+test('trail ring caps at 200 and persists debounced', async () => {
   const { plugin, storage } = loadPlugin();
-  for (let i = 0; i < 55; i++) plugin._connRecordHop('SRC', 'R' + i, 'jump');
-  assert.equal(plugin._refxTrail.ring.length, 50);
+  for (let i = 0; i < 205; i++) plugin._connRecordHop('SRC', 'R' + i, 'jump');
+  assert.equal(plugin._refxTrail.ring.length, 200);
   assert.equal(storage.get('refx_trail_v1:WS_TRAIL'), undefined);
   await new Promise((r) => setTimeout(r, 300));
   const raw = storage.get('refx_trail_v1:WS_TRAIL');
   assert.ok(raw);
-  assert.equal(JSON.parse(raw).ring.length, 50);
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.v, 2);
+  assert.equal(parsed.ring.length, 200);
 });
 
-test('strip renders last 8 hops newest-last with ellipsis when longer', () => {
+test('strip renders last 8 commits newest-last with ellipsis when longer', () => {
   const { plugin } = loadPlugin();
   const ring = [];
-  for (let i = 0; i < 10; i++) ring.push({ guid: 'R' + i, label: 'Hop ' + i, ts: Date.now() - i * 60000, how: 'jump' });
-  plugin._refxTrail = { ring, cap: 50 };
+  for (let i = 0; i < 10; i++) {
+    ring.push({ id: 'j' + i, guid: 'R' + i, label: 'Hop ' + i, ts: Date.now() - i * 60000, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 });
+    ring.push({ id: 'h' + i, guid: 'H' + i, label: 'Hover ' + i, ts: Date.now() - i * 60000, how: 'hover', kind: 'hover', parent: '', dwellMs: 0 });
+  }
+  plugin._refxTrail = { ring, cap: 200 };
+  plugin._trailCommitsOnly = true;
   const { panelEl } = makePanel(plugin);
   plugin._wbLiveTrailPaint(panelEl);
   const hops = plugin._wbTrailEl.children.filter((c) => c.classList.contains('refx-wb-trail-hop'));
@@ -142,7 +151,7 @@ test('strip renders last 8 hops newest-last with ellipsis when longer', () => {
 
 test('hop click calls _bridgeJump', () => {
   const { plugin } = loadPlugin();
-  plugin._refxTrail = { ring: [{ guid: 'R1', label: 'Alpha', ts: Date.now(), how: 'jump' }], cap: 50 };
+  plugin._refxTrail = { ring: [{ id: 'j1', guid: 'R1', label: 'Alpha', ts: Date.now(), how: 'jump', kind: 'jump', parent: '', dwellMs: 0 }], cap: 200 };
   const jumps = [];
   plugin._bridgeJump = (g, opts) => { jumps.push({ g, opts }); };
   const { panelEl } = makePanel(plugin);
@@ -157,13 +166,13 @@ test('save-as-stack passes distinct record guids in walk order', async () => {
   const { plugin } = loadPlugin();
   plugin._refxTrail = {
     ring: [
-      { guid: 'R1', label: 'Alpha', ts: 1, how: 'jump' },
-      { guid: 'R2', label: 'Beta', ts: 2, how: 'jump' },
-      { guid: 'R1', label: 'Alpha', ts: 3, how: 'jump' },
-      { guid: 'GONE', label: 'Ghost', ts: 4, how: 'jump' },
-      { guid: 'R3', label: 'Gamma', ts: 5, how: 'jump' },
+      { id: 'j1', guid: 'R1', label: 'Alpha', ts: 1, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
+      { id: 'j2', guid: 'R2', label: 'Beta', ts: 2, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
+      { id: 'j3', guid: 'R1', label: 'Alpha', ts: 3, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
+      { id: 'j4', guid: 'GONE', label: 'Ghost', ts: 4, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
+      { id: 'j5', guid: 'R3', label: 'Gamma', ts: 5, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
     ],
-    cap: 50,
+    cap: 200,
   };
   let saved = null;
   plugin._wbStackSaveTargets = async (name, guids) => { saved = { name, guids }; return true; };
@@ -181,10 +190,10 @@ test('replay advances in order, supersedes on generation bump, stops on unload',
   const { plugin } = loadPlugin();
   plugin._refxTrail = {
     ring: [
-      { guid: 'R1', label: 'Alpha', ts: 1, how: 'jump' },
-      { guid: 'R2', label: 'Beta', ts: 2, how: 'jump' },
+      { id: 'j1', guid: 'R1', label: 'Alpha', ts: 1, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
+      { id: 'j2', guid: 'R2', label: 'Beta', ts: 2, how: 'jump', kind: 'jump', parent: '', dwellMs: 0 },
     ],
-    cap: 50,
+    cap: 200,
   };
   makePanel(plugin);
   const order = [];
@@ -204,7 +213,7 @@ test('replay advances in order, supersedes on generation bump, stops on unload',
 
 test('clear button needs two presses', () => {
   const { plugin, storage } = loadPlugin();
-  plugin._refxTrail = { ring: [{ guid: 'R1', label: 'Alpha', ts: Date.now(), how: 'jump' }], cap: 50 };
+  plugin._refxTrail = { ring: [{ id: 'j1', guid: 'R1', label: 'Alpha', ts: Date.now(), how: 'jump', kind: 'jump', parent: '', dwellMs: 0 }], cap: 200 };
   storage.set('refx_trail_v1:WS_TRAIL', JSON.stringify(plugin._refxTrail));
   const toasts = [];
   plugin._toast = (m) => toasts.push(m);
@@ -224,17 +233,20 @@ test('strip registered in mutation-ignore lists and teardown selector', () => {
 
 test('strip hidden when ring is empty', () => {
   const { plugin } = loadPlugin();
-  plugin._refxTrail = { ring: [], cap: 50 };
+  plugin._refxTrail = { ring: [], cap: 200 };
+  plugin._trailsEnabled = true;
+  plugin._trailsLoadedFromRecord = true;
+  plugin._trailsEnsureLoaded = async () => {};
   const { panelEl } = makePanel(plugin);
   plugin._wbLiveTrailEnsure(panelEl, []);
   assert.equal(plugin._wbTrailEl.hidden, true);
 });
 
-test('v4.57.2 version locks', () => {
+test('v4.64.1 version locks', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
   assert.ok(source.includes('_wbLiveTrailEnsure'));
   assert.ok(source.includes('custom.workbench.trail'));
 });

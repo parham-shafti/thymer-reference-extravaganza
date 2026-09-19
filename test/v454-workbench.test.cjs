@@ -548,11 +548,11 @@ test('header count click calls _wbAdd with linked-refs kind', async () => {
   assert.equal(added[0].opts.kind, 'linked-refs');
 });
 
-test('v4.57.2 version locks stay green', () => {
+test('v4.64.1 version locks stay green', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'));
-  assert.ok(source.includes('window.__REFX_VERSION = "4.57.2"'));
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'));
+  assert.ok(source.includes('window.__REFX_VERSION = "4.64.1"'));
   assert.ok(source.includes('_wbRelatedBuildCanonCtx'));
   assert.ok(source.includes('_wbRefreshStormRecordRun'));
   assert.ok(source.includes('refx_wb_disable'));
@@ -767,6 +767,11 @@ test('navigation schedules related refresh with canonical main key in cache', as
   plugin._wbRelatedScheduleRefresh = (delay) => { navScheduled++; return origSchedule(delay); };
   await plugin._onNavigated({ panel: {} });
   assert.equal(navScheduled, 1);
+});
+
+test('fold mount gate includes children variant', () => {
+  const decorateSite = source.match(/if \(!it\.collapsed && !dangling && \(it\.variant === "full" \|\| it\.variant === "children"\)\)/);
+  assert.ok(decorateSite, '_wbFoldMount runs for full and children variants');
 });
 
 test('stack save invalidates the cache', async () => {

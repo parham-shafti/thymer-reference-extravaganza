@@ -33,9 +33,9 @@ test('reference hydration seeds all record identities before property-edge class
 
 test('runtime and manifest versions identify the current release', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'plugin.json'), 'utf8'));
-  assert.equal(manifest.version, '4.57.2');
-  assert.ok(source.startsWith('// v4.57.2'), 'first line must be // v4.57.2');
-  assert.match(source, /window\.__REFX_VERSION = "4\.57\.2"/);
+  assert.equal(manifest.version, '4.64.1');
+  assert.ok(source.startsWith('// v4.64.1'), 'first line must be // v4.64.1');
+  assert.match(source, /window\.__REFX_VERSION = "4\.64\.1"/);
 });
 
 test('reference expansion avoids whole-body probes and broad record-update discovery', () => {
@@ -167,10 +167,11 @@ test('Workbench validates identity, serializes migration, and guards every SDK b
   assert.match(load, /rec\.getLineItems\(false\)/);
 });
 
-test('visible Workbench refreshes cannot escape the shared input gate', () => {
+test('visible Workbench refreshes use the background lane except immediate open', () => {
   const schedule = source.slice(source.indexOf('  _wbLiveScheduleRefresh('), source.indexOf('  // (Re)inject the per-item'));
   const refresh = source.slice(source.indexOf('  async _wbLiveRefresh('), source.indexOf('  _wbLiveDecorate('));
   assert.match(schedule, /_runBackgroundWork\('visible-workbench-refresh'/);
+  assert.match(schedule, /if \(immediate\) \{[\s\S]*this\._wbLiveRefresh\(null, owner, refreshSeq\)/);
   assert.doesNotMatch(schedule, /this\._wbLiveRefresh\(\)\.catch/,
     'a refresh timer may enqueue gated work but never call the refresher directly');
   assert.match(refresh, /_wbLoadLive\(backgroundGeneration, owner, refreshSeq\)/);

@@ -509,7 +509,7 @@ test('v4.13.2 bare star-alias click jumps immediately without scheduling or open
   assert.equal(click.defaultPrevented, true);
   assert.equal(jumps.length, 1);
   assert.equal(jumps[0][0], 'TARGET_CLICK');
-  assert.deepEqual(Object.keys(jumps[0][1]), []);
+  assert.equal(jumps[0][1]?.skipTrailRecord, true);
   assert.equal(h.plugin._lineRefClickTimer, 0, 'star click has no double-click/context timer');
   await tick(310);
   assert.equal(contexts, 0);
@@ -3279,9 +3279,13 @@ test('v4.29.1 extension bridge prunes dead owners, enumerates safely, unregister
   bridge.registerMenuExtension({ id: 'explicit', owner: 'plugin-b', label: 'Explicit', onSelect() {} });
   assert.equal(bridge.unregisterMenuExtension('explicit', 'plugin-b'), true);
   bridge.registerMenuExtension({ id: 'unload', owner: 'plugin-b', label: 'Unload', onSelect() {} });
+  h.window['plugin-b'] = {};
   h.plugin.onUnload();
   assert.equal(h.window.__refx, null);
-  assert.equal(h.window.__refxMenuExtensions, null, 'true RefX unload clears every extension closure');
+  assert.ok(h.window.__refxMenuExtensions instanceof Map, 'shared registry survives RefX unload');
+  assert.equal(h.window.__refxMenuExtensions.has('unload'), true, 'other plugins keep their menu extensions across reinstall');
+  delete h.window['plugin-b'];
+  assert.equal(h.plugin._availableMenuExtensions({}).length, 0, 'dead owner pruned on read');
 });
 
 test('v4.29.1 Replace with Embed applies the selected display variant only to the embed it creates', async () => {
@@ -3784,7 +3788,7 @@ test('v4.43 general ref-chain resolver guards cycles and enforces depth/fanout c
 test('v4.48.6 public bridge keeps v4 bounded-chain and one-level resolution compatibility', async () => {
   const h = lineRefClickHarness();
   installU6ChainGraph(h);
-  assert.equal(h.window.__refx.version, '4.57.2');
+  assert.equal(h.window.__refx.version, '4.64.1');
   assert.equal(Object.hasOwn(h.window.__refx, 'refChainVersion'), false);
   assert.equal(h.window.__refx.resolveRefChainVersion, 4);
   assert.equal(typeof h.window.__refx.resolveRefChain, 'function');

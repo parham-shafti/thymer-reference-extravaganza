@@ -1,8 +1,14 @@
 # Reference Extravaganza
 
-## Current release (v4.57.2)
+## Current release (v4.64.1)
 
-RefX now surfaces your **reference walk** on the Workbench: a **trail strip** after the tab bar lists recent hops from `window.__refxTrail` (persisted at `refx_trail_v1:<workspace>`), lets you jump back to any hop, **save the walk as a named stack**, or **replay** it hop-by-hop. Hide it with `custom.workbench.trail=false`.
+Line-target **Workbench** items behave like Roam's sidebar **Block Outline**: the full ancestor **trail** (`Record › ancestor › …`, wrapping when long) sits above the native editable body. **Click a crumb to zoom out in place** (the item re-roots at that ancestor and the line you opened keeps a **yellow outline** that encloses the bullet or checkbox), **Shift+click** opens it in a side panel, **⌘/Ctrl+click** jumps the main panel. **Hover** a crumb to preview its outline. With a header focused, **Alt+←/→** zoom out and back in. **`⤓ Back to original`** restores the line as root. When several shelf items share context, the lowest common ancestor gets a **`⧉N`** pill — click to filter the shelf to that group (Esc in the filter clears it).
+
+Cold starts no longer wait on the registry for that ancestor trail. Each time a Workbench item paints a complete context chain, RefX serializes it to the line's `refx_chain` meta property; on the next open, if the in-memory registry is still warming, the cached chain paints synchronously on first decorate while warm resolve runs in the background with a faster retry ladder and a kick when the global registry first becomes non-empty. `window.__REFX_WB_BOOT_DIAG.trail` records per-item `cachedAt`, `liveAt`, `source`, and `attempts` (milliseconds since boot) so you can confirm cold-start trail timing on a live shelf.
+
+RefX also surfaces your **reference walk** on the Workbench: a **trail strip** after the tab bar lists recent hops from `window.__refxTrail` (persisted at `refx_trail_v1:<workspace>`), lets you jump back to any hop, **save the walk as a named stack**, or **replay** it hop-by-hop. Hide it with `custom.workbench.trail=false`.
+
+**Thinking trails** record every hover, click, and jump with parent and dwell on a structured ring. Query it with `window.__refx.trails.recent(n)`, `window.__refx.trails.query({ guid, kind, since, until, parent, limit })`, and `window.__refx.trails.before(guid, { kind, windowMs })` — for example, what you hovered before clicking a target. Entries persist to the **RefX Trails** record in Settings; the Workbench strip shows ○ for hovers and ● for commits (toggle commits-only to keep it quiet). Disable recording with `custom.trails.enabled=false`.
 
 The Workbench still remembers your layout: **stacks**, **reopen closed**, **tab strip**, **trail strip**, **related strip**, and **shared-neighbours strip**. The ⌕ filter shares the v4.53.0 recall scorer. If the panel pegs CPU, use palette **Disable Reference Workbench (safe mode)** or set `custom.workbench.enabled=false`.
 
@@ -17,8 +23,9 @@ children show directly. The inline section is a compact header (count,
 `⌕ ⇅ ⧉ 📌 ✕`) with flat rows beneath; filters sit behind ⌕. Task-reference
 checkbox spacing matches Thymer native (23.4px slot, 5.4px box-to-text gap).
 Rows also zoom in place from v4.52.x: click a crumb and the row re-roots on that
-node, chips inside the content keep navigating, nested counts open references
-without leaving the row, and a widget-bearing block offers a live transclusion.
+node, chips inside the content keep navigating, each line's own count opens its
+references without leaving the row (chip counts are off; `custom.counter.chipCounts:
+true` restores them), and a widget-bearing block offers a live transclusion.
 
 Block Context, facet pills, the unlinked-mention scan, the CHILDREN heading,
 collapse-all, vertical fold-outline mode, and remark chips are gone. The
@@ -345,7 +352,7 @@ Those provider counters are window-persistent across same-document hot reload,
 so installing a replacement instance cannot make abandoned work disappear from
 the diagnostic tell.
 
-Navigation stays at the top; **Replace with**, **Apply children**, **Aliases**, **Copy**, **Paste**, and **Delete** open flyouts. **Open in side panel** uses a real Thymer panel, while **Add to Workbench ▸** collects either the reference or its linked-references view. **Open linked references** is its own top-level action. Line-reference child application remains subtree-preserving and capped at depth 5 / 50 lines. Dwell on any chip for 350ms and a **hover preview** shows what it points at. **↑/↓** navigates, **→** enters a flyout, **←** returns, Enter picks, and Esc closes the flyout before the parent menu. Shift+right-click gives you the normal browser menu.
+Navigation stays at the top; **Replace with**, **Apply children**, **Aliases**, **Copy**, **Paste**, and **Delete** open flyouts. **Open in side panel** uses a real Thymer panel, while **Add to Workbench ▸** collects either the reference or its linked-references view. **Open linked references** is its own top-level action. Line-reference child application remains subtree-preserving and capped at depth 5 / 50 lines. Dwell on any chip for 350 ms and a **recursive hover card** opens: a scrollable body window with live reference chips, ancestor crumbs, optional pin, and nested cards when you hover chips inside (cycle guard, close grace, palette gate; `custom.hover.*`). **↑/↓** navigates, **→** enters a flyout, **←** returns, Enter picks, and Esc closes the flyout before the parent menu. Shift+right-click gives you the normal browser menu.
 
 **Replace with…** (straight from Roam):
 - **Text** — the chip becomes the target's text, fully severed.
@@ -357,6 +364,8 @@ Navigation stays at the top; **Replace with**, **Apply children**, **Aliases**, 
 ### Reference-menu extensions
 
 Other plugins can add context-aware actions through `window.__refx.registerMenuExtension({ id, owner, label, icon?, when?, onSelect })`. `owner` is required: use the name of a window singleton your plugin clears on unload, or an object with `id` and `isAlive()`. Dead-owner rows are pruned before render and checked again on selection. The call returns a same-id-safe disposer. Integrations can also call `window.__refx.unregisterMenuExtension(id, ownerId?)` and inspect callback-free descriptors from `window.__refx.listMenuExtensions()`. Icons must be lowercase Tabler suffixes such as `bolt` or `ti-bolt`.
+
+If RefX loads after your plugin, register three ways: call `window.__refx.registerMenuExtension(...)` when the bridge is already present; push `(bridge) => bridge.registerMenuExtension(...)` onto `window.__refxMenuExtensionProviders`; or listen for the `refx:bridge-ready` document event (`detail.version`) and register in the handler. Queued providers drain once when the bridge appears and again before each Extensions menu build.
 
 ## Reference counts on every chip
 
@@ -370,7 +379,7 @@ The reverse view of the chip badges: any line whose **own guid is referenced els
 
 Roam's count-click. Clicking a reference-count badge expands an **↙ N Linked References** section directly under that line, pushing the page content down. Each row is one muted clickable path (`Page › parent › date › @mention › ○`) followed by the referencing content at body size; crumbs render by kind and dedupe repeats, and a line that is only a reference to the target collapses into the trailing ○ so its children render directly. One ▾ per row folds the whole row. Rows are flat (Roam's inline references); the Workbench linked-refs view keeps per-page groups. The header holds the count and `⌕ ⇅ ⧉ 📌 ✕`; the filter box and page/hashtag chips sit behind ⌕. Timestamps and row actions show on hover. The floating Shift+badge popover uses the same row model. Click the count again (or ✕) to collapse.
 
-Crumbs zoom the row in place: the page crumb renders the whole page inside the row with the referencing line highlighted; ancestor crumbs and tree dots zoom deeper. For a line target the first row is the target line in its own page context (the home row), then the referencing rows. Reference chips inside rendered content zoom to their target, and their count opens nested references inside the row.
+Crumbs zoom the row in place: the page crumb renders the whole page inside the row with the referencing line highlighted; ancestor crumbs and tree dots zoom deeper. For a line target the first row is the target line in its own page context (the home row), then the referencing rows. Reference chips inside rendered content zoom to their target. Every line in a row — the referencing line, its children, and the ○ of a line that is only a reference — carries its own quiet count; click it (or focus it and press Enter/Space) to open that line's references right under it, and keep going from there as deep as the references go. Counts for lines already open above you are not drawn, so hops never loop back. Click a count again to fold its references.
 
 Editing a row rewrites only the text *between* the line's references/dates/tags — those anchors pass through byte-identical, and the edit is refused if you delete or reorder one (jump to the source for that). Enter commits, Esc cancels (Esc closes the editor first, then the section), blur commits.
 
@@ -388,16 +397,18 @@ A right-docked panel holding the pages, lines, and linked-reference views you're
 
 **Everything is natively editable (v3.15.0, default).** Each item opens as a real Thymer **transclusion**: click into it and **type, add children, check tasks, edit properties** — saved straight to the source, exactly like Roam's sidebar windows. The shelf's source of truth is the body of a **"Reference Workbench State"** record (one transclusion line per item), so order and content **sync natively across your devices** — no JSON, no localStorage store. Your existing shelf is migrated into it automatically on first load.
 
-Each item gets a slim **header** above it: **▾ collapse**, **📍 pin** (pinned items hold the top; new items land below them), **⋯ view-as** (**Full editable** / **Children only** / **Card (read-only)** / **Linked references** — convert any item to another form and back, per item), **⇱ swap to main**, **✕ remove**; the title jumps to source. Click the header **linked-reference count** to open linked references as a separate shelf item. A sticky **filter box + count + Clear-all** sits at the top (⌕ uses the shared recall scorer). **Stacks** (▤ menu, Ctrl/Cmd+Shift+1–9) save and restore named shelf layouts as `Workbench Stack:` records. **Reopen closed** (↶ or Ctrl/Cmd+Shift+T) brings back recently removed items. A **tab strip** mirrors shelf order (click scrolls; Alt+↑/↓/Enter/W for keyboard navigation). A **trail strip** (`.refx-wb-trail`, after the tab strip) shows your last reference hops from `window.__refxTrail`, with jump, save-as-stack, replay, and clear (`custom.workbench.trail=false` to hide). A **related strip** after the last shelf item suggests up to five pages referencing your open items or the main panel (`custom.workbench.related=false` to hide). A **shared-neighbours strip** (`.refx-wb-shared`, after the trail strip) lists up to five records your open shelf items all reference in common (`custom.workbench.shared=false` to hide). An item whose target was deleted shows a "(target deleted)" header instead of a broken embed. Drag-reorder is the **native** line drag. Width is the native panel divider.
+Each item gets a slim **header** above it: **▾ collapse**, **📍 pin** (pinned items hold the top; new items land below them), **⋯ view-as** (**Full editable** shows the block with its whole subtree, like Roam's `{{embed}}`; **Children only** shows its direct children at their fold state, deeper levels behind `▸`; **Card (read-only)** shows a read-only outline; **Linked references** shows the pages that reference it; convert any item to another form and back, per item). A reference inside the body is a pointer: the referenced record's own lines never ride along, and any the host pulls in fold into a `▸ N lines from <Record>` row at the foot of the item that brings them back on click. **⋯ ▸ Depth** (Direct children / Two levels / Everything) sets how deep an item opens; **⋯ ▸ Zoom out one level** and **Back to original** re-root a line target up its chain and back; **`⤓ Back to original`** on the header does the same; **⇱ swap to main**, **✕ remove**; the title jumps to source. Line targets also get the **Block Outline** trail described above: click a crumb to zoom out in place with the opened line outlined, Shift for a side panel, ⌘ to jump, hover to preview, Alt+←/→ from a focused header. Click the header **linked-reference count** to open linked references as a separate shelf item. A sticky **filter box + count + Clear-all** sits at the top (⌕ uses the shared recall scorer). **Stacks** (▤ menu, Ctrl/Cmd+Shift+1–9) save and restore named shelf layouts as `Workbench Stack:` records. **Reopen closed** (↶ or Ctrl/Cmd+Shift+T) brings back recently removed items. A **tab strip** mirrors shelf order (click scrolls; Alt+↑/↓/Enter/W for keyboard navigation). A **trail strip** (`.refx-wb-trail`, after the tab strip) shows your last reference hops from `window.__refxTrail`, with jump, save-as-stack, replay, and clear (`custom.workbench.trail=false` to hide). A **related strip** after the last shelf item suggests up to five pages referencing your open items or the main panel (`custom.workbench.related=false` to hide). A **shared-neighbours strip** (`.refx-wb-shared`, after the trail strip) lists up to five records your open shelf items all reference in common (`custom.workbench.shared=false` to hide). An item whose target was deleted shows a "(target deleted)" header instead of a broken embed. Drag-reorder is the **native** line drag. Width is the native panel divider.
 
 **Ways to collect:**
 - **Shift+click any reference chip or page link** — intercepted before navigation, so the page doesn't jump (count badges keep their own Shift+click behavior).
 - **Ctrl/Cmd+Shift+O** with the caret on a reference — Roam's "open link under cursor in the sidebar" chord. Set `custom.sidebarChord: "panel"` to restore the old behavior (open in a native side panel) instead.
 - The reference menu's **Add to Workbench ▸ Reference** and **Add to Workbench ▸ Linked references** rows.
-- The **⧉** button in an inline "↙ N Linked References" section header.
+- The **⧉** button in an inline "↙ N Linked References" section header adds that Linked-references view (the group-header ⧉ adds the group's source page).
 - Palette: **Add current line to Workbench** / **Add current page to Workbench**.
 
 Duplicates move to the top instead of stacking; new items land **below the pinned block**.
+
+**What a Workbench line can do:** every line inside an item carries its own quiet reference count, the same badge the page shows. Click it and that line's linked references open inline under the line, inside the item, and you can keep hopping from there. Set `custom.workbench.lineBadges: false` to hide the badges again.
 
 ## Connections
 

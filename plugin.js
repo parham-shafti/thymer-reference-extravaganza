@@ -1,3 +1,11 @@
+// v4.64.1 - Hover card scrolls instead of overlapping footer; native journal ref-items count as linked references; line-target card title renders datetime segments.
+// v4.59.6 - Workbench context peek: a closed peek is no longer resurrected empty by the panel keep-alive.
+// v4.59.5 - Workbench boot cloak lands on the .panel host and lifts only after the shelf renders (v4.59 U7).
+// v4.59.4 - Workbench boot cloak rAF attach, open-path refresh bypass, central owner guard, boot diag (v4.59 U6).
+// v4.59.2 - Workbench context peek toggle: chevron click no longer gated on refresh generation (v4.59 U4).
+// v4.59.1 - Workbench boot cloak: correct heading/body targets, leak-proof teardown (v4.59 U3).
+// v4.58.1 - Workbench context trail: single-line layout, redundant owner dedupe, 28-char crumb cap (v4.58.1 U5).
+// v4.58.0 - Workbench context trail, re-root, shared-ancestor grouping, sibling peek under crumbs (v4.58 U1–U4).
 // v4.57.2 - MO storm filter: marker classes on native hosts no longer blind keep-alive (WO-23).
 // v4.57.1 - Path search: containment hops, child-carried refs, trivial line-on-page sentences (WO-22).
 // v4.56.0 - Traversal strength ranking, behavioural co-occurrence, Workbench shared-neighbours strip (WO-20).
@@ -354,6 +362,13 @@ class Plugin extends AppPlugin {
   _mediaViewportPending = new Map();
   _mediaViewportObserverInstance = null;
   _mediaViewportObserverFailed = false;
+  _refNestCountJobs = new Map();
+  _refNestCountQueue = [];
+  _refNestCountInFlight = 0;
+  _refNestRevealPending = new Map();
+  _refNestRevealRaf = 0;
+  _refCountViewportPending = new Map();
+  _refCountViewportObserverInstance = null;
   _inlineMediaDisposed = false;
   _inlineMediaStats = {
     loads: 0, failures: 0, evictions: 0, byteCapDrops: 0,
@@ -363,6 +378,41 @@ class Plugin extends AppPlugin {
   _hoverT = 0;
   _hoverPop = null;
   _hoverChip = null;
+  _hoverStack = [];
+  _hoverStackPinned = false;
+  _hoverCloseT = 0;
+  _hoverNestT = 0;
+  _hoverNestChip = null;
+  _hoverNestDepthTarget = 0;
+  _hoverNestParentGuid = '';
+  _hoverCloseKeepDepth = -1;
+  _hoverRootGuid = '';
+  _hoverTreeCache = new Map();
+  _hoverRecursive = true;
+  _hoverMentions = true;
+  _hoverNestDepth = 2;
+  _hoverCloseMs = 180;
+  _hoverTrailNextId = 1;
+  _TRAILS_RECORD_NAME = "RefX Trails";
+  _TRAILS_META_KEY = "refx_trails";
+  _TRAILS_DAY_CAP = 400;
+  _TRAILS_RETENTION_DAYS = 14;
+  _trailsEnabled = true;
+  _trailsPersist = true;
+  _trailsLoadedFromRecord = false;
+  _trailsDirty = false;
+  _trailsFlushT = 0;
+  _trailsLastFlushed = new Map();
+  _trailsDayLines = new Map();
+  _trailsPagehide = null;
+  _trailCommitsOnly = true;
+  _pluginDataRecordGuids = new Map();
+  _hoverClickClose = null;
+  _hoverEscClose = null;
+  _hoverCardClickTrail = null;
+  _wbCrumbHoverEnabled = true; // custom.workbench.crumbHover (default true)
+  _wbCrumbHoverBound = null; // panel element carrying the delegated crumb-hover listener
+  _wbScrollFocusTries = new Map(); // lineGuid -> decorate attempts while focus line not yet rendered
   // Line embeds are real document lines. Record/page references default to a
   // lightweight decorator persisted as meta on the authored host line; the user
   // can explicitly opt into the expensive native full-body transclusion. This
@@ -631,7 +681,9 @@ class Plugin extends AppPlugin {
   _wbStatusItem = null; // statusbar toggle (Roam's persistent sidebar toggle)
   _WB_KEY = "refx_workbench_v1";
   _WB_CAP = 50; // shelf cap (Roam keeps windows until closed; 50 is the sanity ceiling)
-  _wbClearArmTs = 0; // "Clear all" pressed once while pinned items exist
+  _wbClearArmTs = 0; // "Clear all" confirmed once while pinned items exist
+  _wbFclearArmT = null; // armed "Clear all" timeout
+  _wbFclearDisarmDoc = null; // document listeners while armed
   // Synced persistence (v3.14.0): localStorage is per-client, so the shelf's
   // source of truth moves to a meta property (meta props sync and don't
   // render) on the first line of a dedicated "Reference Workbench State"
@@ -668,9 +720,24 @@ class Plugin extends AppPlugin {
   _wbLiveObs = null; // MutationObserver scoped to the live panel (header keep-alive)
   _wbLiveObsEl = null;
   _wbLiveFilter = ""; // session filter string (client-side CSS hide)
+  _wbLiveGuidFilter = null; // v4.58 U3: shelf line-guids narrowed by ⧉N group pill (Set or null)
+  _wbCtxGroupsFp = ""; // fingerprint of last painted shared-ancestor groups
+  _wbCtxGroupAnnot = null; // Map lineGuid -> {shared, dimPrefix, pill}
   _wbFilterBar = null; // the filter/count/clear decorator bar
   _wbMigrated = false;
   _wbLiveRefreshT = 0;
+  _wbBootClearT = 0;
+  _wbBootAttachRaf = 0;
+  _wbBootDiag = null;
+  _wbBootDiagOpenAt = 0;
+  _wbRegistryWasEmpty = true;
+  _wbCtxKickT = 0;
+  _wbCtxKickFired = false;
+  _wbCtxEventHandlers = [];
+  _wbCtxInvalidateTs = new Map();
+  _wbCtxCacheWritten = new Map(); // lineGuid -> {json, at}: in-memory refx_chain write guard while props lag
+  _wbMenuRegistrantPoked = null; // WeakSet of menu-extension registrants poked for the current bridge
+  _wbMenuRegistrantPokedBridge = null;
   _wbStormTripped = false;
   _wbRefreshRunTimes = []; // sliding-window timestamps for storm breaker
   _wbRefreshLastAt = 0;
@@ -719,7 +786,12 @@ class Plugin extends AppPlugin {
   // _wbFolds key = same -> true when that body line is folded (session-only).
   _wbFoldTwists = new Map();
   _wbFolds = new Map();
+  // v4.61 U7: record-local foreign clamp over native transclusion bodies.
+  _wbClampLift = new Map(); // wbLineGuid -> Set<'foreign'>
+  _wbClampNotes = new Map(); // wbLineGuid -> .refx-wb-clamp-note element
+  _wbClampSeeded = new Map(); // wbLineGuid -> Set<foldKey> — depth-fold keys seeded once per item
   _wbFocusSuppressUntil = 0; // _wbFocusFix settle-check suppressed while our own focus placement settles
+  _wbScrollFocusOnce = new Set(); // lineGuids that should scroll focus into view once after re-root
   _wbLivePanelId = null; // cached id of the panel showing the backing record (survives a transient null getActiveRecord)
   _WB_BACKING_GUID_KEY = "refx_workbench_backing_guid_v1";
   _sidebarChord = "workbench"; // custom.sidebarChord: Ctrl/Cmd+Shift+O → "workbench" | "panel"
@@ -4263,10 +4335,11 @@ class Plugin extends AppPlugin {
       const existingTrail = window.__refxTrail;
       this._refxTrail = existingTrail && typeof existingTrail === "object" && Array.isArray(existingTrail.ring)
         ? existingTrail
-        : { ring: [], cap: 50 };
+        : { ring: [], cap: 200 };
+      if (this._refxTrail && (!this._refxTrail.cap || this._refxTrail.cap < 200)) this._refxTrail.cap = 200;
       window.__refxTrail = this._refxTrail;
     } catch (e) {
-      this._refxTrail = { ring: [], cap: 50 };
+      this._refxTrail = { ring: [], cap: 200 };
     }
     this._refChainTreeDiagnostics = {
       version: 2,
@@ -4318,6 +4391,13 @@ class Plugin extends AppPlugin {
       }
       window.__REFX_CONN_DIAG = this._connDiagnostics;
     } catch (e) {}
+    try {
+      const adoptedBoot = window.__REFX_WB_BOOT_DIAG;
+      if (adoptedBoot && typeof adoptedBoot === "object") {
+        this._wbBootDiag = adoptedBoot;
+      }
+      window.__REFX_WB_BOOT_DIAG = this._wbBootDiag;
+    } catch (e) {}
     this._initInlineMediaRuntime();
     // v4.27.4: serialize every whole-workspace warm-up behind one cooperative,
     // input-aware queue.  RefX used to let broker hydration, title/alias indexing,
@@ -4342,7 +4422,7 @@ class Plugin extends AppPlugin {
     this._attachAttributesClaims();
     this._referenceSurfaceBroker = this._initReferenceSurfaceBroker(); // R1 + A1: Reference Surface v1
     this._referenceEditsBroker = this._initReferenceEditsBroker();
-    try { window.__REFX_VERSION = "4.57.2"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "4.64.1"; } catch (e) {} // live-version tell for debugging
     try {
       this._moveGeneration = Number(window.__refxMoveGeneration || 0) + 1;
       window.__refxMoveGeneration = this._moveGeneration;
@@ -4642,6 +4722,7 @@ class Plugin extends AppPlugin {
         this._recordRefxError(error, "line context subscribe " + eventName);
       }
     }
+    this._wbCtxSubscribeEvents();
     // Window-stash the host subscriptions so a hot-reload/PM-reinstall (which
     // re-runs onLoad WITHOUT onUnload) can sweep the PRIOR instance's handlers in
     // _killStaleObservers — otherwise each in-session reinstall leaks another copy
@@ -4668,6 +4749,8 @@ class Plugin extends AppPlugin {
     this._wbRelatedEnabled = !(wbCfgRaw.related === false || wbCfgRaw.related === "off");
     this._wbSharedEnabled = !(wbCfgRaw.shared === false || wbCfgRaw.shared === "off");
     this._wbTrailEnabled = !(wbCfgRaw.trail === false || wbCfgRaw.trail === "off");
+    this._wbCrumbHoverEnabled = !(wbCfgRaw.crumbHover === false || wbCfgRaw.crumbHover === "off");
+    try { if (localStorage.getItem("refx_wb_crumb_hover_v1") === "0") this._wbCrumbHoverEnabled = false; } catch (e) {}
     this._wbEnabled = !(wbCfgRaw.enabled === false || wbCfgRaw.enabled === "off");
     const connCfgRaw = custom.connections && typeof custom.connections === "object" ? custom.connections : {};
     this._connEnabled = !(connCfgRaw.enabled === false || connCfgRaw.enabled === "off");
@@ -4791,9 +4874,16 @@ class Plugin extends AppPlugin {
         referenceSurface: this._referenceSurfaceBroker,
         // R6: synced saved Reference Views API (generation-guarded, hot-reload-safe).
         referenceViews: this._r6BuildViewsApi(),
+        trails: this._trailsBuildApi(),
       };
       this._refxBridge = bridge;
       window.__refx = bridge;
+      this._drainRefxMenuExtensionProviders(bridge);
+      this._wbPokeMenuRegistrants("bridge-ready");
+      this._registerActivityTimerMenuExtensions();
+      try {
+        document.dispatchEvent(new CustomEvent("refx:bridge-ready", { detail: { version: bridge.version } }));
+      } catch (e) {}
       // Stash for singleton disposal on hot-reload.
       window.__refxSavedViews = window.__refx.referenceViews;
     } catch (e) {}
@@ -5459,13 +5549,31 @@ class Plugin extends AppPlugin {
     window.__refxChipTaskPress = null;
     try { if (window.__refxWbStatusItem === this._wbStatusItem) window.__refxWbStatusItem = null; } catch (e) {}
     if (this._wbStatusItem) { try { this._wbStatusItem.remove(); } catch (e) {} this._wbStatusItem = null; }
+    this._wbCtxCancelAllWarmRetries();
+    if (this._wbCtxKickT) { try { clearTimeout(this._wbCtxKickT); } catch (e) {} this._wbCtxKickT = 0; }
+    for (const t of this._wbCtxInvalidateTs.values()) { try { clearTimeout(t); } catch (e) {} }
+    this._wbCtxInvalidateTs.clear();
+    if (this._wbCtxCacheWritten) this._wbCtxCacheWritten.clear();
+    if (typeof this.events?.off === "function") {
+      for (const id of this._wbCtxEventHandlers || []) {
+        try { if (id) this.events.off(id); } catch (e) {}
+      }
+    }
+    this._wbCtxEventHandlers = [];
+    this._wbMenuRegistrantPoked = null;
+    this._wbMenuRegistrantPokedBridge = null;
     this._wbLiveTeardownObserver(); // live headers + panel observer + filter bar
     if (this._wbLiveRefreshT) { try { clearTimeout(this._wbLiveRefreshT); } catch (e) {} this._wbLiveRefreshT = 0; }
+    if (this._wbBootClearT) { try { clearTimeout(this._wbBootClearT); } catch (e) {} this._wbBootClearT = 0; }
+    if (this._wbBootAttachRaf) { try { cancelAnimationFrame(this._wbBootAttachRaf); } catch (e) {} this._wbBootAttachRaf = 0; }
+    try { this._wbClearBootCloak(null); } catch (e) {}
     if (this._wbRelatedT) { try { clearTimeout(this._wbRelatedT); } catch (e) {} this._wbRelatedT = 0; }
     this._wbRelatedGen++;
     if (this._wbSharedT) { try { clearTimeout(this._wbSharedT); } catch (e) {} this._wbSharedT = 0; }
     this._wbSharedGen++;
     this._wbTrailStopReplay();
+    try { if (window.__refxTrailsDispose) window.__refxTrailsDispose(); } catch (e) {}
+    window.__refxTrailsDispose = null;
     if (this._wbDatacorePokeT) { try { clearTimeout(this._wbDatacorePokeT); } catch (e) {} this._wbDatacorePokeT = 0; }
     this._wbBackingRecord = null;
     this._wbBackingGuid = null;
@@ -5477,13 +5585,10 @@ class Plugin extends AppPlugin {
     this._wbMigrated = false;
     try {
       // A same-document hot reload intentionally preserves registrations because
-      // Thymer skips this method. A true disable/uninstall calls onUnload, where
-      // the current bridge owns and clears the registry so no dead closures survive.
+      // Thymer skips this method. On true disable/uninstall only drop the bridge;
+      // __refxMenuExtensions and __refxPopupSections stay shared registries —
+      // _availableMenuExtensions prunes dead owners via _menuExtensionOwnerAlive.
       if (window.__refx === this._refxBridge) {
-        window.__refxMenuExtensions?.clear?.();
-        window.__refxMenuExtensions = null;
-        window.__refxPopupSections?.clear?.();
-        window.__refxPopupSections = null;
         window.__refx = null;
       }
     } catch (e) {}
@@ -5616,7 +5721,9 @@ class Plugin extends AppPlugin {
       const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
       const li = document.querySelector('.listitem[data-guid="' + esc + '"]');
       const root = li && li.closest('.listview-items[data-guid]');
-      return (root && root.getAttribute('data-guid')) || null;
+      const guid = (root && root.getAttribute('data-guid')) || null;
+      if (guid && this._wbBackingGuid && String(guid) === String(this._wbBackingGuid)) return null;
+      return guid;
     } catch (e) { return null; }
   }
 
@@ -6520,7 +6627,10 @@ class Plugin extends AppPlugin {
     this._inlineMediaAborters.clear();
     try { this._mediaViewportObserverInstance?.disconnect?.(); } catch (e) {}
     this._mediaViewportObserverInstance = null;
+    try { this._refCountViewportObserverInstance?.disconnect?.(); } catch (e) {}
+    this._refCountViewportObserverInstance = null;
     this._mediaViewportPending.clear();
+    this._refCountViewportPending.clear();
     for (const url of this._inlineMediaUrls) { try { URL.revokeObjectURL(url); } catch (e) {} }
     this._inlineMediaCache.clear();
     this._inlineMediaPending.clear();
@@ -10266,6 +10376,7 @@ class Plugin extends AppPlugin {
         alive: () => !settled,
         onJump: (g) => { this._closeModal(); done(false); this._bridgeJump(g, {}); },
         treeCache,
+        nestedCounts: false,
       };
       this._openModal({
         title: items.length === 1 ? "1 line references this line" : items.length + " lines reference this line",
@@ -11715,6 +11826,26 @@ class Plugin extends AppPlugin {
     const k = e.key;
     if (k === "ArrowDown") { e.preventDefault(); e.stopImmediatePropagation(); this._moveWbNav(1); return; }
     if (k === "ArrowUp") { e.preventDefault(); e.stopImmediatePropagation(); this._moveWbNav(-1); return; }
+    if (e.altKey && k === "ArrowLeft") {
+      const it = this._wbNavItem();
+      if (it && it.target && !this.data.getRecord(it.target)) {
+        const chainResult = this._wbCtxChain(it.target);
+        if (chainResult.chain.length > 0) {
+          e.preventDefault(); e.stopImmediatePropagation();
+          this._wbLiveReroot(it, chainResult.chain[0].guid, it.focus || it.target);
+          return;
+        }
+      }
+      return;
+    }
+    if (e.altKey && k === "ArrowRight") {
+      const it = this._wbNavItem();
+      if (it && this._wbLiveZoomInOne(it)) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        return;
+      }
+      return;
+    }
     if (k === "ArrowRight" || k === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); this._wbNavDescend(); return; }
     if (k === "ArrowLeft") { e.preventDefault(); e.stopImmediatePropagation(); this._wbNavCollapse(); return; }
     if (k === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); this._exitWbNav(); return; }
@@ -14005,10 +14136,19 @@ class Plugin extends AppPlugin {
     try { if (window.__refxTrailReplayKey) window.removeEventListener("keydown", window.__refxTrailReplayKey, true); } catch (e) {}
     window.__refxTrailReplayKey = null;
     try { if (window.__refxTrailReplayGen != null) window.__refxTrailReplayGen = (Number(window.__refxTrailReplayGen) || 0) + 1; } catch (e) {}
+    try { if (window.__refxTrailsDispose) window.__refxTrailsDispose(); } catch (e) {}
+    window.__refxTrailsDispose = null;
     // Live Workbench: a hot-reload-leaked panel observer + orphaned headers.
     try { if (window.__refxWbLiveObs && window.__refxWbLiveObs.disconnect) window.__refxWbLiveObs.disconnect(); } catch (e) {}
     window.__refxWbLiveObs = null;
-    try { document.querySelectorAll(".refx-wb-hdr, .refx-wb-slot, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-shared").forEach((n) => n.remove()); } catch (e) {}
+    try { if (window.__refxWbCtxPeekKey) window.removeEventListener("keydown", window.__refxWbCtxPeekKey, true); } catch (e) {}
+    window.__refxWbCtxPeekKey = null;
+    try { document.querySelectorAll(".refx-wb-hdr, .refx-wb-ctx, .refx-wb-slot, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-shared").forEach((n) => n.remove()); } catch (e) {}
+    try { document.querySelectorAll('[data-refx-wb-boot]').forEach((el) => { delete el.dataset.refxWbBoot; }); } catch (e) {}
+    try { document.querySelectorAll('.refx-wb-foreignhide').forEach((n) => n.classList.remove('refx-wb-foreignhide')); } catch (e) {}
+    this._wbClampLift.clear();
+    this._wbClampNotes.clear();
+    this._wbClampSeeded.clear();
     // ... and its Workbench chip collectors (same press-swallow shape).
     try { if (window.__refxWbClick) window.removeEventListener("click", window.__refxWbClick, true); } catch (e) {}
     window.__refxWbClick = null;
@@ -21683,6 +21823,9 @@ class Plugin extends AppPlugin {
     let st = document.getElementById(this._STYLE_ID);
     if (!st) { st = document.createElement("style"); st.id = this._STYLE_ID; document.head.appendChild(st); }
     st.textContent = `
+:root { --refx-wb-focus-ring: #e6b422; }
+[data-theme="dark"] { --refx-wb-focus-ring: #d4a92a; }
+
 .refx-typed-offer {
   position: fixed; z-index: 2147482995; display: flex; align-items: center; gap: 5px;
   max-width: min(420px, calc(100vw - 16px)); padding: 5px;
@@ -23026,6 +23169,20 @@ class Plugin extends AppPlugin {
 .refx-hoverpop-page { font-size: 10px; opacity: .55; margin-bottom: 3px; }
 .refx-hoverpop-line { font-size: 11px; opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .refx-hoverpop-empty { opacity: .45; font-style: italic; }
+.refx-hovercard { width: 460px; max-width: calc(100vw - 24px); max-height: min(60vh, 520px); overflow: auto; pointer-events: auto; padding: 8px 10px; box-sizing: border-box; border: 1px solid color-mix(in srgb, var(--cards-border-color, rgba(127,127,127,.24)) calc(100% - calc(var(--refx-hovercard-depth, 0) * 8%)), transparent); }
+.refx-hovercard .refx-wb-tree-line { white-space: normal; }
+.refx-hovercard-header { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 4px; }
+.refx-hovercard-title-wrap { flex: 1 1 auto; min-width: 0; }
+.refx-hovercard-title { font-size: 12px; font-weight: 650; margin-bottom: 2px; cursor: pointer; }
+.refx-hovercard-crumb { font-size: 11px; color: var(--text-muted, var(--color-text-600)); }
+.refx-hovercard-crumb .trc-ref-crumb-heading { font-weight: 650; }
+.refx-hovercard-pin { flex: 0 0 auto; border: none; background: transparent; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1.2; }
+.refx-hovercard-pin.refx-hovercard-pinned { opacity: 1; }
+.refx-hovercard > * { flex-shrink: 0; }
+.refx-hovercard-crumb-page { border: 0; background: none; padding: 0; font: inherit; color: var(--refx-page-link-color, #106ba3); cursor: pointer; }
+.refx-hovercard-mentions { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--cards-border-color, rgba(127,127,127,.18)); }
+.refx-hovercard-mentions-header { font-size: 11px; font-weight: 600; margin-bottom: 4px; color: var(--text-muted, var(--color-text-600)); }
+.refx-hovercard-mentions-showall { display: block; margin-top: 4px; border: none; background: none; padding: 0; font-size: 11px; color: var(--refx-page-link-color, #106ba3); cursor: pointer; }
 .refx-popup-sections {
   display: flex; flex-direction: column; gap: 5px;
   padding: 6px 9px; border-top: 1px solid var(--cards-border-color, rgba(127,127,127,.24));
@@ -23702,7 +23859,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         this._lineRefClickPending = null;
         this._lineRefClickSeq++;
         const targetGuid = (chip.getAttribute && chip.getAttribute('data-guid')) || '';
-        if (targetGuid) this._bridgeJump(targetGuid, {});
+        if (targetGuid) {
+          this._trailRecordChipClick(chip, targetGuid);
+          this._bridgeJump(targetGuid, { skipTrailRecord: true });
+        }
         return;
       }
       const now = Date.now();
@@ -23854,7 +24014,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // checkbox (→ toggles, never a menu). Text loses Thymer's native menu, but
     // every useful action already lives in the block menu (_openLineMenu).
     const li = t.closest(".listitem[data-guid]");
-    if (li && !li.closest(".listitem-transclusion") && !li.closest(".refx-wb-live")) {
+    if (li && !li.classList?.contains?.("listitem-transclusion") && (
+      li.closest(".refx-wb-item")
+      || (!li.closest(".listitem-transclusion") && !li.closest(".refx-wb-live"))
+    )) {
       if (t.closest(".refx-chip-task")) return; // checkbox toggles, no menu
       const g = (li.getAttribute("data-guid") || "").trim();
       if (g) {
@@ -24510,7 +24673,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // Close again after async resolution in case another menu opened while the
     // target loaded. The double-click action itself never opens a second menu.
     this._closeCardPopup();
-    this._bridgeJump(r.targetGuid, { from: r.lineGuid || r.pageGuid || null });
+    this._trailRecordChipClick(chip, r.targetGuid);
+    this._bridgeJump(r.targetGuid, { from: r.lineGuid || r.pageGuid || null, skipTrailRecord: true });
   }
 
   _panelForNode(node) {
@@ -27675,6 +27839,97 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     return { li, segs, refIdx, targetGuid, anchorNode: null, lineNode: null, current, fallback, isText, lineGuid, pageGuid };
   }
 
+  _registerActivityTimerMenuExtensions() {
+    if (this._unloaded) return;
+    let at = null;
+    try { at = window.__activityTimer; } catch (e) {}
+    if (!at || typeof at.getState !== "function") return;
+    let registry = null;
+    try { registry = window.__refxMenuExtensions; } catch (e) {}
+    if (registry instanceof Map) {
+      for (const id of registry.keys()) {
+        if (String(id).startsWith("refx-at:")) return;
+      }
+    }
+    const owner = { id: "refx:activity-timer", isAlive: () => !this._unloaded && !!window.__activityTimer };
+    const invokeAt = (call) => {
+      try {
+        const pending = call();
+        if (pending && typeof pending.then === "function") {
+          pending.then((result) => {
+            if (result && result.message && (result.rejected || result.ok === false)) {
+              this._toast(result.message);
+            }
+          }).catch((error) => {
+            try { this._toast(String(error && error.message || error)); } catch (e) {}
+          });
+        } else if (pending && pending.message && (pending.rejected || pending.ok === false)) {
+          this._toast(pending.message);
+        }
+      } catch (error) {
+        try { this._toast(String(error && error.message || error)); } catch (e) {}
+      }
+    };
+    const atState = () => {
+      try { return at.getState() || {}; } catch (e) { return {}; }
+    };
+    this._registerMenuExtension({
+      id: "refx-at:start",
+      owner,
+      label: "Start timer on this line",
+      icon: "player-play",
+      when: (ctx) => {
+        const state = atState();
+        return !!(ctx.lineGuid && state.ready && !state.activeSessionGuid);
+      },
+      onSelect: (ctx) => {
+        if (!ctx.lineGuid) return;
+        invokeAt(() => at.start({ sourceLine: ctx.lineGuid, origin: "RefX line menu" }));
+      },
+    });
+    this._registerMenuExtension({
+      id: "refx-at:switch",
+      owner,
+      label: "Switch timer to this line",
+      icon: "player-skip-forward",
+      when: (ctx) => {
+        const state = atState();
+        const activeLine = state.active?.sourceLine || state.active?.lineGuid;
+        return !!(ctx.lineGuid && state.ready && state.activeSessionGuid && activeLine !== ctx.lineGuid);
+      },
+      onSelect: (ctx) => {
+        if (!ctx.lineGuid) return;
+        invokeAt(() => at.switch({ sourceLine: ctx.lineGuid, origin: "RefX line menu" }));
+      },
+    });
+    this._registerMenuExtension({
+      id: "refx-at:stop",
+      owner,
+      label: "Stop timer",
+      icon: "player-stop",
+      when: (ctx) => {
+        const state = atState();
+        return !!(state.ready && state.activeSessionGuid);
+      },
+      onSelect: () => {
+        const state = atState();
+        if (!state.activeSessionGuid) return;
+        invokeAt(() => at.stop({ sessionGuid: state.activeSessionGuid }));
+      },
+    });
+    this._registerMenuExtension({
+      id: "refx-at:dock",
+      owner,
+      label: "Open timer dock",
+      icon: "clock",
+      when: () => {
+        const state = atState();
+        return !!state.ready;
+      },
+      onSelect: () => invokeAt(() => at.openDock()),
+    });
+  }
+
   _registerMenuExtension(definition) {
     if (!definition || typeof definition !== "object") throw new TypeError("RefX menu extension must be an object.");
     const id = String(definition.id || "").trim();
@@ -27961,9 +28216,96 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     });
   }
 
+  _drainRefxMenuExtensionProviders(bridge) {
+    if (!bridge) return;
+    let providers = null;
+    try { providers = window.__refxMenuExtensionProviders; } catch (e) {}
+    if (!Array.isArray(providers) || providers.length === 0) return;
+    const batch = providers.splice(0, providers.length);
+    for (const fn of batch) {
+      if (typeof fn !== "function") continue;
+      try { fn(bridge); } catch (error) {
+        this._recordRefxError(error, "menu extension provider");
+      }
+    }
+  }
+
+  // After a RefX reinstall other plugins may still hold refxMenuDisposers from the
+  // old bridge and skip re-registering. Scan window for registrant objects, run
+  // stale disposers, and call their register hook once per bridge generation.
+  _wbPokeMenuRegistrants(reason) {
+    if (!this._refxBridge) return;
+    if (!this._wbMenuRegistrantPoked || this._wbMenuRegistrantPokedBridge !== this._refxBridge) {
+      this._wbMenuRegistrantPoked = new WeakSet();
+      this._wbMenuRegistrantPokedBridge = this._refxBridge;
+    }
+    const poked = this._wbMenuRegistrantPoked;
+    let registrants = null;
+    try {
+      const diag = this._wbBootDiag || window.__REFX_WB_BOOT_DIAG;
+      if (diag) {
+        if (!Array.isArray(diag.registrants)) diag.registrants = [];
+        registrants = diag.registrants;
+      }
+    } catch (e) {}
+    let keys = [];
+    try { keys = Object.keys(window); } catch (e) { return; }
+    for (const name of keys) {
+      if (!name.startsWith("__")) continue;
+      if (name === "__refx" || name.startsWith("__refx") || name.startsWith("__REFX_")) continue;
+      let obj = null;
+      try { obj = window[name]; } catch (e) { continue; }
+      if (!obj || typeof obj !== "object") continue;
+      const registerFn = typeof obj._registerRefxMenuExtensions === "function"
+        ? obj._registerRefxMenuExtensions
+        : (typeof obj.registerRefxMenuExtensions === "function" ? obj.registerRefxMenuExtensions : null);
+      if (!registerFn) continue;
+      if (poked.has(obj)) continue;
+      poked.add(obj);
+      let disposersRun = 0;
+      if (Array.isArray(obj.refxMenuDisposers)) {
+        const batch = obj.refxMenuDisposers.slice();
+        for (const d of batch) {
+          if (typeof d !== "function") continue;
+          try { d(); disposersRun++; } catch (error) {
+            this._recordRefxError(error, "menu registrant disposer");
+          }
+        }
+      }
+      try { registerFn.call(obj, 0); } catch (error) {
+        this._recordRefxError(error, "menu registrant register");
+      }
+      if (registrants) {
+        try { registrants.push({ name, disposersRun, at: performance.now(), reason }); } catch (e) {}
+      }
+    }
+  }
+
   _availableMenuExtensions(ctx) {
+    try {
+      if (Array.isArray(window.__refxMenuExtensionProviders) && window.__refxMenuExtensionProviders.length > 0) {
+        this._drainRefxMenuExtensionProviders(window.__refx);
+      }
+    } catch (e) {}
+    try {
+      if (window.__activityTimer) {
+        let atRegistry = null;
+        try { atRegistry = window.__refxMenuExtensions; } catch (e) {}
+        let hasAt = false;
+        if (atRegistry instanceof Map) {
+          for (const id of atRegistry.keys()) {
+            if (String(id).startsWith("refx-at:")) { hasAt = true; break; }
+          }
+        }
+        if (!hasAt) this._registerActivityTimerMenuExtensions();
+      }
+    } catch (e) {}
     let registry = null;
     try { registry = window.__refxMenuExtensions; } catch (e) { registry = this._menuExtensions; }
+    if (!(registry instanceof Map) || registry.size === 0) {
+      this._wbPokeMenuRegistrants("availableMenuExtensions");
+      try { registry = window.__refxMenuExtensions; } catch (e) { registry = this._menuExtensions; }
+    }
     if (!(registry instanceof Map)) return [];
     const available = [];
     for (const [id, extension] of registry) {
@@ -28578,63 +28920,767 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   // ═══════════════════════════════════════ hover preview (Roam-style peek)
 
   // One always-on mouseover listener; first lines reject everything that isn't
-  // entering a reference chip. 350ms dwell before showing. Any move off the
-  // chip cancels/closes; scroll closes; popups/link-mode suppress it.
-  _handleRefHover = (e) => {
-    const t = e.target;
-    if (!t || !t.closest) return;
-    if (t.closest(".refx-hoverpop")) return;
-    const chip = t.closest(".lineitem-ref");
-    if (chip === this._hoverChip) return;
-    this._cancelHover();
-    if (!chip) return;
-    if (this._modal || this._link || this._cardEditing || this._cardPopup) return;
-    if (t.closest(".refalias-pop, .refx-propcard, .trc-ref-popover")) return;
-    this._hoverChip = chip;
-    // v4.20.1 Fix 3a: warm-on-hover — kick _fetchBackrefs + ensureCollectionIndex
-    // fire-and-forget so a subsequent click hits warm caches instead of cold ones.
-    // Gated: only when the chip carries a data-guid that looks like a record target
-    // (not a line, since _fetchBackrefs is a no-op for lines) and the backref cache
-    // isn't already warm for this guid.
+  // entering a reference chip. 350ms dwell before showing. v4.64: recursive
+  // card stack with close-grace, cycle guard, and pin.
+  _trailSafeLabel(guid, entryLabel) {
+    if (entryLabel) return String(entryLabel).trim();
     try {
-      const hoverGuid = (chip.getAttribute?.('data-guid') || '').trim();
-      if (hoverGuid && this.isExistingRecordGuid?.(hoverGuid)) {
-        const hit = this._backrefCache?.get?.(hoverGuid);
-        if (!hit || (performance.now() - hit.ts) >= this._countTtlMs) {
-          this._fetchBackrefs(hoverGuid).catch(() => {});
-        }
-        if (this._excludeCollections?.size > 0) this.ensureCollectionIndex().catch(() => {});
-      }
-    } catch (_) {}
-    this._hoverT = setTimeout(() => { this._hoverT = 0; this._showHoverPreview(chip); }, 350);
-  };
-
-  _cancelHover() {
-    if (this._hoverT) { try { clearTimeout(this._hoverT); } catch (e) {} this._hoverT = 0; }
-    this._hoverChip = null;
-    if (this._hoverPop) { try { this._hoverPop.remove(); } catch (e) {} this._hoverPop = null; window.__refxHoverPop = null; }
-    // The scroll-to-close listener is once:true, but a preview shown then dismissed
-    // by mouseout (never scrolled) leaves it dangling over this instance's closure.
-    // removeEventListener is a no-op if it already fired or was never added.
-    try { document.removeEventListener("scroll", this._hoverScrollClose, true); } catch (e) {}
+      return String(this.getOrLoadRecordName?.(guid) || this._readableLineTitle?.(guid) || guid).trim();
+    } catch (e) {
+      return String(this._readableLineTitle?.(guid) || guid).trim();
+    }
   }
 
-  _showHoverPreview(chip) {
-    if (!chip.isConnected || this._modal || this._link || this._cardPopup) return;
-    const guid = (chip.getAttribute("data-guid") || "").trim();
+  _trailNormalizeEntry(entry, idx = 0) {
+    const guid = String(entry?.guid || "");
+    const ts = Number(entry?.ts) || Date.now();
+    const how = String(entry?.how || entry?.kind || "jump");
+    let kind = String(entry?.kind || "");
+    if (!kind) {
+      if (how === "hover") kind = "hover";
+      else if (how === "click" || how === "pick" || how === "expand") kind = "click";
+      else kind = "jump";
+    }
+    const label = this._trailSafeLabel(guid, entry?.label);
+    const id = entry?.id ? String(entry.id) : ("l" + ts + ":" + guid + ":" + idx);
+    return {
+      id,
+      guid,
+      label,
+      ts,
+      how,
+      kind,
+      parent: entry?.parent ? String(entry.parent) : "",
+      dwellMs: Math.max(0, Number(entry?.dwellMs) || 0),
+    };
+  }
+
+  _trailRecord(entry) {
+    if (!this._trailsEnabled) return "";
+    const trail = this._refxTrail || (typeof window !== "undefined" ? window.__refxTrail : null);
+    if (!trail || !Array.isArray(trail.ring)) return "";
+    const cap = Math.max(1, Number(trail.cap) || 200);
+    trail.cap = cap;
+    const normalized = this._trailNormalizeEntry({ ...entry, ts: entry?.ts || Date.now() });
+    if (!normalized.guid) return "";
+    if (!entry?.id) normalized.id = "t" + (this._hoverTrailNextId++);
+    trail.ring.push(normalized);
+    while (trail.ring.length > cap) trail.ring.shift();
+    this._connTrailPersistSoon();
+    this._trailsMarkDirty();
+    this._wbTrailNotifyChanged();
+    return normalized.id;
+  }
+
+  _trailSetDwell(id, ms) {
+    if (!this._trailsEnabled || !id) return;
+    const trail = this._refxTrail || (typeof window !== "undefined" ? window.__refxTrail : null);
+    if (!trail || !Array.isArray(trail.ring)) return;
+    const entry = trail.ring.find((e) => e && e.id === id);
+    if (!entry) return;
+    entry.dwellMs = Math.max(0, Number(ms) || 0);
+    this._connTrailPersistSoon();
+    this._trailsMarkDirty();
+    this._wbTrailNotifyChanged();
+  }
+
+  _trailRecordChipClick(chip, targetGuid) {
+    if (!this._trailsEnabled || !chip || !targetGuid) return;
+    if (chip.closest?.(".refx-hovercard")) return;
+    const hostLine = chip.closest?.(".listitem[data-guid]") || null;
+    const parent = String(hostLine?.getAttribute?.("data-guid") || hostLine?.dataset?.guid || "");
+    const guid = String(targetGuid);
+    this._trailRecord({ guid, kind: "click", how: "click", parent, label: this._trailSafeLabel(guid) });
+  }
+
+  _hoverHostLineGuid(chip) {
+    const sourceLine = chip?.closest?.(".listitem[data-guid]") || null;
+    return sourceLine?.getAttribute?.("data-guid") || sourceLine?.dataset?.guid || "";
+  }
+
+  _hoverPaletteVisible() {
+    let nodes = [];
+    try { nodes = Array.from(document.querySelectorAll?.(this._nativePickerRootSelector() + ", [role=\"dialog\"]") || []); } catch (e) {}
+    for (const node of nodes) {
+      if (!node || node.isConnected === false || node.hidden === true) continue;
+      try {
+        if (node.getAttribute?.("aria-hidden") === "true") continue;
+        if (node.offsetParent === null) continue;
+      } catch (err) { continue; }
+      return true;
+    }
+    return false;
+  }
+
+  _hoverVisitedGuids() {
+    const out = new Set();
+    for (const frame of this._hoverStack || []) {
+      if (frame?.guid) out.add(String(frame.guid));
+    }
+    if (this._hoverRootGuid) out.add(String(this._hoverRootGuid));
+    return out;
+  }
+
+  _cancelHoverPendingOpen() {
+    if (this._hoverT) { try { clearTimeout(this._hoverT); } catch (e) {} this._hoverT = 0; }
+    this._hoverChip = null;
+  }
+
+  _cancelHoverNestArm() {
+    if (this._hoverNestT) { try { clearTimeout(this._hoverNestT); } catch (e) {} this._hoverNestT = 0; }
+    this._hoverNestChip = null;
+    this._hoverNestDepthTarget = 0;
+    this._hoverNestParentGuid = "";
+  }
+
+  _cancelHoverCloseGrace() {
+    if (this._hoverCloseT) { try { clearTimeout(this._hoverCloseT); } catch (e) {} this._hoverCloseT = 0; }
+    this._hoverCloseKeepDepth = -1;
+  }
+
+  _armHoverCloseGrace(keepDepth = -1) {
+    if (this._hoverStackPinned || !this._hoverStack.length) return;
+    this._cancelHoverCloseGrace();
+    this._hoverCloseKeepDepth = keepDepth;
+    this._hoverCloseT = setTimeout(() => {
+      this._hoverCloseT = 0;
+      if (this._hoverStackPinned) return;
+      this._popHoverStackToDepth(this._hoverCloseKeepDepth);
+    }, Math.max(0, Number(this._hoverCloseMs) || 180));
+  }
+
+  _popHoverStackToDepth(keepDepth) {
+    while (this._hoverStack.length && this._hoverStack[this._hoverStack.length - 1].depth > keepDepth) {
+      this._popHoverCard(true);
+    }
+    if (keepDepth < 0 && !this._hoverStack.length) this._teardownHoverStackListeners();
+  }
+
+  _popHoverCard(recordDwell) {
+    const frame = this._hoverStack.pop();
+    if (!frame) return;
+    if (recordDwell && frame.id) this._trailSetDwell(frame.id, Date.now() - (frame.openedAt || Date.now()));
+    try { frame.pop?.remove?.(); } catch (e) {}
+    const top = this._hoverStack[this._hoverStack.length - 1] || null;
+    this._hoverPop = top ? top.pop : null;
+    window.__refxHoverPop = this._hoverPop;
+    if (!this._hoverStack.length) {
+      this._hoverRootGuid = "";
+      this._hoverStackPinned = false;
+      this._teardownHoverStackListeners();
+    }
+  }
+
+  _teardownHoverStackListeners() {
+    try { document.removeEventListener("scroll", this._hoverScrollClose, true); } catch (e) {}
+    if (this._hoverClickClose) { try { document.removeEventListener("click", this._hoverClickClose, true); } catch (e) {} this._hoverClickClose = null; }
+    if (this._hoverEscClose) { try { document.removeEventListener("keydown", this._hoverEscClose, true); } catch (e) {} this._hoverEscClose = null; }
+    if (this._hoverCardClickTrail) { try { document.removeEventListener("click", this._hoverCardClickTrail, true); } catch (e) {} this._hoverCardClickTrail = null; }
+  }
+
+  _installHoverStackListeners(rootChip) {
+    this._teardownHoverStackListeners();
+    this._hoverClickClose = (ev) => {
+      const t = ev.target;
+      if (t?.closest?.(".refx-hovercard")) return;
+      this._cancelHover();
+    };
+    this._hoverEscClose = (ev) => { if (ev.key === "Escape") this._cancelHover(); };
+    this._hoverCardClickTrail = (ev) => {
+      const chip = ev.target?.closest?.(".lineitem-ref");
+      const card = chip?.closest?.(".refx-hovercard");
+      if (!chip || !card) return;
+      const parentGuid = String(card.dataset?.refxGuid || card.getAttribute?.("data-refx-guid") || "").trim();
+      const guid = (chip.getAttribute?.("data-guid") || "").trim();
+      if (!guid) return;
+      this._trailRecord({ guid, kind: "click", how: "click", parent: parentGuid });
+    };
+    document.addEventListener("click", this._hoverClickClose, true);
+    document.addEventListener("keydown", this._hoverEscClose, true);
+    document.addEventListener("click", this._hoverCardClickTrail, true);
+    document.addEventListener("scroll", this._hoverScrollClose, { capture: true });
+  }
+
+  _armHoverNestOpen(chip, depth, parentGuid) {
+    if (chip === this._hoverNestChip && this._hoverNestT) return;
+    this._cancelHoverNestArm();
+    this._hoverNestChip = chip;
+    this._hoverNestDepthTarget = depth;
+    this._hoverNestParentGuid = String(parentGuid || "");
+    this._hoverNestT = setTimeout(() => {
+      this._hoverNestT = 0;
+      this._hoverNestChip = null;
+      if (!chip?.isConnected || this._hoverPaletteVisible()) return;
+      if (this._modal || this._link || this._cardEditing || this._cardPopup) return;
+      const hostLineGuid = this._hoverStack[0]?.hostLineGuid || this._hoverHostLineGuid(this._hoverStack[0]?.chip || chip);
+      this._openHoverCard(chip, depth, parentGuid, hostLineGuid);
+    }, 350);
+  }
+
+  _openHoverCard(chip, depth, parentGuid, hostLineGuid) {
+    if (!chip?.isConnected || this._hoverPaletteVisible()) return;
+    if (this._modal || this._link || this._cardEditing || this._cardPopup) return;
+    const guid = (chip.getAttribute?.("data-guid") || "").trim();
     if (!guid) return;
-    const pop = this._el("div", "refalias-pop refx-hoverpop");
+    if (depth === 0) {
+      this._cancelHover();
+      this._hoverRootGuid = guid;
+    } else {
+      while (this._hoverStack.length > depth) this._popHoverCard(true);
+      const visited = this._hoverVisitedGuids();
+      if (visited.has(guid) || depth > this._hoverNestDepth) return;
+    }
+    const pop = this._el("div", "refalias-pop refx-hoverpop refx-hovercard refx-popup-interactive");
+    pop.dataset.refxDepth = String(depth);
+    pop.dataset.refxGuid = guid;
+    pop.style.setProperty("--refx-hovercard-depth", String(depth));
     const sourceLine = chip.closest?.(".listitem[data-guid]") || null;
     const sourceRoot = chip.closest?.(".listview-items[data-guid]") || null;
-    this._fillHoverPop(pop, guid, () => this._hoverPop === pop, {
-      lineGuid: sourceLine?.getAttribute?.("data-guid") || null,
+    const frame = {
+      pop,
+      guid,
+      chip,
+      depth,
+      parentGuid: String(parentGuid || ""),
+      openedAt: Date.now(),
+      id: "",
+      hostLineGuid: String(hostLineGuid || this._hoverHostLineGuid(chip) || ""),
+    };
+    const alive = () => this._hoverStack.some((f) => f.pop === pop) && pop.isConnected && !this._unloaded;
+    this._fillHoverPop(pop, guid, alive, {
+      recursive: this._hoverRecursive,
+      lineGuid: frame.hostLineGuid || sourceLine?.getAttribute?.("data-guid") || null,
       pageGuid: sourceRoot?.getAttribute?.("data-guid") || null,
+      parentGuid: frame.parentGuid,
+      depth,
     });
     document.body.append(pop);
     this._positionPopover(pop, [chip]);
+    frame.id = this._trailRecord({ guid, kind: "hover", how: "hover", parent: frame.parentGuid || frame.hostLineGuid });
+    this._hoverStack.push(frame);
     this._hoverPop = pop;
     window.__refxHoverPop = pop;
+    if (depth === 0) this._installHoverStackListeners(chip);
+    this._cancelHoverCloseGrace();
+    this._cancelHoverNestArm();
+  }
+
+  _handleRefHover = (e) => {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest(".refx-hoverpop:not(.refx-hovercard)")) return;
+    if (t.closest(".refx-wb-ctx .trc-ref-popover-crumb-parent")) return;
+    const card = t.closest(".refx-hovercard");
+    const chip = t.closest(".lineitem-ref");
+    if (card) {
+      this._cancelHoverCloseGrace();
+      const cardDepth = Number(card.dataset?.refxDepth ?? card.getAttribute?.("data-refx-depth") ?? 0);
+      const topDepth = this._hoverStack.length ? this._hoverStack[this._hoverStack.length - 1].depth : -1;
+      if (topDepth > cardDepth) this._armHoverCloseGrace(cardDepth);
+      if (chip) {
+        const nestGuid = (chip.getAttribute?.("data-guid") || "").trim();
+        const parentGuid = String(card.dataset?.refxGuid || card.getAttribute?.("data-refx-guid") || "").trim();
+        if (nestGuid && !this._hoverVisitedGuids().has(nestGuid) && cardDepth + 1 <= this._hoverNestDepth) {
+          if (chip !== this._hoverNestChip) this._armHoverNestOpen(chip, cardDepth + 1, parentGuid);
+          return;
+        }
+      }
+      if (!chip || chip !== this._hoverNestChip) this._cancelHoverNestArm();
+      return;
+    }
+    if (chip) {
+      if (chip === this._hoverChip && this._hoverT) return;
+      this._cancelHoverCloseGrace();
+      this._cancelHoverNestArm();
+      this._cancelHover();
+      if (this._modal || this._link || this._cardEditing || this._cardPopup) return;
+      if (this._hoverPaletteVisible()) return;
+      if (t.closest(".refalias-pop, .refx-propcard, .trc-ref-popover")) return;
+      this._hoverChip = chip;
+      this._hoverRootGuid = (chip.getAttribute?.("data-guid") || "").trim();
+      try {
+        const hoverGuid = this._hoverRootGuid;
+        if (hoverGuid && this.isExistingRecordGuid?.(hoverGuid)) {
+          const hit = this._backrefCache?.get?.(hoverGuid);
+          if (!hit || (performance.now() - hit.ts) >= this._countTtlMs) {
+            this._fetchBackrefs(hoverGuid).catch(() => {});
+          }
+          if (this._excludeCollections?.size > 0) this.ensureCollectionIndex().catch(() => {});
+        }
+      } catch (_) {}
+      const hostLineGuid = this._hoverHostLineGuid(chip);
+      this._hoverT = setTimeout(() => {
+        this._hoverT = 0;
+        this._openHoverCard(chip, 0, "", hostLineGuid);
+      }, 350);
+      return;
+    }
+    this._cancelHoverPendingOpen();
+    this._cancelHoverNestArm();
+    if (this._hoverStack.length) this._armHoverCloseGrace(-1);
+  };
+
+  _cancelHover() {
+    this._cancelHoverPendingOpen();
+    this._cancelHoverNestArm();
+    this._cancelHoverCloseGrace();
+    while (this._hoverStack.length) this._popHoverCard(true);
+    this._hoverRootGuid = "";
+    this._hoverStackPinned = false;
+    this._hoverPop = null;
+    window.__refxHoverPop = null;
+    this._teardownHoverStackListeners();
+  }
+
+  _wbCrumbExpandPathGuids(focusGuid, ancGuid) {
+    const expandPathGuids = new Set();
+    const fg = String(focusGuid || "");
+    const ag = String(ancGuid || "");
+    if (!fg || !ag || fg === ag) return expandPathGuids;
+    const { chain } = this._wbCtxChain(fg);
+    const pathUp = [fg];
+    for (const a of chain || []) pathUp.push(a.guid);
+    const ancIdx = pathUp.indexOf(ag);
+    if (ancIdx > 0) {
+      for (let i = 1; i < ancIdx; i++) expandPathGuids.add(pathUp[i]);
+    }
+    return expandPathGuids;
+  }
+
+  _wbCrumbHover = (e) => {
+    if (!this._wbCrumbHoverEnabled) return;
+    const t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest(".refx-hoverpop")) return;
+    const btn = t.closest(".refx-wb-ctx .trc-ref-popover-crumb-parent");
+    const guid = btn?.dataset?.guid;
+    if (!btn || !guid) {
+      if (this._hoverChip?.closest?.(".refx-wb-ctx")) this._cancelHover();
+      return;
+    }
+    if (btn === this._hoverChip) return;
+    this._cancelHover();
+    if (this._modal || this._link || this._cardEditing || this._cardPopup) return;
+    if (t.closest(".refalias-pop, .refx-propcard, .trc-ref-popover")) return;
+    this._hoverChip = btn;
+    this._hoverT = setTimeout(() => { this._hoverT = 0; this._showWbCrumbHoverPreview(btn); }, 350);
+  };
+
+  _showWbCrumbHoverPreview(btn) {
+    if (!btn?.isConnected || this._modal || this._link || this._cardEditing || this._cardPopup) return;
+    const ancGuid = String(btn.dataset.guid || "").trim();
+    if (!ancGuid) return;
+    const ctxEl = btn.closest(".refx-wb-ctx");
+    const lineGuid = ctxEl?.dataset?.refxWbLine;
+    const h = lineGuid ? this._wbHeaders.get(lineGuid) : null;
+    const it = h?.el?.__wbIt;
+    if (!it || !h) return;
+    const pop = this._el("div", "refalias-pop refx-hoverpop refx-wb-crumbpop");
+    const titleText = (btn.textContent || "").trim();
+    if (titleText) pop.append(this._el("div", "refalias-pop-title", titleText));
+    const body = this._el("div", "refx-wb-crumbpop-body");
+    pop.append(body);
+    document.body.append(pop);
+    this._positionPopover(pop, [btn]);
+    this._hoverPop = pop;
+    window.__refxHoverPop = pop;
+    this._hoverClickClose = () => this._cancelHover();
+    this._hoverEscClose = (ev) => { if (ev.key === "Escape") this._cancelHover(); };
+    document.addEventListener("click", this._hoverClickClose, true);
+    document.addEventListener("keydown", this._hoverEscClose, true);
     document.addEventListener("scroll", this._hoverScrollClose, { capture: true, once: true });
+    const alive = () => this._hoverPop === pop && pop.isConnected && !this._unloaded;
+    const chainResult = h.ctxChain || this._wbCtxChain(it.target);
+    const ownerGuid = chainResult?.ownerGuid || null;
+    const treeCache = new Map();
+    const isRecordCrumb = !!(ownerGuid && ancGuid === ownerGuid) || !!this.data.getRecord(ancGuid);
+    if (isRecordCrumb) {
+      this._wbCrumbFillRecordPreview(body, ancGuid, alive).catch(() => {});
+      return;
+    }
+    this._wbCtxAncestorTree(it, ancGuid, ownerGuid, treeCache, alive).then((result) => {
+      if (!alive()) return;
+      try { body.replaceChildren(); } catch (e) {}
+      if (result.note) {
+        body.append(this._el("span", "refx-wb-ctx-peek-note", result.note));
+        return;
+      }
+      const highlightGuid = it.focus || it.target;
+      const expandPathGuids = this._wbCrumbExpandPathGuids(highlightGuid, ancGuid);
+      const peekCtx = {
+        onJump: (g) => { this._bridgeJump(g, {}); },
+        alive,
+      };
+      const treeBox = this._buildRefChildTree(result.node, peekCtx, {
+        highlightGuid,
+        expandPathGuids,
+        defaultExpandDepth: 1,
+        maxDepth: 4,
+        maxNodes: 60,
+      });
+      if (!alive()) return;
+      try { body.append(treeBox); } catch (e) {}
+    }).catch(() => {});
+  }
+
+  async _wbCrumbFillRecordPreview(bodyEl, recGuid, alive) {
+    const rec = this.data.getRecord(recGuid);
+    if (!rec) {
+      if (alive()) bodyEl.append(this._el("span", "refx-wb-ctx-peek-note", "Can't open this ancestor's record."));
+      return;
+    }
+    let items = [];
+    try { items = await rec.getLineItems(false); } catch (e) { items = []; }
+    if (!alive()) return;
+    let n = 0;
+    for (const it of items || []) {
+      if (!it || (it.parent_guid && it.parent_guid !== rec.guid)) continue;
+      const txt = this._cleanDisplayText(it.segments || []).trim();
+      if (!txt) continue;
+      if (n >= 12) break;
+      n++;
+      bodyEl.append(this._el("div", "refx-hoverpop-line", "· " + (txt.length > 110 ? txt.slice(0, 110) + "…" : txt)));
+    }
+    if (!n && alive()) bodyEl.append(this._el("span", "refx-wb-ctx-peek-note", "(empty)"));
+  }
+
+  async _wbCtxAncestorTree(it, ancGuid, ownerGuid, treeCache, alive) {
+    const ag = String(ancGuid);
+    let og = ownerGuid;
+    let rec = og ? this.data.getRecord(og) : null;
+    if (!rec) {
+      const targetGuid = it.focus || it.target;
+      const hdr = this._wbHeaders.get(it.lineGuid);
+      const shelfNode = hdr?.el?.parentNode || null;
+      const resolved = this._wbCtxResolveOwner(targetGuid, shelfNode);
+      if (resolved.ownerGuid) {
+        og = resolved.ownerGuid;
+        rec = this.data.getRecord(og);
+      }
+    }
+    if (!rec) return { note: "Can't open this ancestor's record." };
+    let items = treeCache.get(og);
+    let loadFailed = false;
+    if (!items) {
+      try { items = await rec.getLineItems(false); } catch (e) { items = []; loadFailed = true; }
+      treeCache.set(og, items);
+    }
+    if (alive && !alive()) return { note: "" };
+    if (loadFailed || !items || !items.length) return { note: "Couldn't load context." };
+    const tree = this._refContextTree(items);
+    const ancNode = tree.byGuid[ag];
+    if (!ancNode) return { note: "Ancestor is no longer in this record." };
+    if (!ancNode.children || !ancNode.children.length) return { note: "No siblings under this ancestor." };
+    return { node: ancNode, tree };
+  }
+
+  _showHoverPreview(chip) {
+    if (!chip?.isConnected || this._modal || this._link || this._cardPopup) return;
+    if (this._hoverPaletteVisible()) return;
+    this._openHoverCard(chip, 0, "", this._hoverHostLineGuid(chip));
+  }
+
+  _hoverScrollClose = (e) => {
+    if (e?.target?.closest?.(".refx-hovercard")) return;
+    this._cancelHover();
+  };
+
+  _hoverTreeCacheGet(ownerGuid, loader) {
+    const key = String(ownerGuid || "");
+    if (!key) return Promise.resolve(loader());
+    const hit = this._hoverTreeCache.get(key);
+    const now = Date.now();
+    if (hit && (now - hit.ts) < 20000) return Promise.resolve(hit.tree);
+    return Promise.resolve(loader()).then((tree) => {
+      this._hoverTreeCache.set(key, { tree, ts: Date.now() });
+      return tree;
+    });
+  }
+
+  _paintHoverCardCrumb(crumbEl, tree, lineGuid, ownerGuid) {
+    if (!crumbEl) return;
+    try { crumbEl.replaceChildren(); } catch (e) {}
+    const pageGuid = String(ownerGuid || "");
+    const pageName = String((pageGuid && this.data.getRecord(pageGuid)?.getName?.()) || this.getOrLoadRecordName(pageGuid) || "Page").trim();
+    const cap = (s) => (s.length > 28 ? s.slice(0, 28) + "…" : s);
+    const pageBtn = this._el("button", "refx-hovercard-crumb-page", cap(pageName));
+    pageBtn.type = "button";
+    pageBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (pageGuid) this._bridgeJump(pageGuid, {});
+    });
+    crumbEl.append(pageBtn);
+    const rel = this._refContextRelations(tree, lineGuid, true);
+    for (const anc of rel.chain || []) {
+      crumbEl.append(this._el("span", "refx-hovercard-crumb-sep", " › "));
+      const label = cap(this._cleanDisplayText(anc.segments || []).trim() || this._readableLineTitle(anc.guid) || anc.guid);
+      const isHeading = anc.type === "heading" || anc.heading_size || anc.props?.heading_size;
+      const ancEl = this._el("span", "refx-hovercard-crumb-part" + (isHeading ? " trc-ref-crumb-heading" : ""), label);
+      crumbEl.append(ancEl);
+    }
+  }
+
+  _fillHoverPopRecursive(pop, guid, alive, opts) {
+    const header = this._el("div", "refx-hovercard-header");
+    const titleWrap = this._el("div", "refx-hovercard-title-wrap");
+    const rec = this.data.getRecord(guid);
+    const titleText = rec
+      ? ((rec.getName && rec.getName()) || "Untitled")
+      : (this._readableLineTitle(guid) || "[unresolved line]");
+    const titleEl = this._el("div", "refx-hovercard-title");
+    if (!rec) {
+      const segs = this._liveSegs(guid);
+      if (segs && segs.length) this._renderRefLineText(titleEl, segs);
+      else titleEl.textContent = titleText;
+    } else {
+      titleEl.textContent = titleText;
+    }
+    titleEl.addEventListener("click", (ev) => {
+      if (ev.shiftKey) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try { this._wbAdd(guid); } catch (e) {}
+      }
+    });
+    titleWrap.append(titleEl);
+    const crumbEl = this._el("div", "refx-hovercard-crumb");
+    titleWrap.append(crumbEl);
+    header.append(titleWrap);
+    const pinBtn = this._el("button", "refx-hovercard-pin" + (this._hoverStackPinned ? " refx-hovercard-pinned" : ""), "📌");
+    pinBtn.type = "button";
+    pinBtn.title = this._hoverStackPinned ? "Unpin hover stack" : "Pin hover stack";
+    pinBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._hoverStackPinned = !this._hoverStackPinned;
+      pinBtn.classList.toggle("refx-hovercard-pinned", this._hoverStackPinned);
+      if (this._hoverStackPinned) this._cancelHoverCloseGrace();
+    });
+    header.append(pinBtn);
+    pop.append(header);
+    const body = this._el("div", "refx-hovercard-body");
+    pop.append(body);
+    const ownerGuidForPop = rec ? (opts?.pageGuid || rec.guid || null) : (opts?.pageGuid || null);
+    this._renderPopupSections(pop, this._popupSectionContext({
+      targetGuid: guid,
+      lineGuid: opts?.lineGuid || null,
+      pageGuid: ownerGuidForPop,
+      isLine: !rec,
+    }, "hoverpop"));
+    this._scheduleHoverCardMentions(pop, guid, alive, opts);
+    const ctx = { onJump: (g) => { this._bridgeJump(g, {}); }, alive };
+    if (rec) {
+      this._hoverTreeCacheGet(rec.guid, async () => {
+        let items = [];
+        try { items = await rec.getLineItems(false); } catch (e) { items = []; }
+        return this._refContextTree(items);
+      }).then((tree) => {
+        if (!alive()) return;
+        if (!tree?.roots?.length) {
+          body.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+          return;
+        }
+        this._paintHoverCardCrumb(crumbEl, tree, rec.guid, rec.guid);
+        const treeBox = this._buildRefChildTree({ guid: rec.guid, children: tree.roots }, ctx, {
+          maxDepth: 6,
+          maxNodes: this._smallBodyLineCap,
+          defaultExpandDepth: 2,
+        });
+        if (!alive()) return;
+        body.append(treeBox);
+      }).catch(() => {
+        if (alive()) body.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+      });
+      return;
+    }
+    const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[guid];
+    let ownerGuid = st?.rguid || opts?.pageGuid || "";
+    if (!ownerGuid) {
+      const resolved = this._wbCtxResolveOwner(guid, null);
+      ownerGuid = resolved?.ownerGuid || "";
+    }
+    const ownerRec = ownerGuid ? this.data.getRecord(ownerGuid) : null;
+    if (!ownerRec) {
+      this._fillHoverPopFlat(pop, guid, alive, opts, body, crumbEl);
+      return;
+    }
+    this._hoverTreeCacheGet(ownerGuid, async () => {
+      let items = [];
+      try { items = await ownerRec.getLineItems(false); } catch (e) { items = []; }
+      return this._refContextTree(items);
+    }).then((tree) => {
+      if (!alive()) return;
+      const byGuid = tree.byGuid || {};
+      if (!byGuid[guid]) {
+        body.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+        return;
+      }
+      this._paintHoverCardCrumb(crumbEl, tree, guid, ownerGuid);
+      let rootNode = byGuid[guid];
+      while (rootNode?.parent_guid && byGuid[rootNode.parent_guid]) rootNode = byGuid[rootNode.parent_guid];
+      const expandPathGuids = new Set();
+      let walk = byGuid[guid];
+      while (walk && walk.guid !== rootNode.guid) {
+        const pg = walk.parent_guid;
+        if (!pg || !byGuid[pg]) break;
+        if (byGuid[pg].guid !== rootNode.guid) expandPathGuids.add(byGuid[pg].guid);
+        walk = byGuid[pg];
+      }
+      const treeBox = this._buildRefChildTree(rootNode, ctx, {
+        highlightGuid: guid,
+        expandPathGuids,
+        maxDepth: 6,
+        maxNodes: this._smallBodyLineCap,
+        defaultExpandDepth: 2,
+      });
+      if (!alive()) return;
+      body.append(treeBox);
+      requestAnimationFrame(() => {
+        if (!alive()) return;
+        const zoom = pop.querySelector?.(".refx-zoom-target");
+        if (zoom?.scrollIntoView) zoom.scrollIntoView({ block: "center" });
+      });
+    }).catch(() => {
+      if (alive()) body.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+    });
+  }
+
+  _scheduleHoverCardMentions(pop, guid, alive, opts) {
+    if (!this._hoverMentions) return;
+    requestAnimationFrame(() => {
+      if (!alive()) return;
+      this._paintHoverCardMentions(pop, guid, alive, opts).catch((error) => {
+        this._recordRefxError(error, "hover card mentions " + guid);
+      });
+    });
+  }
+
+  async _paintHoverCardMentions(pop, guid, alive, opts) {
+    if (!alive() || !this._hoverMentions) return;
+    if (pop.querySelector?.(".refx-hovercard-mentions")) return;
+    let countInfo = null;
+    try { countInfo = this.getCachedCountInfo(guid); } catch (e) { countInfo = null; }
+    const knownCount = countInfo && typeof countInfo.count === "number" ? countInfo.count : null;
+    const fetchLines = () => this._queryRefLines(guid);
+    let lines = [];
+    const loadLines = async () => {
+      if (knownCount != null && knownCount > 50) {
+        const result = await this._runBackgroundWork("hover-mentions:" + guid, async () => {
+          if (!alive()) return null;
+          return fetchLines();
+        });
+        return result || [];
+      }
+      if (knownCount == null) {
+        try { countInfo = await this.getCountInfoForGuid(guid); } catch (e) { countInfo = countInfo || null; }
+        if (!alive()) return null;
+        const refined = countInfo && typeof countInfo.count === "number" ? countInfo.count : null;
+        if (refined != null && refined > 50) {
+          const result = await this._runBackgroundWork("hover-mentions:" + guid, async () => {
+            if (!alive()) return null;
+            return fetchLines();
+          });
+          return result || [];
+        }
+      }
+      return fetchLines();
+    };
+    lines = await loadLines();
+    if (!alive() || lines == null) return;
+    const shown = lines.slice(0, 5);
+    let countLabel;
+    if (countInfo && typeof countInfo.count === "number") {
+      countLabel = String(countInfo.count) + (countInfo.capped ? "+" : "");
+    } else {
+      countLabel = String(lines.length) + (lines.length > 5 ? "+" : "");
+    }
+    const box = this._el("div", "refx-hovercard-mentions");
+    box.append(this._el("div", "refx-hovercard-mentions-header", "↙ " + countLabel + " mentions"));
+    const list = this._el("div", "refx-hovercard-mentions-list");
+    box.append(list);
+    this._renderRefsGroups(list, shown, {
+      flat: true,
+      targetGuid: guid,
+      deferContext: false,
+      contextCap: 5,
+      nestedCounts: false,
+      canEdit: false,
+      alive,
+      actionsFor: (line) => [
+        this._mkRefRowAction("↗", "Jump to line", () => { this._bridgeJump(line?.guid || "", {}); }),
+      ],
+    });
+    const total = countInfo && typeof countInfo.count === "number" ? countInfo.count : lines.length;
+    if (total > 5) {
+      const showAll = this._el("button", "refx-hovercard-mentions-showall", "Show all");
+      showAll.type = "button";
+      showAll.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const rootChip = this._hoverStack[0]?.chip || null;
+        let rootHost = rootChip?.closest?.(".listitem[data-guid]") || null;
+        if (rootHost?.closest?.(".refx-hovercard")) rootHost = null;
+        if (rootHost) {
+          const hostLineGuid = rootHost.getAttribute?.("data-guid") || rootHost.dataset?.guid || "";
+          const state = this.findPanelStateForNode(rootHost);
+          this._toggleInlineRefsFor(state, guid, rootHost, hostLineGuid).catch(() => {});
+        } else {
+          try { this._wbAdd(guid, { kind: "linked-refs" }); } catch (e) {}
+        }
+      });
+      box.append(showAll);
+    }
+    pop.append(box);
+  }
+
+  _fillHoverPopFlat(pop, guid, alive, opts, bodyEl, crumbEl) {
+    if (crumbEl) try { crumbEl.replaceChildren(); } catch (e) {}
+    const lineCap = (opts && opts.lineCap) || 5;
+    const childCap = (opts && opts.childCap) || 4;
+    const targetBody = bodyEl || pop;
+    const rec = this.data.getRecord(guid);
+    if (rec) {
+      if (!bodyEl) targetBody.append(this._el("div", "refx-hoverpop-title", (rec.getName && rec.getName()) || "Untitled"));
+      rec.getLineItems(false).then((items) => {
+        if (!alive()) return;
+        let n = 0;
+        for (const it of items || []) {
+          if (!it || (it.parent_guid && it.parent_guid !== rec.guid)) continue;
+          const txt = this._cleanDisplayText(it.segments || []).trim();
+          if (!txt) continue;
+          targetBody.append(this._el("div", "refx-hoverpop-line", txt.slice(0, 120)));
+          if (++n >= lineCap) break;
+        }
+        if (!n) targetBody.append(this._el("div", "refx-hoverpop-line refx-hoverpop-empty", "(empty)"));
+      }).catch(() => {
+        if (alive()) targetBody.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+      });
+      return;
+    }
+    if (!bodyEl) targetBody.append(this._el("div", "refx-hoverpop-title", this._readableLineTitle(guid) || "[unresolved line]"));
+    const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[guid];
+    const rguid = st && st.rguid;
+    const srcRec = rguid ? this.data.getRecord(rguid) : null;
+    if (!srcRec) {
+      if (alive()) targetBody.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+      return;
+    }
+    srcRec.getLineItems(false).then((items) => {
+      if (!alive()) return;
+      const tree = this._refContextTree(items);
+      const target = tree.byGuid[guid];
+      let n = 0;
+      for (const c of (target && target.children) || []) {
+        const txt = this._cleanDisplayText((c && c.segments) || []).trim();
+        if (!txt) continue;
+        targetBody.append(this._el("div", "refx-hoverpop-line", "· " + txt.slice(0, 110)));
+        if (++n >= childCap) break;
+      }
+      if (!n) targetBody.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+    }).catch(() => {
+      if (alive()) targetBody.append(this._el("span", "refx-wb-ctx-peek-note", "Couldn't load body preview."));
+    });
   }
 
   // Shared preview content (chip hover AND the (( / [[ picker rows): a record
@@ -28642,6 +29688,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   // Async fills bail via alive() so a closed/replaced pop is never written to.
   // Caps configurable per surface — the picker uses a lighter card.
   _fillHoverPop(pop, guid, alive, opts) {
+    const recursive = opts && Object.prototype.hasOwnProperty.call(opts, "recursive")
+      ? opts.recursive
+      : this._hoverRecursive;
+    if (recursive && pop.classList?.contains?.("refx-hovercard")) {
+      this._fillHoverPopRecursive(pop, guid, alive, opts);
+      return;
+    }
     const lineCap = (opts && opts.lineCap) || 5;
     const childCap = (opts && opts.childCap) || 4;
     const rec = this.data.getRecord(guid);
@@ -28763,8 +29816,6 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     }, "hoverpop"));
   }
 
-  _hoverScrollClose = () => { this._cancelHover(); };
-
   // ─────────── (( / [[ picker row previews (same card, beside the picker)
 
   // 300ms dwell on a result row shows the row target's preview to the picker's
@@ -28792,6 +29843,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this._fillHoverPop(pop, r.guid, () => this._pickerHoverPop === pop, {
       lineCap: 3,
       childCap: 2,
+      recursive: false,
       lineGuid: link?.lineGuid || null,
       pageGuid: link?.pageGuid || null,
     });
@@ -28982,7 +30034,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   // an empty Custom Panel behind whenever the navigation failed).
   _bridgeJumpRecordHop(opts, dstGuid) {
     try {
-      if (dstGuid) this._connRecordHop(opts?.from || null, dstGuid, opts?.how || "jump");
+      if (!dstGuid || opts?.skipTrailRecord) return;
+      this._connRecordHop(opts?.from || null, dstGuid, opts?.how || "jump");
     } catch (e) {}
   }
 
@@ -29145,6 +30198,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this._storageKeyHoverOnly = 'refx_counter_hover_only_v1';
     this._storageKeyCountMode = 'refx_counter_count_mode_v1';
     this._storageKeyTargetBadges = 'refx_target_line_badges_v1';
+    this._storageKeyChipCounts = 'refx_chip_counts_v1';
+    this._storageKeyWbLineBadges = 'refx_wb_line_badges_v1';
     this._storageKeyBreadcrumbs = 'refx_breadcrumbs_v1';
     this._storageKeyHideNativePill = 'refx_hide_native_pill_v1';
     this._storageKeyHideEditingCounts = 'refx_hide_editing_counts_v1'; // v3.35.0 flicker fix toggle
@@ -29230,6 +30285,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // rendered line whose OWN guid has inbound references — clicking it opens
     // the same inline "N Linked References" section for that line.
     this._targetLineBadges = this.loadBoolSetting(this._storageKeyTargetBadges, custom.targetLineBadges !== false);
+    const counterCustom = (cfg && cfg.custom && cfg.custom.counter) || {};
+    this._refChipCounts = this.loadBoolSetting(this._storageKeyChipCounts, counterCustom.chipCounts === true);
+    const wbCustom = (cfg && cfg.custom && cfg.custom.workbench) || {};
+    this._wbBadgesInItems = this.loadBoolSetting(this._storageKeyWbLineBadges, wbCustom.lineBadges !== false);
+    this._storageKeyWbClampForeign = 'refx_wb_clamp_foreign_v1';
+    this._wbClampForeign = this.loadBoolSetting(this._storageKeyWbClampForeign, wbCustom.clampForeign !== false);
+    const refRowsCustom = (cfg && cfg.custom && cfg.custom.refRows) || {};
+    this._refOutlineDepth = this.coercePositiveInt(refRowsCustom.expandDepth, 1);
     this._targetBadgeMaxLines = this.coercePositiveInt(custom.targetLineBadgesMaxLines, 300);
     this._maxResults = this.coercePositiveInt(custom.maxResults, 250);
     this._cacheTtlMs = this.coercePositiveInt(custom.cacheTtlMs, 120000);
@@ -29277,6 +30340,17 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this._smallBodyLineCap = Number.isFinite(configuredSmallBodyLineCap) && configuredSmallBodyLineCap >= 0
       ? Math.floor(configuredSmallBodyLineCap)
       : 40;
+    const hoverCustom = topCustom.hover || {};
+    this._hoverRecursive = this.loadBoolSetting('refx_hover_recursive_v1', hoverCustom.recursive !== false);
+    this._hoverMentions = this.loadBoolSetting('refx_hover_mentions_v1', hoverCustom.mentions !== false);
+    this._hoverNestDepth = this.coercePositiveInt(this.loadStringSetting('refx_hover_nest_depth_v1') || hoverCustom.nestDepth, 2);
+    this._hoverCloseMs = this.coercePositiveInt(this.loadStringSetting('refx_hover_close_ms_v1') || hoverCustom.closeMs, 180);
+    const trailsCustom = topCustom.trails || {};
+    this._trailsEnabled = !(trailsCustom.enabled === false || trailsCustom.enabled === "off");
+    this._trailsPersist = !(trailsCustom.persist === false || trailsCustom.persist === "off");
+    this._trailCommitsOnly = this.loadBoolSetting("refx_trail_commits_only_v1", true);
+    this._trailsInstallLifecycle();
+    this._hoverTreeCache = new Map();
     // v4.7.2: rich linked-reference context is adaptive for inline sections.
     // `eagerContext` restores the pre-v4.7.2 always-eager behavior. A numeric
     // threshold overrides both large-section triggers; defaults remain 12 rows
@@ -29857,6 +30931,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this.refreshAllPanels({ force: true, reason: 'set-target-badges' });
   }
 
+  setRefChipCounts(on) {
+    on = !!on;
+    if (on === this._refChipCounts) return;
+    this._refChipCounts = on;
+    this.saveBoolSetting(this._storageKeyChipCounts, on);
+    this.refreshAllPanels({ force: true, reason: 'set-chip-counts' });
+  }
+
   setBreadcrumbsEnabled(on) {
     on = !!on;
     if (on === this._breadcrumbsEnabled) return;
@@ -30204,6 +31286,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
           if (on !== this._hoverOnly) this.toggleHoverOnly();
         }));
         body.append(mkCheckRow('Target-line badges', this._targetLineBadges, (on) => this.setTargetLineBadges(on)));
+        body.append(mkCheckRow('Chip reference counts', this._refChipCounts, (on) => this.setRefChipCounts(on)));
         body.append(mkCheckRow('Breadcrumbs on embeds', this._breadcrumbsEnabled, (on) => this.setBreadcrumbsEnabled(on)));
         body.append(mkCheckRow("Hide Thymer's native backlink pill", this._hideNativePill, (on) => this.setHideNativePill(on)));
         body.append(mkCheckRow("Hide Thymer's native open arrows on references (RefX menus and Cmd/Ctrl+O / Cmd/Ctrl+Shift+O provide Open / Open in side panel)", configuredInlineGroups.hideNativeOpenGlyphs, (on) => {
@@ -31047,6 +32130,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       .trc-ref-popover-crumb-parent:hover, .trc-ref-popover-crumb-rec:hover {
         text-decoration: underline;
       }
+      .trc-ref-crumb-heading { font-weight: 650; }
 
       .trc-ref-crumb-ref, .trc-ref-crumb-date, .trc-ref-crumb-mention {
         color: var(--refx-page-link-color, #106ba3);
@@ -31504,20 +32588,34 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
 
       .refx-nested-count {
         display: inline-block;
-        margin-left: 4px;
-        font-size: var(--refx-count-size, .8em);
-        opacity: var(--refx-count-opacity, .6);
-        color: var(--refx-page-link-color, #106ba3);
+        position: relative;
+        padding: 3px 4px;
+        margin: -3px -4px -3px 0;
+        background: transparent;
+        border: 0;
+        font-size: var(--refx-count-size, var(--refx-count-size-preset, .8em));
+        opacity: var(--refx-count-opacity, var(--refx-count-opacity-preset, .6));
+        font-weight: var(--refx-count-weight, var(--refx-count-weight-preset, 400));
+        color: var(--color-text-600, inherit);
         cursor: pointer;
         vertical-align: super;
         line-height: 1;
       }
-      .refx-nested-count:hover { opacity: 1; }
+      .refx-nested-count::after { content: attr(data-count); }
+      .refx-nested-count:not([data-count]) { display: none; }
+      .refx-nested-count:hover,
+      .refx-nested-count[aria-expanded="true"] { opacity: 1; }
+      .refx-nested-count:focus { outline: none; }
+      .refx-nested-count:focus-visible { opacity: 1; outline: 1px solid currentColor; outline-offset: 1px; }
+      body.refx-links-roam .refx-nested-count { color: inherit; }
       .refx-nested-refs {
         margin: 4px 0 6px 14px;
         border-left: 1px solid var(--border-default);
         padding-left: 8px;
       }
+      .refx-nested-refs.refx-nest-flat { margin-left: 0; padding-left: 6px; }
+      .refx-nest-parked,
+      .refx-nest-folded { display: none !important; }
 
       .refx-inline-editor {
         display: block;
@@ -31736,12 +32834,59 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       .refx-wb-hdr {
         flex: 0 0 100%; order: -2; box-sizing: border-box;
         display: flex; align-items: center; gap: 6px;
+        min-width: 0; flex-wrap: nowrap; container-type: inline-size;
         padding: 4px 6px 5px; margin: 0 0 3px;
         font-size: 12px; line-height: 1.45;
         color: var(--color-text-600);
         border-bottom: 1px solid var(--cards-border-color);
         user-select: none; cursor: pointer; /* whole row toggles collapse */
       }
+      @container (max-width: 420px) { .refx-wb-hdr-actions-more { display: none; } }
+      .refx-wb-item > .refx-wb-ctx {
+        flex: 0 0 100%; order: -1;
+        display: flex; flex-wrap: wrap; align-items: center; gap: 2px;
+        font-size: 11px; line-height: 1.5;
+        color: var(--color-text-600);
+        white-space: normal; overflow: visible; text-overflow: clip; row-gap: 1px;
+      }
+      .refx-wb-ctx.is-cached { opacity: .85; }
+      .refx-wb-ctx .trc-ref-popover-crumb {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 2px;
+        overflow: hidden; min-width: 0;
+      }
+      .refx-wb-ctx .trc-ref-popover-crumb-rec,
+      .refx-wb-ctx .trc-ref-crumb-anc,
+      .refx-wb-ctx .refx-wb-ctx-dots {
+        flex: 0 1 auto; min-width: 0; max-width: 20ch;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .refx-wb-ctx .trc-ref-crumb-anc .trc-ref-popover-crumb-parent {
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        min-width: 0; max-width: 100%;
+      }
+      .refx-wb-ctx .trc-ref-popover-crumb-sep { flex: 0 0 auto; }
+      .refx-wb-ctx .trc-ref-popover-crumb-rec.is-shared,
+      .refx-wb-ctx .trc-ref-crumb-anc.is-shared { opacity: .5; }
+      .refx-wb-ctx-pill {
+        flex: 0 0 auto; margin-left: 3px; padding: 0 4px;
+        font-size: 10px; font-weight: 650; line-height: 15px;
+        color: var(--color-text-500, var(--color-text-600));
+        background: var(--sidebar-bg-hover); border: 1px solid var(--cards-border-color);
+        border-radius: 7px; cursor: pointer; vertical-align: baseline;
+      }
+      .refx-wb-ctx-pill:hover { border-color: var(--refx-page-link-color); color: var(--color-text-300); }
+      .refx-wb-ctx-pill.is-active {
+        border-color: var(--button-primary-bg-color, #2d72d2);
+        color: var(--button-primary-bg-color, #2d72d2);
+      }
+      .refx-wb-ctx-peek-note {
+        font-size: 11px; color: var(--color-text-600); font-style: italic;
+      }
+      .refx-wb-crumbpop {
+        max-width: 420px; max-height: 260px; overflow: hidden; pointer-events: none;
+      }
+      .panel[data-refx-wb-boot="1"] .panel-heading,
+      .panel[data-refx-wb-boot="1"] .panel-body { visibility: hidden; }
       /* Enable wrapping for EVERY workbench item so the full-width header forces
          its content onto the next row (record items already wrapped via the
          :has(> .refx-propcard) rule; this covers line/task items too). */
@@ -31758,7 +32903,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         background: rgba(127,127,127,.14);
       }
       .refx-wb-hdr.refx-nav-focus .refx-wb-hdr-actions { opacity: 1; }
-      .refx-wb-hdr-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; font-weight: 650; font-size: 13.5px; color: var(--color-text-400); }
+      .refx-wb-hdr-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; font-weight: 650; font-size: 13.5px; color: var(--color-text-400); }
       /* v3.23.0: Roam's clickable linked-reference count badge on the item header */
       .refx-wb-hdr-count {
         flex: 0 0 auto; cursor: pointer; font-size: 11px; font-weight: 650;
@@ -31795,6 +32940,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       .refx-wb-twist:hover { opacity: 1; background: var(--sidebar-bg-hover); }
       /* Row-level hide class applied by _wbFoldApply to descendant rows */
       .refx-wb-foldhide { display: none !important; }
+      /* v4.61 U7: foreign-record lines pulled into a WB transclusion body */
+      .refx-wb-foreignhide { display: none !important; }
+      .refx-wb-clamp-note { display: flex; gap: 8px; flex-wrap: wrap; margin: 2px 0 6px 14px;
+        font-size: .85em; opacity: .7; }
+      .refx-wb-clamp-note button { background: none; border: 0; padding: 0; cursor: pointer;
+        color: var(--color-text-600, inherit); font: inherit; }
+      .refx-wb-clamp-note button:hover { opacity: 1; text-decoration: underline; }
       /* Collapse: hide the native transcluded body, keep the header. */
       .refx-wb-item.refx-wb-collapsed > *:not(.refx-wb-hdr) { display: none !important; }
       /* card/refs variants: hide the native body, show the read-only slot. */
@@ -33658,7 +34810,544 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   // True when the line is nothing but a reference to targetGuid (Roam elides it as ○).
   _isPureSelfRef(line, targetGuid) {
     if (!line || !targetGuid) return false;
+    if (line.type === 'ref') {
+      const itemref = line.props?.itemref ?? line.meta_properties?.itemref;
+      if (itemref === targetGuid) return true;
+    }
     return this._crumbIdentity(line) === targetGuid;
+  }
+
+  // v4.58 U1: synchronous ancestor chain for Workbench line-target context trail.
+  // Walks registry parent links only — never getTreeContext().
+  _wbCtxChain(targetGuid) {
+    const registry = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const stateOf = (g) => (g ? (registry[g] || this._liveStateByGuid(g)) : null);
+    let st = stateOf(targetGuid);
+    if (!st) return { ownerGuid: null, chain: [], complete: false };
+    const ownerGuid = st.rguid || null;
+    const chain = [];
+    const seen = new Set([String(targetGuid)]);
+    let complete = true;
+    let cur = st;
+    let guard = 0;
+    while (cur && guard++ < 12) {
+      if (cur.parent_unknown === true) { complete = false; break; }
+      if (cur.guid && cur.rguid && cur.guid === cur.rguid) break;
+      const next = cur.parent_guid ? stateOf(cur.parent_guid) : (cur.parent || null);
+      if (!next) { complete = false; break; }
+      if (next.type === 'document') break;
+      const ng = next.guid || cur.parent_guid || (cur.parent && cur.parent.guid) || null;
+      if (!ng) { complete = false; break; }
+      if (seen.has(String(ng))) { complete = false; break; }
+      seen.add(String(ng));
+      if (ownerGuid && String(ng) === String(ownerGuid)) break;
+      const item = this._wbCtxChainItem(next);
+      if (item) chain.push(item);
+      cur = stateOf(ng) || next;
+    }
+    return { ownerGuid, chain, complete };
+  }
+
+  _wbCtxChainItem(st) {
+    if (!st) return null;
+    const segments = st.text_segments ? this._segmentsFromState(st) : (st.segments || []);
+    return { guid: st.guid, segments, type: st.type };
+  }
+
+  async _wbCtxChainAsync(targetGuid, ownerGuid) {
+    const og = ownerGuid || this._wbCtxChain(targetGuid).ownerGuid;
+    const rec = og ? this.data.getRecord(og) : null;
+    if (!rec) return { ownerGuid: og, chain: [], complete: false };
+    let items = [];
+    try { items = await rec.getLineItems(false); } catch (e) {}
+    const tree = this._refContextTree(items);
+    const relations = this._refContextRelations(tree, targetGuid, true);
+    if (!relations.target) return { ownerGuid: og, chain: [], complete: false };
+    const chain = (relations.chain || []).slice().reverse();
+    return { ownerGuid: og, chain, complete: true };
+  }
+
+  // Workbench context U7: owner record for a cold line — registry may be empty on boot.
+  _wbCtxOwnerFromShelfDom(targetGuid, shelfNode) {
+    if (!targetGuid || !shelfNode) return null;
+    try {
+      const esc = (window.CSS && CSS.escape) ? CSS.escape(targetGuid) : targetGuid;
+      const li = shelfNode.querySelector('.transclusion-container-div .listitem[data-guid="' + esc + '"]')
+        || shelfNode.querySelector('.listitem[data-guid="' + esc + '"]');
+      const root = li && li.closest('.listview-items[data-guid]');
+      const guid = root && root.getAttribute('data-guid');
+      if (!guid) return null;
+      // Rule 15: outer .listview-items carries the host panel RECORD guid, not the
+      // transcluded content owner — inside the Workbench that is always the backing record.
+      if (guid === this._wbBackingGuid || guid === targetGuid) return null;
+      return guid;
+    } catch (e) { return null; }
+  }
+
+  // Workbench context U7: resolve owning record without g_universe — liveState, shelf DOM, SDK hints.
+  _wbCtxResolveOwner(targetGuid, shelfNode) {
+    if (!targetGuid) return { ownerGuid: null, source: null };
+    const bad = (g) => !g || g === targetGuid
+      || (this._wbBackingGuid && String(g) === String(this._wbBackingGuid));
+    const live = this._liveStateByGuid(targetGuid);
+    if (live?.rguid && !bad(live.rguid)) return { ownerGuid: live.rguid, source: 'liveState' };
+    const shelfDom = this._wbCtxOwnerFromShelfDom(targetGuid, shelfNode);
+    if (shelfDom && !bad(shelfDom)) return { ownerGuid: shelfDom, source: 'dom' };
+    try {
+      const dom = this._pageGuidFromDom(targetGuid);
+      if (dom && !bad(dom)) return { ownerGuid: dom, source: 'dom' };
+    } catch (e) {}
+    const sdk = this._targetOwnerGuid(targetGuid);
+    if (sdk && !bad(sdk)) return { ownerGuid: sdk, source: 'sdk' };
+    return { ownerGuid: null, source: null };
+  }
+
+  _wbCtxWarmDelays() {
+    return [120, 250, 500, 1000, 2000, 4000, 8000, 13000, 21000];
+  }
+
+  _wbCtxChainGuids(chainResult) {
+    if (!chainResult) return "";
+    return (chainResult.chain || []).map((c) => String(c.guid)).join("\0");
+  }
+
+  _wbCtxSerializeChain(chainResult) {
+    if (!chainResult?.complete) return null;
+    const ownerGuid = chainResult.ownerGuid || null;
+    const ownerName = ownerGuid ? (this.getOrLoadRecordName(ownerGuid) || ownerGuid) : "";
+    const crumbs = (chainResult.chain || []).slice(0, 8).map((anc) => {
+      let text = this._wbCtxAncDisplayText(anc);
+      if (text.length > 28) text = text.slice(0, 28) + "…";
+      return [anc.guid, text];
+    });
+    try { return JSON.stringify({ o: ownerGuid, on: ownerName, c: crumbs }); } catch (e) { return null; }
+  }
+
+  _wbCtxParseCachedChain(it) {
+    const raw = it?.line?.props?.refx_chain;
+    if (!raw || typeof raw !== "string") return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      const ownerGuid = parsed.o || null;
+      const chain = (Array.isArray(parsed.c) ? parsed.c : []).slice(0, 8).map(([guid, text]) => ({
+        guid,
+        segments: [{ type: "text", text: String(text || "") }],
+      })).filter((c) => c.guid);
+      return { ownerGuid, chain, complete: false, cached: true };
+    } catch (e) { return null; }
+  }
+
+  _wbCtxCacheChain(it, chainResult) {
+    if (!it?.line?.setMetaProperty) return;
+    const json = this._wbCtxSerializeChain(chainResult);
+    if (!json) return;
+    const lineGuid = String(it.lineGuid || it.line?.guid || "");
+    if (!lineGuid) return;
+    if (!this._wbCtxCacheWritten) this._wbCtxCacheWritten = new Map();
+    const prev = this._wbCtxCacheWritten.get(lineGuid);
+    const now = performance.now();
+    try {
+      const cur = it.line.props && it.line.props.refx_chain;
+      if (cur === json) return;
+      if (prev && prev.json === json) return;
+      if (prev && (now - prev.at) < 5000 && prev.json === json) return;
+      it.line.setMetaProperty("refx_chain", json);
+      this._wbCtxCacheWritten.set(lineGuid, { json, at: now });
+    } catch (e) {}
+  }
+
+  _wbCtxClearCacheWritten(lineGuid) {
+    if (!lineGuid || !this._wbCtxCacheWritten) return;
+    try { this._wbCtxCacheWritten.delete(String(lineGuid)); } catch (e) {}
+  }
+
+  _wbCtxTrailDiag(lineGuid, patch) {
+    try {
+      const diag = this._wbBootDiag || window.__REFX_WB_BOOT_DIAG;
+      if (!diag) return;
+      if (!diag.trail) diag.trail = {};
+      const lg = String(lineGuid);
+      diag.trail[lg] = { ...(diag.trail[lg] || {}), ...patch };
+    } catch (e) {}
+  }
+
+  _wbCtxCheckRegistryKick() {
+    const reg = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const size = Object.keys(reg).length;
+    const wasEmpty = this._wbRegistryWasEmpty;
+    this._wbRegistryWasEmpty = size === 0;
+    if (size === 0) this._wbCtxKickFired = false;
+    if (wasEmpty && size > 0) this._wbCtxScheduleKick();
+  }
+
+  _wbCtxScheduleKick() {
+    if (this._wbCtxKickT) { try { clearTimeout(this._wbCtxKickT); } catch (e) {} }
+    this._wbCtxKickT = setTimeout(() => {
+      this._wbCtxKickT = 0;
+      if (this._wbCtxKickFired) return;
+      this._wbCtxKickFired = true;
+      this._wbCtxKickPending();
+    }, 100);
+  }
+
+  _wbCtxKickPending() {
+    for (const h of this._wbHeaders.values()) {
+      if (!h?.ctxRetryTimer) continue;
+      try { clearTimeout(h.ctxRetryTimer); } catch (e) {}
+      h.ctxRetryTimer = 0;
+      const it = h.ctxWarmIt;
+      if (!it) continue;
+      this._wbCtxWarmResolve(h, it, h.ctxWarmNode, h.ctxWarmDangling, h.ctxWarmBg, h.ctxWarmOwner, h.ctxWarmRefreshSeq, h.ctxWarmAttempt || 0);
+    }
+  }
+
+  // Verified Thymer lineitem.* payload (v4.63 F3): eventName, source, collectionGuid,
+  // recordGuid, lineItemGuid, parentGuid, afterGuid, overindent, type, metaProperties,
+  // properties, status.
+  _wbCtxEventLineGuid(ev) {
+    const candidates = [
+      ev?.lineItemGuid,
+      ev?.lineitem?.guid,
+      ev?.lineItem?.guid,
+      ev?.item?.guid,
+      ev?.lineitemGuid,
+      ev?.guid,
+      ev?.line?.guid,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.length > 0) return c;
+    }
+    return null;
+  }
+
+  _wbCtxRecordEventDiag(ev, guid) {
+    try {
+      const diag = this._wbBootDiag || window.__REFX_WB_BOOT_DIAG;
+      if (!diag || diag.events) return;
+      diag.events = { keys: Object.keys(ev || {}), resolvedGuid: !!guid, at: performance.now() };
+    } catch (e) {}
+  }
+
+  _wbCtxSubscribeEvents() {
+    if (typeof this.events?.on !== "function") return;
+    this._wbCtxEventHandlers = [];
+    const register = (name, handler) => {
+      try {
+        const id = this.events.on(name, handler);
+        if (id) this._wbCtxEventHandlers.push(id);
+      } catch (e) {}
+    };
+    const onLineitemEvent = (ev) => {
+      const g = this._wbCtxEventLineGuid(ev);
+      this._wbCtxRecordEventDiag(ev, g);
+      this._wbCtxInvalidateForLineEvent(g, ev?.parentGuid);
+    };
+    register("lineitem.moved", onLineitemEvent);
+    register("lineitem.updated", onLineitemEvent);
+    register("panel.closed", (ev) => {
+      const panel = ev?.panel || null;
+      const panelId = panel?.getId?.() || null;
+      if (!panelId || panelId !== this._wbLivePanelId) return;
+      if (this._wbCrumbHoverBound) {
+        try { this._wbCrumbHoverBound.removeEventListener("mouseover", this._wbCrumbHover, true); } catch (e) {}
+        this._wbCrumbHoverBound = null;
+      }
+    });
+  }
+
+  _wbCtxInvalidateForLineEvent(lineGuid, parentGuid) {
+    const guids = [];
+    const g = String(lineGuid || "");
+    if (g) guids.push(g);
+    const p = String(parentGuid || "");
+    if (p && p !== g) guids.push(p);
+    if (!guids.length) return;
+    let hit = false;
+    for (const [lg, h] of this._wbHeaders) {
+      const target = h.target || h.ctxWarmIt?.target;
+      const inChain = (h.ctxChain?.chain || []).some((c) => guids.includes(String(c.guid)));
+      if (!guids.includes(String(target)) && !inChain) continue;
+      hit = true;
+      this._wbCtxScheduleHeaderInvalidate(lg, h);
+    }
+    if (hit) this._wbCtxScheduleKick();
+  }
+
+  _wbCtxScheduleHeaderInvalidate(lineGuid, h) {
+    const lg = String(lineGuid);
+    const prev = this._wbCtxInvalidateTs.get(lg);
+    if (prev) { try { clearTimeout(prev); } catch (e) {} }
+    const t = setTimeout(() => {
+      this._wbCtxInvalidateTs.delete(lg);
+      if (this._unloaded || this._wbHeaders.get(lg) !== h) return;
+      h.ctxChain = null;
+      h.ctxResolveGen = (h.ctxResolveGen || 0) + 1;
+      if (h.ctx) { try { h.ctx.classList.remove("is-cached"); } catch (e) {} }
+      const it = h.ctxWarmIt || { lineGuid: lg, target: h.target, variant: h.variant, line: null };
+      this._wbCtxWarmResolve(h, it, h.ctxWarmNode, h.ctxWarmDangling, h.ctxWarmBg, h.ctxWarmOwner, h.ctxWarmRefreshSeq, 0);
+    }, 150);
+    this._wbCtxInvalidateTs.set(lg, t);
+  }
+
+  _wbCtxCancelWarmRetry(h) {
+    if (!h) return;
+    if (h.ctxRetryTimer) { try { clearTimeout(h.ctxRetryTimer); } catch (e) {} h.ctxRetryTimer = 0; }
+    h.ctxResolving = false;
+  }
+
+  _wbCtxCancelAllWarmRetries() {
+    for (const h of this._wbHeaders.values()) this._wbCtxCancelWarmRetry(h);
+  }
+
+  _wbCtxScheduleWarmRetry(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt) {
+    const delays = this._wbCtxWarmDelays();
+    if (!h || attempt >= delays.length) return;
+    if (h.ctxRetryTimer) { try { clearTimeout(h.ctxRetryTimer); } catch (e) {} h.ctxRetryTimer = 0; }
+    const resolveGen = h.ctxResolveGen || 0;
+    const delay = delays[attempt];
+    h.ctxWarmIt = it;
+    h.ctxWarmNode = node;
+    h.ctxWarmDangling = dangling;
+    h.ctxWarmBg = backgroundGeneration;
+    h.ctxWarmOwner = owner;
+    h.ctxWarmRefreshSeq = refreshSeq;
+    h.ctxWarmAttempt = attempt;
+    h.ctxRetryTimer = setTimeout(() => {
+      h.ctxRetryTimer = 0;
+      if (h.ctxResolveGen !== resolveGen || this._unloaded) return;
+      if (this._wbHeaders.get(it.lineGuid) !== h) return;
+      if (h.ctxChain?.complete) return;
+      this._wbCtxWarmResolve(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt + 1);
+    }, delay);
+  }
+
+  _wbCtxWarmPaint(h, it, node, chainResult, alive, annot, source = "registry", attempt = 0) {
+    if (!h?.ctx || !chainResult?.complete || !alive()) return false;
+    if (h.ctxChain?.complete && !h.ctxChain?.cached) return false;
+    const prevGuids = this._wbCtxChainGuids(h.ctxChain);
+    const newGuids = this._wbCtxChainGuids(chainResult);
+    const sameGuids = !!prevGuids && prevGuids === newGuids;
+    h.ctxChain = chainResult;
+    this._wbCtxCancelWarmRetry(h);
+    try {
+      const bootT0 = this._wbBootDiagOpenAt || performance.now();
+      this._wbCtxTrailDiag(it.lineGuid, {
+        liveAt: performance.now() - bootT0,
+        source,
+        attempts: attempt,
+      });
+    } catch (e) {}
+    this._wbCtxCacheChain(it, chainResult);
+    if (!sameGuids) this._wbLiveRenderContextPaint(h.ctx, chainResult, it, h, alive, annot);
+    if (h.ctx) { try { h.ctx.classList.remove("is-cached"); } catch (e) {} }
+    if (h.el?.isConnected && h.ctx && !h.ctx.isConnected && node) {
+      try { node.insertBefore(h.ctx, h.el.nextSibling); } catch (e) {}
+    }
+    return true;
+  }
+
+  _wbCtxWarmResolve(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt = 0) {
+    if (!h || dangling || this._unloaded) return;
+    h.ctxWarmIt = it;
+    h.ctxWarmNode = node;
+    h.ctxWarmDangling = dangling;
+    h.ctxWarmBg = backgroundGeneration;
+    h.ctxWarmOwner = owner;
+    h.ctxWarmRefreshSeq = refreshSeq;
+    h.ctxWarmAttempt = attempt;
+    const resolveGen = h.ctxResolveGen || 0;
+    const alive = () => this._wbHeaders.get(it.lineGuid) === h
+      && h.ctxResolveGen === resolveGen && !this._unloaded;
+    if (!alive()) return;
+    if (h.ctxChain?.complete && !h.ctxChain?.cached) { this._wbCtxCancelWarmRetry(h); return; }
+    if (h.ctxResolving) return;
+    h.ctxResolving = true;
+    const finish = () => { if (h.ctxResolveGen === resolveGen) h.ctxResolving = false; };
+    const chainResult = this._wbCtxChain(it.target);
+    if (chainResult.complete) {
+      const annot = this._wbCtxGroupAnnot?.get?.(String(it.lineGuid)) || null;
+      if (this._wbCtxWarmPaint(h, it, node, chainResult, alive, annot, "registry", attempt)) { finish(); return; }
+      finish();
+      return;
+    }
+    const resolved = this._wbCtxResolveOwner(it.target, node);
+    const ownerGuid = chainResult.ownerGuid || resolved.ownerGuid || null;
+    const tryAsync = (og) => {
+      if (!og) {
+        finish();
+        if (alive()) this._wbCtxScheduleWarmRetry(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt);
+        return;
+      }
+      this._wbCtxChainAsync(it.target, og).then((asyncResult) => {
+        finish();
+        if (!alive()) return;
+        if (h.ctxChain?.complete) return;
+        let result = asyncResult;
+        if (!result.complete) {
+          const warmed = this._wbCtxChain(it.target);
+          if (warmed.complete) result = warmed;
+        }
+        if (result.complete) {
+          const annot = this._wbCtxGroupAnnot?.get?.(String(it.lineGuid)) || null;
+          this._wbCtxWarmPaint(h, it, node, result, alive, annot, "async", attempt);
+          return;
+        }
+        this._wbCtxScheduleWarmRetry(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt);
+      }).catch(() => {
+        finish();
+        if (alive() && !h.ctxChain?.complete) {
+          this._wbCtxScheduleWarmRetry(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, attempt);
+        }
+      });
+    };
+    tryAsync(ownerGuid);
+  }
+
+  _wbCtxTrailPlan(chain, opts = {}) {
+    const maxVisible = opts.maxVisible == null ? 8 : opts.maxVisible;
+    const list = chain || [];
+    if (list.length <= maxVisible + 1) return { hidden: [], tail: list };
+    return { hidden: list.slice(maxVisible), tail: list.slice(0, maxVisible) };
+  }
+
+  _wbCtxNormCrumbText(t) {
+    let s = String(t || '').trim().replace(/\s+/g, ' ');
+    if (s.endsWith('…')) s = s.slice(0, -1).trim();
+    else if (s.endsWith('...')) s = s.slice(0, -3).trim();
+    return s.toLowerCase().slice(0, 40);
+  }
+
+  // v4.58.1 U5: drop owner crumb when its text duplicates an ancestor (comments record named after line).
+  _wbCtxDropRedundantOwner(ownerText, chainTexts) {
+    const list = chainTexts || [];
+    if (!list.length) return false;
+    const on = this._wbCtxNormCrumbText(ownerText);
+    if (!on) return false;
+    for (const ct of list) {
+      const an = this._wbCtxNormCrumbText(ct);
+      if (!an) continue;
+      if (on === an || an.startsWith(on)) return true;
+    }
+    return false;
+  }
+
+  _wbCtxAncDisplayText(anc) {
+    if (!anc) return '';
+    return this._mediaLineInfo(anc)
+      ? this._navigatorContextText(anc)
+      : this._cleanDisplayText(anc.segments || []).trim();
+  }
+
+  _wbCtxTruncateCrumbLabels(crumbEl, maxLen = 28) {
+    if (!crumbEl) return;
+    for (const btn of crumbEl.querySelectorAll('.trc-ref-popover-crumb-parent, .trc-ref-popover-crumb-rec')) {
+      const full = btn.textContent || '';
+      if (full.length > maxLen) {
+        btn.textContent = full.slice(0, maxLen) + '…';
+        btn.title = full;
+      }
+    }
+  }
+
+  // v4.58 U3: root-to-nearest ancestor guid path for grouping (owner first).
+  _wbCtxPath(chainResult) {
+    const anc = (chainResult.chain || []).slice().reverse().map((c) => c.guid).filter(Boolean);
+    return chainResult.ownerGuid ? [chainResult.ownerGuid, ...anc] : anc;
+  }
+
+  // v4.58 U3: deepest-first shared-ancestor groups across warm shelf chains.
+  _wbCtxGroups(itemChains) {
+    const items = (itemChains || [])
+      .filter((ic) => ic && ic.complete !== false && ic.lineGuid)
+      .map((ic) => ({
+        lineGuid: String(ic.lineGuid),
+        path: this._wbCtxPath(ic),
+      }))
+      .filter((it) => it.path.length > 0);
+    if (items.length < 2) return new Map();
+
+    const assigned = new Set();
+    const groups = new Map();
+    const guidDepth = new Map();
+    for (const it of items) {
+      for (let d = 0; d < it.path.length; d++) {
+        const g = it.path[d];
+        const prev = guidDepth.get(g);
+        if (prev == null || d > prev) guidDepth.set(g, d);
+      }
+    }
+    const sortedGuids = [...guidDepth.keys()].sort((a, b) => {
+      const da = guidDepth.get(a) || 0;
+      const db = guidDepth.get(b) || 0;
+      if (db !== da) return db - da;
+      return String(a).localeCompare(String(b));
+    });
+    const lcaOf = (paths) => {
+      if (!paths.length) return null;
+      let len = 0;
+      const first = paths[0];
+      while (len < first.length) {
+        const g = first[len];
+        if (!paths.every((p) => p.length > len && p[len] === g)) break;
+        len++;
+      }
+      if (len === 0) return null;
+      return first[len - 1];
+    };
+    for (const guid of sortedGuids) {
+      const depth = guidDepth.get(guid) || 0;
+      const members = items
+        .filter((it) => !assigned.has(it.lineGuid) && it.path.length > depth && it.path[depth] === guid)
+        .map((it) => it.lineGuid);
+      if (members.length < 2) continue;
+      const paths = members.map((lg) => items.find((i) => i.lineGuid === lg).path);
+      if (lcaOf(paths) !== guid) continue;
+      const sorted = members.slice().sort((a, b) => String(a).localeCompare(String(b)));
+      groups.set(guid, sorted);
+      for (const lg of sorted) assigned.add(lg);
+    }
+    return groups;
+  }
+
+  _wbCtxGroupsFingerprint(groups) {
+    const rows = [];
+    for (const [lca, members] of [...(groups || new Map()).entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0])))) {
+      rows.push(String(lca) + "=" + (members || []).join(","));
+    }
+    return rows.join("|");
+  }
+
+  _wbCtxAnnotByLine(items, groups, warmChains) {
+    const byLine = new Map();
+    const shelfOrder = (items || []).map((it) => String(it.lineGuid || ""));
+    const pathByLine = new Map();
+    for (const ic of warmChains || []) pathByLine.set(String(ic.lineGuid), this._wbCtxPath(ic));
+    for (const [lcaGuid, members] of (groups || new Map()).entries()) {
+      const ordered = members.slice().sort((a, b) => {
+        const ia = shelfOrder.indexOf(a);
+        const ib = shelfOrder.indexOf(b);
+        if (ia !== ib) return ia - ib;
+        return String(a).localeCompare(String(b));
+      });
+      const firstInShelf = ordered[0];
+      const sharedMembers = members.slice().sort((a, b) => String(a).localeCompare(String(b)));
+      const n = sharedMembers.length;
+      for (const lg of members) {
+        const path = pathByLine.get(String(lg)) || [];
+        const lcaIdx = path.indexOf(lcaGuid);
+        const shared = new Set();
+        if (lcaIdx >= 0) {
+          for (let i = 0; i < lcaIdx; i++) shared.add(path[i]);
+        }
+        byLine.set(String(lg), {
+          shared,
+          dimPrefix: String(lg) !== String(firstInShelf),
+          pill: { guid: lcaGuid, n, members: sharedMembers },
+        });
+      }
+    }
+    return byLine;
   }
 
   _siblingRenderPlan(total, rendered) {
@@ -33743,12 +35432,18 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (!rowEl || rowEl.__refxZoomWired) return;
     rowEl.__refxZoomWired = true;
     rowEl.addEventListener('mousedown', (ev) => {
+      const ownRow = ev.target?.closest?.('.trc-ref-popover-item');
+      if (ownRow && ownRow !== rowEl) return;
+      if (ev.target?.closest?.('.refx-nested-count')) return;
       const t = ev.target?.closest?.('.trc-ref-popover-crumb-rec')
         || ev.target?.closest?.('.trc-ref-popover-crumb-parent')
         || ev.target?.closest?.('.refx-wb-tree-dot');
       if (t) ev.preventDefault();
     }, true);
     rowEl.addEventListener('click', (ev) => {
+      const ownRow = ev.target?.closest?.('.trc-ref-popover-item');
+      if (ownRow && ownRow !== rowEl) return;
+      if (ev.target?.closest?.('.refx-nested-count')) return;
       if (ev.target?.closest?.('.trc-ref-crumb-acts') || ev.target?.closest?.('.trc-ref-popover-action') || ev.target?.closest?.('.refx-ref-rowfold') || ev.target?.closest?.('.refx-wb-act') || ev.target?.closest?.('.refx-wb-tree-acts')) return;
       const ctx = rowEl.__refxCtx;
       if (!ctx) return;
@@ -33812,10 +35507,23 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     return chip;
   }
 
+  _activateRefNestedCount(count) {
+    const guid = count?.dataset?.guid || '';
+    const row = count?.closest?.('.trc-ref-popover-item');
+    const ctx = row?.__refxCtx || row?.__refxLazyCtx;
+    if (!guid || !row || !ctx || !this._refGestureAlive(ctx, row)) return;
+    this._toggleRefNestedRefs(count, guid, row, ctx).catch(() => {});
+  }
+
   _wireRefSurfaceChipNav(root) {
     if (!root || root.__refxChipNavWired || typeof root.addEventListener !== 'function') return;
     root.__refxChipNavWired = true;
     root.addEventListener('mousedown', (ev) => {
+      if (ev.target?.closest?.('.refx-nested-count')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
       const chip = this._refContentChipFromEvent(ev);
       if (!chip) return;
       ev.preventDefault();
@@ -33826,11 +35534,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       if (count) {
         ev.preventDefault();
         ev.stopPropagation();
-        const guid = count.dataset?.guid || '';
-        const row = count.closest('.trc-ref-popover-item');
-        const ctx = row?.__refxCtx;
-        if (guid && row && ctx) this._toggleRefNestedRefs(count, guid, row, ctx).catch(() => {});
+        this._activateRefNestedCount(count);
         return;
+      }
+      const twist = ev.target?.closest?.('.refx-wb-tree-twist');
+      if (twist) {
+        const r = twist.closest('.trc-ref-popover-item');
+        const c = r?.__refxCtx;
+        if (c) requestAnimationFrame(() => { if (r.isConnected !== false) this._paintRefRowNestedCounts(r, c); });
       }
       const chip = this._refContentChipFromEvent(ev);
       if (!chip) return;
@@ -33854,106 +35565,355 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         this._zoomRefRow(row, ctx, { sourceGuid: guid, rootGuid: null }).catch(() => {});
       }
     }, true);
+    root.addEventListener('keydown', (ev) => {
+      if (ev.isComposing || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      const count = ev.target?.closest?.('.refx-nested-count');
+      const inBox = ev.target?.closest?.('.refx-nested-refs');
+      const openerForBox = (box) => {
+        const anchor = box?.previousElementSibling;
+        const target = box?.dataset?.refxNestTarget || '';
+        if (!anchor || !target) return null;
+        for (const c of anchor.querySelectorAll?.('.refx-nested-count') || []) {
+          if (c.dataset?.guid === target) return c;
+        }
+        const row = box.closest?.('.trc-ref-popover-item');
+        const crumb = row?.__refxCrumbEl;
+        if (crumb) {
+          for (const c of crumb.querySelectorAll?.('.refx-nested-count') || []) {
+            if (c.dataset?.guid === target) return c;
+          }
+        }
+        return null;
+      };
+      if (ev.key === 'ArrowRight' && count) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (count.getAttribute('aria-expanded') === 'false') {
+          this._activateRefNestedCount(count);
+          return;
+        }
+        let box = count.nextElementSibling;
+        if (!box?.classList?.contains('refx-nested-refs')) {
+          const anchor = count.closest('.refx-wb-tree-line') || count.closest('.trc-ref-popover-fulltext');
+          box = anchor?.nextElementSibling;
+        }
+        if (box?.classList?.contains('refx-nested-refs')) {
+          const inner = box.querySelector('.refx-nested-count');
+          if (inner) inner.focus();
+        }
+        return;
+      }
+      if (ev.key === 'ArrowLeft' && count) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (count.getAttribute('aria-expanded') === 'true') {
+          this._activateRefNestedCount(count);
+          return;
+        }
+        const parentBox = count.closest('.refx-nested-refs');
+        if (parentBox) {
+          const opener = openerForBox(parentBox);
+          if (opener) opener.focus();
+        }
+        return;
+      }
+      if (ev.key === 'Escape' && (count || inBox)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        let box = inBox;
+        if (!box && count) {
+          const sib = count.nextElementSibling;
+          if (sib?.classList?.contains('refx-nested-refs') && sib.getAttribute('aria-expanded') !== 'false' && !sib.classList.contains('refx-hidden')) box = sib;
+        }
+        if (box) {
+          let innermost = box;
+          while (true) {
+            let openChild = null;
+            for (const child of innermost.querySelectorAll('.refx-nested-refs')) {
+              if (!child.classList.contains('refx-hidden')) { openChild = child; break; }
+            }
+            if (!openChild) break;
+            innermost = openChild;
+          }
+          const opener = openerForBox(innermost);
+          if (opener && opener.getAttribute('aria-expanded') === 'true') this._activateRefNestedCount(opener);
+          if (opener) opener.focus();
+        }
+        return;
+      }
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      if (!count) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._activateRefNestedCount(count);
+    }, true);
   }
 
-  _paintRefRowNestedCounts(row, ctx) {
-    if (!row || !ctx) return;
-    for (const old of row.querySelectorAll('.refx-nested-count')) {
-      try { old.remove(); } catch (e) {}
-    }
-    const depth = row.__refxNestDepth || 0;
-    if (depth >= 2) return;
+  _refNestPath(ctx) {
+    if (Array.isArray(ctx?.nestPath)) return ctx.nestPath;
+    return Object.freeze(ctx?.targetGuid ? [ctx.targetGuid] : []);
+  }
+
+  _refGestureAlive(ctx, row) {
+    if (this._unloaded) return false;
+    if (row && row.isConnected === false) return false;
+    if (typeof ctx?.gestureAlive === 'function') return ctx.gestureAlive();
+    return !ctx?.alive || ctx.alive();
+  }
+
+  _paintRefRowNestedCounts(row, ctx, opts = {}) {
+    if (!row || !ctx || ctx.nestedCounts === false || typeof row.querySelectorAll !== 'function') return;
     row.__refxNestedCountGen = (row.__refxNestedCountGen || 0) + 1;
     const token = row.__refxNestedCountGen;
-    const selector = this._refContentChipSelector();
-    const chips = [];
-    const seen = new Set();
-    for (const area of row.querySelectorAll('.trc-ref-popover-fulltext, .refx-wb-tree-text')) {
-      for (const chip of area.querySelectorAll(selector)) {
-        const guid = this._refChipGuid(chip);
-        if (!guid || seen.has(guid)) continue;
-        seen.add(guid);
-        chips.push({ chip, guid });
-        if (chips.length >= 40) break;
+    const path = this._refNestPath(ctx);
+    const pathSet = new Set(path);
+    const ownGuid = row.__refxLine?.guid || row.__refxZoom?.refLineGuid || '';
+    const lineCounts = Array.isArray(ctx.nestPath) || !!ctx.targetGuid;
+    const budget = ctx.countBudget || (ctx.countBudget = { left: 60 });
+    const owned = (el) => el.closest('.trc-ref-popover-item') === row;
+    const hiddenWithin = (el) => {
+      if (el.classList?.contains('refx-hidden')) return true;
+      let node = el.parentElement;
+      while (node && node !== row) {
+        if (node.classList?.contains('refx-hidden') || node.classList?.contains('refx-nest-parked') || node.classList?.contains('refx-nest-folded')) return true;
+        node = node.parentElement;
       }
-      if (chips.length >= 40) break;
-    }
-    const applyCount = (chip, guid, count) => {
-      if (token !== row.__refxNestedCountGen) return;
-      if (ctx.alive && !ctx.alive()) return;
-      if (row.isConnected === false) return;
-      if (!chip.isConnected) return;
-      const next = chip.nextElementSibling;
-      if (next?.classList?.contains('refx-nested-count')) next.remove();
-      if (count > 0) {
-        const span = document.createElement('span');
-        span.className = 'refx-nested-count';
-        this._ensureElDataset(span).dataset.guid = guid;
-        span.title = count + ' references';
-        span.textContent = String(count);
-        chip.insertAdjacentElement('afterend', span);
-      }
+      return false;
     };
-    for (const { chip, guid } of chips) {
-      const cached = this.getCachedCountInfo(guid);
-      if (cached && cached.count > 0) applyCount(chip, guid, cached.count);
-      this.getCountInfoForGuid(guid).then((info) => {
-        applyCount(chip, guid, Number(info?.count) || 0);
-      }).catch(() => {});
+    const targets = [];
+    const seenKeys = new Set();
+    let scanned = 0;
+    const addTarget = (t) => {
+      const key = t.kind + '|' + t.guid + '|' + t.place;
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+      targets.push(t);
+    };
+    const selector = this._refContentChipSelector();
+    if (!opts.ownOnly) {
+      if (lineCounts && ownGuid && !pathSet.has(ownGuid) && !row.__refxZoom?.view) {
+        if (row.dataset?.refxSelfRef === '1') {
+          const crumb = row.__refxCrumbEl;
+          const selfBtn = crumb?.querySelector?.(':scope > .trc-ref-crumb-self');
+          if (selfBtn && !hiddenWithin(selfBtn)) addTarget({ kind: 'line', guid: ownGuid, place: 'afterSelf', ref: selfBtn });
+        } else {
+          const full = row.querySelector(':scope > .trc-ref-popover-fulltext');
+          if (full && !hiddenWithin(full)) addTarget({ kind: 'line', guid: ownGuid, place: 'fulltextEnd', ref: full });
+        }
+      }
+      const shallowTree = [];
+      const deepTree = [];
+      for (const lineEl of row.querySelectorAll('.refx-wb-tree-line')) {
+        if (scanned++ > 300) break;
+        if (!owned(lineEl) || hiddenWithin(lineEl)) continue;
+        const g = lineEl.dataset?.guid || '';
+        if (!g || pathSet.has(g) || g === ownGuid) continue;
+        let depth = 0;
+        let p = lineEl.parentElement;
+        while (p && p !== row) {
+          if (p.classList?.contains('refx-wb-tree-kids')) depth++;
+          p = p.parentElement;
+        }
+        if (depth === 0) shallowTree.push({ lineEl, guid: g });
+        else deepTree.push({ lineEl, guid: g });
+      }
+      for (const { lineEl, guid: g } of shallowTree) {
+        if (targets.length >= 24) break;
+        addTarget({ kind: 'line', guid: g, place: 'beforeActs', ref: lineEl });
+      }
+      if (this._refChipCounts) {
+        const full = row.querySelector(':scope > .trc-ref-popover-fulltext');
+        if (full && !hiddenWithin(full)) {
+          const chipSeen = new Set();
+          for (const chip of full.querySelectorAll(selector)) {
+            if (scanned++ > 300 || targets.length >= 24) break;
+            const g = this._refChipGuid(chip);
+            if (!g || pathSet.has(g) || g === ownGuid || chipSeen.has(g)) continue;
+            chipSeen.add(g);
+            addTarget({ kind: 'chip', guid: g, place: 'afterChip', ref: chip });
+          }
+        }
+      }
+      for (const { lineEl, guid: g } of deepTree) {
+        if (targets.length >= 24) break;
+        addTarget({ kind: 'line', guid: g, place: 'beforeActs', ref: lineEl });
+      }
+      if (this._refChipCounts) {
+        for (const textEl of row.querySelectorAll('.refx-wb-tree-text')) {
+          if (!owned(textEl) || hiddenWithin(textEl)) continue;
+          const treeLine = textEl.closest('.refx-wb-tree-line');
+          const treeGuid = treeLine?.dataset?.guid || '';
+          const chipSeen = new Set();
+          for (const chip of textEl.querySelectorAll(selector)) {
+            if (scanned++ > 300 || targets.length >= 24) break;
+            const g = this._refChipGuid(chip);
+            if (!g || pathSet.has(g) || g === ownGuid || g === treeGuid || chipSeen.has(g)) continue;
+            chipSeen.add(g);
+            addTarget({ kind: 'chip', guid: g, place: 'afterChip', ref: chip });
+          }
+        }
+      }
+    } else if (lineCounts && ownGuid && !pathSet.has(ownGuid) && !row.__refxZoom?.view) {
+      if (row.dataset?.refxSelfRef === '1') {
+        const crumb = row.__refxCrumbEl;
+        const selfBtn = crumb?.querySelector?.(':scope > .trc-ref-crumb-self');
+        if (selfBtn && !hiddenWithin(selfBtn)) addTarget({ kind: 'line', guid: ownGuid, place: 'afterSelf', ref: selfBtn });
+      } else {
+        const full = row.querySelector(':scope > .trc-ref-popover-fulltext');
+        if (full && !hiddenWithin(full)) addTarget({ kind: 'line', guid: ownGuid, place: 'fulltextEnd', ref: full });
+      }
+    }
+    const resolved = new Set();
+    for (const t of targets) {
+      let el = null;
+      if (t.place === 'afterChip' || t.place === 'afterSelf') {
+        const next = t.ref.nextElementSibling;
+        if (next?.classList?.contains('refx-nested-count') && next.dataset?.guid === t.guid) el = next;
+      } else if (t.place === 'fulltextEnd') {
+        for (const child of t.ref.children || []) {
+          if (child.classList?.contains('refx-nested-count') && child.dataset?.guid === t.guid && child.getAttribute('data-refx-count-kind') === t.kind) { el = child; break; }
+        }
+      } else if (t.place === 'beforeActs') {
+        for (const child of t.ref.children || []) {
+          if (child.classList?.contains('refx-nested-count') && child.dataset?.guid === t.guid && child.getAttribute('data-refx-count-kind') === t.kind) { el = child; break; }
+        }
+      }
+      if (el) resolved.add(el);
+      t.el = el;
+    }
+    for (const old of row.querySelectorAll('.refx-nested-count')) {
+      if (owned(old) && !resolved.has(old)) {
+        try { old.remove(); } catch (e) {}
+      }
+    }
+    let viewportScheduled = false;
+    for (const t of targets) {
+      const { kind, guid, place, ref } = t;
+      let el = t.el;
+      let cached = null;
+      try { cached = this.getCachedCountInfo(guid); } catch (e) { cached = null; }
+      if (!el && cached && cached.count === 0) continue;
+      if (!el) {
+        el = document.createElement('span');
+        el.className = 'refx-nested-count' + (kind === 'line' ? ' refx-own-count' : '');
+        this._ensureElDataset(el).dataset.guid = guid;
+        el.setAttribute('data-refx-count-kind', kind);
+        el.setAttribute('role', 'button');
+        el.tabIndex = 0;
+        const anchor = place === 'afterChip' || place === 'afterSelf' ? ref : (place === 'fulltextEnd' ? ref : ref);
+        const boxes = anchor.__refxNestedBoxes;
+        const visBox = (boxes instanceof Map) ? boxes.get(guid) : null;
+        el.setAttribute('aria-expanded', (visBox && visBox.isConnected !== false && !visBox.classList.contains('refx-hidden')) ? 'true' : 'false');
+        if (cached?.count > 0) this._refNestCountWrite(el, cached.count, kind);
+        if (place === 'afterChip' || place === 'afterSelf') {
+          if (typeof ref.insertAdjacentElement === 'function') ref.insertAdjacentElement('afterend', el);
+          else if (ref.parentElement) ref.parentElement.insertBefore(el, ref.nextElementSibling);
+        } else if (place === 'fulltextEnd') ref.appendChild(el);
+        else {
+          const acts = ref.querySelector(':scope > .refx-wb-tree-acts');
+          if (acts) ref.insertBefore(el, acts);
+          else ref.appendChild(el);
+        }
+        t.el = el;
+        resolved.add(el);
+      } else if (cached) {
+        this._refNestCountWrite(el, cached.count, kind);
+      }
+      if (!cached) {
+        const ownExempt = kind === 'line' && (place === 'fulltextEnd' || place === 'afterSelf');
+        if (!ownExempt && budget.left <= 0 && !opts.budgetExempt) {
+          if (!viewportScheduled) {
+            viewportScheduled = true;
+            this._refCountWhenNearViewport(row, () => {
+              if (row.isConnected !== false) this._paintRefRowNestedCounts(row, row.__refxCtx || row.__refxLazyCtx || ctx, { budgetExempt: true });
+            });
+          }
+          continue;
+        }
+        if (!ownExempt) budget.left--;
+        this._refNestCountRequest(guid, el).then((info) => {
+          if (!info || token !== row.__refxNestedCountGen || this._unloaded || el.isConnected === false) return;
+          this._refNestCountQueueReveal(el, Number(info.count) || 0, kind);
+        });
+      }
     }
   }
 
   async _toggleRefNestedRefs(countEl, targetGuid, row, ctx) {
-    const lineEl = countEl.closest('.refx-wb-tree-line') || countEl.closest('.trc-ref-popover-fulltext');
-    if (!lineEl) return;
-    let box = (lineEl.__refxNestedRefsEl && lineEl.__refxNestedRefsEl.isConnected !== false)
-      ? lineEl.__refxNestedRefsEl
-      : lineEl.nextElementSibling;
-    if (box?.classList?.contains('refx-nested-refs')) {
-      box.classList.toggle('refx-hidden');
+    if (!countEl || !targetGuid || !row || !ctx) return;
+    const treeLine = countEl.closest('.refx-wb-tree-line');
+    const fullEl = row.querySelector(':scope > .trc-ref-popover-fulltext');
+    const anchor = treeLine || fullEl;
+    if (!anchor) return;
+    const parentPath = this._refNestPath(ctx);
+    if (parentPath.includes(targetGuid)) return;
+    const boxes = anchor.__refxNestedBoxes || (anchor.__refxNestedBoxes = new Map());
+    let box = boxes.get(targetGuid);
+    if (box && box.isConnected !== false && !box.__refxRetry) {
+      if (box.__refxPending) return;
+      const hidden = box.classList.toggle('refx-hidden');
+      countEl.setAttribute('aria-expanded', hidden ? 'false' : 'true');
       return;
     }
+    if (box) { try { box.remove(); } catch (e) {} boxes.delete(targetGuid); }
+    const ownGuid = row.__refxLine?.guid || row.__refxZoom?.refLineGuid || '';
+    const treeGuid = treeLine?.dataset?.guid || '';
+    const path = Object.freeze([...new Set([...parentPath, ownGuid, treeGuid, targetGuid].filter(Boolean))]);
+    const depth = (ctx.nestDepth | 0) + 1;
     box = document.createElement('div');
-    box.className = 'refx-nested-refs';
-    lineEl.__refxNestedRefsEl = box;
+    box.className = 'refx-nested-refs' + (depth > 6 ? ' refx-nest-flat' : '');
+    this._ensureElDataset(box).dataset.refxNestTarget = targetGuid;
+    box.__refxNestPath = path;
+    box.__refxPending = true;
     const loading = document.createElement('div');
     loading.className = 'refx-ref-line-loading';
     loading.textContent = 'Loading…';
     box.appendChild(loading);
-    lineEl.insertAdjacentElement('afterend', box);
-    const depth = (row.__refxNestDepth || 0) + 1;
+    anchor.insertAdjacentElement('afterend', box);
+    boxes.set(targetGuid, box);
+    anchor.__refxNestedRefsEl = box;
+    countEl.setAttribute('aria-expanded', 'true');
+    const mounted = () => !this._unloaded && box.isConnected !== false && row.isConnected !== false && this._refGestureAlive(ctx, row);
     try {
       const lines = await this._queryRefLines(targetGuid);
-      if (ctx.alive && !ctx.alive()) return;
-      if (row.isConnected === false) return;
+      box.__refxPending = false;
+      if (!mounted()) { box.__refxRetry = true; return; }
       try { loading.remove(); } catch (e) {}
       if (!lines.length) {
         const empty = document.createElement('div');
         empty.className = 'refx-ref-line-empty';
         empty.textContent = '(unavailable)';
         box.appendChild(empty);
+        box.__refxRetry = true;
         return;
       }
-      const shown = lines.slice(0, 30);
-      const nestedAlive = () => (!ctx.alive || ctx.alive()) && row.isConnected !== false
-        && box.isConnected && !box.classList.contains('refx-hidden');
-      await this._renderRefsGroups(box, shown, {
-        flat: true,
-        targetGuid,
-        hostLineGuid: null,
-        canEdit: false,
-        contextCap: 8,
-        deferContext: false,
-        alive: nestedAlive,
-        actionsFor: (line) => [
-          { label: '↗', title: 'Jump to line', fn: () => { this._bridgeJump(line?.guid || '', {}); } },
-          { label: '◧', title: 'Open in side panel', fn: () => { this._bridgeJump(line?.guid || '', { newPanel: true }); } },
-        ],
-      });
-      for (const nestedRow of box.querySelectorAll('.trc-ref-popover-item')) {
-        nestedRow.__refxNestDepth = depth;
-      }
+      const renderPage = (offset) => {
+        const page = document.createElement('div');
+        page.className = 'refx-nested-refs-page';
+        box.appendChild(page);
+        this._renderRefsGroups(page, lines.slice(offset, offset + 30), {
+          flat: true,
+          targetGuid,
+          nestPath: path,
+          nestDepth: depth,
+          hostLineGuid: null,
+          canEdit: false,
+          contextCap: 8,
+          overflowDefer: true,
+          deferContext: false,
+          alive: mounted,
+          actionsFor: (line) => [
+            { label: '↗', title: 'Jump to line', fn: () => { this._bridgeJump(line?.guid || '', {}); } },
+            { label: '◧', title: 'Open in side panel', fn: () => { this._bridgeJump(line?.guid || '', { newPanel: true }); } },
+          ],
+        });
+        const rest = lines.length - (offset + 30);
+        if (rest > 0) box.appendChild(this._makeShowMoreButton(rest, () => renderPage(offset + 30)));
+      };
+      renderPage(0);
     } catch (e) {
+      box.__refxPending = false;
+      box.__refxRetry = true;
       try { loading.remove(); } catch (err) {}
       const empty = document.createElement('div');
       empty.className = 'refx-ref-line-empty';
@@ -34160,7 +36120,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       ctx.treeCache.set(srcGuid, treeP);
     }
     const tree = await treeP;
-    if (ctx.alive && !ctx.alive()) return;
+    if (!this._refGestureAlive(ctx, row)) return;
     if (row.isConnected === false) return;
     const zoom = row.__refxZoom || { refLineGuid: '', refSourceGuid: srcGuid, stack: [], view: null };
     row.__refxZoom = zoom;
@@ -34218,6 +36178,9 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       }
     }
 
+    for (const child of row.children || []) {
+      if (child.classList?.contains('refx-nested-refs')) child.classList.add('refx-nest-parked');
+    }
     if (fullEl) fullEl.classList.add('refx-hidden');
     childBox.textContent = '';
     childBox.classList.add('refx-zoom-body');
@@ -34231,7 +36194,6 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       maxNodes: 1500,
       highlightGuid: refLineGuid,
       expandPathGuids,
-      defaultExpandDepth: 2,
     });
     const showWidget = this._refZoomShowsWidget(rootNode, treeRoot);
     row.__refxZoomShowLive = showWidget;
@@ -34281,7 +36243,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       ctx.treeCache.set(srcGuid, treeP);
     }
     const tree = await treeP;
-    if (ctx.alive && !ctx.alive()) return;
+    if (!this._refGestureAlive(ctx, row)) return;
     if (row.isConnected === false) return;
 
     const zoom = row.__refxZoom || { refLineGuid: lineGuid, refSourceGuid: srcGuid, stack: [], view: null };
@@ -34318,7 +36280,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       return acts;
     };
     const nonEmptyKids = (target.children || []).filter((c) => !!this._mediaLineInfo(c) || this._cleanDisplayText((c && c.segments) || []).trim());
-    const selfRef = !!ctx.targetGuid && this._isPureSelfRef(target, ctx.targetGuid) && this._isLineRefTarget(ctx.targetGuid) && nonEmptyKids.length > 0;
+    const pureSelf = !!ctx.targetGuid && this._isPureSelfRef(target, ctx.targetGuid) && this._isLineRefTarget(ctx.targetGuid);
+    const selfRef = pureSelf && (nonEmptyKids.length > 0 || target?.type === 'ref');
 
     const twisty = this._refZoomClearCrumbs(crumbEl);
     if (twisty) crumbEl.insertBefore(twisty, crumbEl.firstChild);
@@ -34332,7 +36295,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       crumbEl.appendChild(recEl);
     }
     ctx.sourceRecordGuid = srcGuid;
-    this._appendFlatAncestorTrail(crumbEl, chain, ctx, mkAncActions, { selfRef, lineGuid });
+    this._appendFlatAncestorTrail(crumbEl, chain, ctx, mkAncActions, { selfRef, lineGuid, targetLine: target });
 
     if (selfRef) {
       row.dataset.refxSelfRef = '1';
@@ -34343,7 +36306,11 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     childBox.textContent = '';
     childBox.classList.remove('refx-zoom-body');
     if (nonEmptyKids.length > 0) childBox.append(this._buildRefChildTree(target, ctx));
+    for (const child of row.children || []) {
+      if (child.classList?.contains('refx-nested-refs')) child.classList.remove('refx-nest-parked');
+    }
     this._paintRefRowZoomActions(row);
+    this._paintRefRowNestedCounts(row, ctx);
   }
 
   // Async context fill for one reference row (popover or inline section): the
@@ -34405,7 +36372,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       return acts;
     };
     const nonEmptyKids = (target.children || []).filter((c) => !!this._mediaLineInfo(c) || this._cleanDisplayText((c && c.segments) || []).trim());
-    const selfRef = !!ctx.targetGuid && this._isPureSelfRef(target, ctx.targetGuid) && this._isLineRefTarget(ctx.targetGuid) && nonEmptyKids.length > 0;
+    const pureSelf = !!ctx.targetGuid && this._isPureSelfRef(target, ctx.targetGuid) && this._isLineRefTarget(ctx.targetGuid);
+    const selfRef = pureSelf && (nonEmptyKids.length > 0 || target?.type === 'ref');
     if (crumbEl && crumbEl.isConnected) {
       if (!crumbEl.querySelector(':scope > .refx-ref-rowfold')) {
         const rowFold = this._el('button', 'refx-ref-rowfold', '▾');
@@ -34423,6 +36391,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
           let hidden = false;
           if (childEl) hidden = childEl.classList.toggle('refx-hidden');
           if (fullEl && !isSelfRef) fullEl.classList.toggle('refx-hidden', hidden);
+          if (row) {
+            for (const nestBox of row.children || []) {
+              if (nestBox.classList?.contains('refx-nested-refs')) {
+                if (hidden) nestBox.classList.add('refx-nest-folded');
+                else nestBox.classList.remove('refx-nest-folded');
+              }
+            }
+          }
           rowFold.textContent = hidden ? '▸' : '▾';
           rowFold.title = hidden ? 'Unfold this reference' : 'Fold this reference';
           rowFold.setAttribute('aria-expanded', hidden ? 'false' : 'true');
@@ -34430,7 +36406,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         crumbEl.insertBefore(rowFold, crumbEl.firstChild);
       }
       ctx.sourceRecordGuid = srcGuid;
-      this._appendFlatAncestorTrail(crumbEl, chain, ctx, mkAncActions, { selfRef, lineGuid });
+      this._appendFlatAncestorTrail(crumbEl, chain, ctx, mkAncActions, { selfRef, lineGuid, targetLine: target });
     }
     if (selfRef && contextRow) {
       contextRow.dataset.refxSelfRef = '1';
@@ -34459,6 +36435,18 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       if (!ptxt) continue;
       crumbEl.append(this._el('span', 'trc-ref-popover-crumb-sep', '›'));
       const wrap = this._el('span', 'trc-ref-crumb-anc');
+      if (opts.peekToggle && anc.guid) {
+        const open = opts.peekOpenGuid && String(opts.peekOpenGuid) === String(anc.guid);
+        const twk = this._el('button', 'refx-wb-ctx-twist refx-wb-act', open ? '▾' : '▸');
+        twk.type = 'button';
+        twk.title = open ? 'Hide siblings' : 'Peek siblings';
+        twk.setAttribute('aria-expanded', open ? 'true' : 'false');
+        twk.addEventListener('click', (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          opts.peekToggle(anc, twk);
+        });
+        wrap.append(twk);
+      }
       const segs = (anc?.segments || []).filter((s) => s && !(s.type === 'text' && !String(s.text || '').trim()));
       let kindClass = 'trc-ref-crumb-text';
       if (segs.length === 1) {
@@ -34466,10 +36454,17 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         else if (segs[0].type === 'datetime') kindClass = 'trc-ref-crumb-date';
         else if (segs[0].type === 'mention') kindClass = 'trc-ref-crumb-mention';
       }
-      const aEl = this._el('button', 'trc-ref-popover-crumb-parent ' + kindClass, ptxt.length > 60 ? ptxt.slice(0, 60) + '…' : ptxt);
+      const isHeading = anc.type === 'heading' || anc.heading_size || anc.props?.heading_size;
+      const aEl = this._el('button', 'trc-ref-popover-crumb-parent ' + kindClass + (isHeading ? ' trc-ref-crumb-heading' : ''), ptxt.length > 60 ? ptxt.slice(0, 60) + '…' : ptxt);
       aEl.type = 'button';
-      aEl.title = 'Zoom to this ancestor line';
+      aEl.title = opts.onCrumbClick ? 'Zoom out to here · Shift: side panel · ⌘: jump' : 'Zoom to this ancestor line';
       if (anc.guid) this._ensureElDataset(aEl).dataset.guid = anc.guid;
+      if (opts.onCrumbClick) {
+        aEl.addEventListener('click', (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          opts.onCrumbClick(anc, ev);
+        });
+      }
       wrap.append(aEl);
       wrap.append(mkAncActions(anc, wrap, aEl));
       crumbEl.append(wrap);
@@ -34479,8 +36474,12 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       crumbEl.append(this._el('span', 'trc-ref-popover-crumb-sep', '›'));
       const selfBtn = this._el('button', 'trc-ref-crumb-self', '');
       selfBtn.type = 'button';
-      selfBtn.title = 'This line is the reference itself — jump to it';
-      selfBtn.setAttribute('aria-label', 'This line is the reference itself — jump to it');
+      const refItemSelf = opts.targetLine?.type === 'ref';
+      const selfTitle = refItemSelf
+        ? 'Referenced as an item on this page'
+        : 'This line is the reference itself — jump to it';
+      selfBtn.title = selfTitle;
+      selfBtn.setAttribute('aria-label', selfTitle);
       selfBtn.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); ctx.onJump(opts.lineGuid || ''); });
       crumbEl.append(selfBtn);
     }
@@ -34494,7 +36493,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   _buildRefChildTree(target, ctx, opts = {}) {
     const maxDepth = opts.maxDepth == null ? 5 : opts.maxDepth;
     const maxNodes = opts.maxNodes == null ? 200 : opts.maxNodes;
-    const defaultExpandDepth = opts.defaultExpandDepth == null ? Number.POSITIVE_INFINITY : opts.defaultExpandDepth;
+    const defaultExpandDepth = opts.defaultExpandDepth == null ? this._refOutlineDepth : opts.defaultExpandDepth;
     const highlightGuid = opts.highlightGuid || '';
     const expandPathGuids = opts.expandPathGuids || null;
     const box = this._el('div', 'refx-wb-tree refx-ref-child-tree');
@@ -34635,6 +36634,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       // Optimistic re-render of the tree line, then write through.
       txtEl.textContent = '';
       this._renderRefLineText(txtEl, rebuilt);
+      const r = lineEl.closest('.trc-ref-popover-item');
+      if (r?.__refxCtx) this._paintRefRowNestedCounts(r, r.__refxCtx);
       // Keep the resident copy in sync so a later collapse/expand shows the edit.
       try { c.segments = rebuilt; } catch (e) {}
       this._writeInlineEditedSegments(c, rebuilt).then((written) => {
@@ -34722,8 +36723,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (!targetGuid) return;
     const hostNode = wrap.closest?.('.listitem[data-guid]') || null;
     const hostLineGuid = hostNode ? hostNode.getAttribute('data-guid') : null;
+    const wbItem = hostNode?.closest?.('.refx-wb-item') || wrap?.closest?.('.refx-wb-item');
     // No identifiable host line to anchor under → the floating popover still works.
-    if (!hostNode || !hostLineGuid) { await this.openRefPopover(state, wrap); return; }
+    if (!hostNode || !hostLineGuid) {
+      if (wbItem) { this._wbAdd(targetGuid, { kind: 'linked-refs' }); return; }
+      await this.openRefPopover(state, wrap);
+      return;
+    }
     await this._toggleInlineRefsFor(state, targetGuid, hostNode, hostLineGuid);
   }
 
@@ -34775,8 +36781,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     wb.type = 'button';
     wb.className = 'refx-inline-refs-wb';
     wb.textContent = '⧉';
-    wb.title = 'Add this target to the Reference Workbench';
-    wb.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); this._wbAdd(targetGuid); });
+    wb.title = 'Add these linked references to the Workbench';
+    wb.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); this._wbAdd(targetGuid, { kind: 'linked-refs' }); });
     header.appendChild(wb);
 
     const pin = document.createElement('button');
@@ -34995,6 +37001,91 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     return { ok, items };
   }
 
+  async _queryNativeRefItemLines(targetGuid, exactGuidSet) {
+    try {
+      const reg = (window.g_universe && window.g_universe.itemsByGuid) || {};
+      let owner = reg[targetGuid]?.rguid || null;
+      if (!owner) {
+        try { owner = this._targetOwnerGuid?.(targetGuid); } catch (e) {}
+      }
+      if (!owner) return [];
+
+      const refs = await this._fetchBackrefs(owner);
+      if (refs === null) return [];
+
+      const exactSet = exactGuidSet || new Set();
+      const items = [];
+      const coldRecordGuids = new Set();
+      const coldLineByRecord = new Map();
+
+      const makeRefItem = (lineGuid, srcRecord, st) => {
+        const srcGuid = srcRecord?.guid || st?.rguid || '';
+        if (!this._showSelf && srcGuid === targetGuid) return null;
+        return this._withRefxLineFlag({
+          guid: lineGuid,
+          record: srcRecord || { guid: srcGuid },
+          type: 'ref',
+          props: { itemref: targetGuid },
+          segments: [],
+          getSegments: () => [],
+        }, '_refxRefItem');
+      };
+
+      const acceptLine = (line, lineGuid, srcRecord) => {
+        if (!line || line.type !== 'ref') return null;
+        const itemref = line.props?.itemref ?? line.meta_properties?.itemref;
+        if (itemref !== targetGuid) return null;
+        return makeRefItem(lineGuid, srcRecord, line);
+      };
+
+      for (const r of refs) {
+        if (!r || r.kind !== 'line') continue;
+        const lineGuid = r.lineItemGuid || null;
+        if (!lineGuid || exactSet.has(lineGuid)) continue;
+        const srcRecord = r.record || null;
+        const srcGuid = srcRecord?.guid || '';
+        try {
+          if (this.isLineSharedIgnored?.({ guid: lineGuid, record: srcRecord })) continue;
+        } catch (e) { continue; }
+
+        const st = reg[lineGuid] || this._liveStateByGuid(lineGuid);
+        if (st) {
+          if (st.type !== 'ref') continue;
+          const itemref = st.props?.itemref ?? st.meta_properties?.itemref;
+          if (itemref !== targetGuid) continue;
+          const item = makeRefItem(lineGuid, srcRecord, st);
+          if (item) items.push(item);
+        } else if (srcGuid) {
+          if (!coldLineByRecord.has(srcGuid)) {
+            if (coldRecordGuids.size >= 4) continue;
+            coldRecordGuids.add(srcGuid);
+            coldLineByRecord.set(srcGuid, []);
+          }
+          coldLineByRecord.get(srcGuid).push({ lineGuid, srcRecord });
+        }
+      }
+
+      for (const [recGuid, pending] of coldLineByRecord) {
+        try {
+          const rec = this.data.getRecord?.(recGuid);
+          if (!rec) continue;
+          let lineItems = [];
+          try { lineItems = await rec.getLineItems(false); } catch (e) { continue; }
+          const tree = this._refContextTree(lineItems);
+          const byGuid = tree?.byGuid || {};
+          for (const { lineGuid, srcRecord } of pending) {
+            const item = acceptLine(byGuid[lineGuid], lineGuid, srcRecord);
+            if (item) items.push(item);
+          }
+        } catch (e) {}
+      }
+
+      return items;
+    } catch (e) {
+      return [];
+    }
+  }
+
   async _queryRefLines(targetGuid) {
     // -- RECORD target: call getBackReferences() directly --
     if (this.isExistingRecordGuid(targetGuid)) {
@@ -35058,15 +37149,15 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       }
       // Native API absent: fall through to searchByQuery.
     } else {
-      // -- LINE target: always use searchByQuery --
-      // v3.72.1: PluginBackReference.lineItemGuid is the SOURCE line guid, not the
-      // target line guid. The native getBackReferences() API cannot tell us which
-      // specific target line-item was referenced -- that information is absent from
-      // PluginBackReference. searchByQuery('@linkto = "lineGuid"') is the only
-      // correct path for LINE targets. Fall through to the searchByQuery block below.
+      // -- LINE target: searchByQuery + native ref-item lines (journal completed-task refs) --
+      const exact = await this._searchExactRefLines(targetGuid);
+      const exactGuidSet = new Set();
+      for (const item of exact.items) if (item?.guid) exactGuidSet.add(item.guid);
+      const refItems = await this._queryNativeRefItemLines(targetGuid, exactGuidSet);
+      return [...exact.items, ...refItems];
     }
 
-    // Fallback: searchByQuery (legacy path, used when getBackReferences() is absent).
+    // Fallback: searchByQuery (legacy path, used when getBackReferences() is absent on RECORD targets).
     const exact = await this._searchExactRefLines(targetGuid);
     return exact.items;
   }
@@ -35716,6 +37807,11 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         && row.rowEl?.isConnected !== false
         && (!callerAlive || callerAlive())
     };
+    row.rowEl.__refxLazyCtx = lazyCtx;
+    row.rowEl.__refxLine = row.rowEl.__refxLine || line;
+    if (Array.isArray(ctx.nestPath) || ctx.targetGuid) {
+      this._refCountWhenNearViewport(row.rowEl, () => this._paintRefRowNestedCounts(row.rowEl, lazyCtx, { ownOnly: true }), { fallbackRun: true });
+    }
     load.addEventListener('click', async (ev) => {
       ev.preventDefault(); ev.stopPropagation();
       if (running || !lazyCtx.alive()) return;
@@ -35796,6 +37892,11 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         && bodyEl.__refxContextToken === renderToken
         && bodyEl.isConnected !== false
         && (!callerAlive || callerAlive()),
+      gestureAlive: () => !this._unloaded && bodyEl.isConnected !== false && (!callerAlive || callerAlive()),
+      nestPath: Object.freeze(Array.isArray(opts.nestPath) ? opts.nestPath.slice() : (opts.targetGuid ? [opts.targetGuid] : [])),
+      nestDepth: opts.nestDepth | 0,
+      countBudget: { left: 60 },
+      nestedCounts: opts.nestedCounts !== false,
       onJump: (guid) => { this._bridgeJump(guid, {}); },
       treeCache,
       siblingCache: new Map(),
@@ -35886,12 +37987,16 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         actions,
         onCrumbJump: (g) => this._bridgeJump(g, {}),
       });
+      row.rowEl.__refxNestDepth = ctx.nestDepth;
+      row.rowEl.__refxNestPath = ctx.nestPath;
       (flat ? bodyEl : groupEl).appendChild(row.rowEl);
       if (srcGuid && deferContext) {
         this._attachDeferredRefContext(ctx, line, row, callerAlive);
       } else if (srcGuid && (treeCache.has(srcGuid) || contextSources.size < contextSourceCap)) {
         contextSources.add(srcGuid);
         contextJobs.push({ line, crumbEl: row.crumbEl, childBox: row.childBox });
+      } else if (srcGuid && opts.overflowDefer) {
+        this._attachDeferredRefContext(ctx, line, row, callerAlive);
       }
     };
 
@@ -36984,14 +39089,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       }
       const st = registry[keys[i]];
       if (!st || st.is_deleted || st.is_trashed) continue;
-      const rg = st.rguid || st.parent_guid;
+      const pg = st.parent_guid || (st.parent && st.parent.guid) || null;
+      const rg = st.rguid || pg;
       if (rg) {
         let arr = rguidIndex.get(rg);
         if (!arr) { arr = []; rguidIndex.set(rg, arr); }
         arr.push(st);
         if (st.guid) ownerByLine.set(st.guid, rg);
       }
-      const pg = st.parent_guid;
       if (pg && st.guid) {
         let kids = childrenByLine.get(pg);
         if (!kids) { kids = []; childrenByLine.set(pg, kids); }
@@ -37030,7 +39135,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       if (!st || st.is_deleted || st.is_trashed) continue;
       const refs = this._connRefsFromLineState(st);
       if (!refs.length || !st.guid) continue;
-      let ancestor = st.parent_guid;
+      let ancestor = st.parent_guid || (st.parent && st.parent.guid) || null;
       for (let gen = 1; ancestor && gen <= 2; gen++) {
         for (const tg of refs) {
           let arr = childRefInbound.get(tg);
@@ -37038,7 +39143,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
           arr.push({ carrier: ancestor, viaLine: st.guid });
         }
         const pst = registry[ancestor];
-        ancestor = pst && pst.parent_guid;
+        ancestor = pst && (pst.parent_guid || (pst.parent && pst.parent.guid) || null);
       }
     }
     return {
@@ -37236,6 +39341,259 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     return workspaceGuid ? "refx_traversal_v1:" + workspaceGuid : "";
   }
 
+  _trailsInstallLifecycle() {
+    try { if (window.__refxTrailsDispose) window.__refxTrailsDispose(); } catch (e) {}
+    const onPagehide = () => { try { this._trailsFlushNow(); } catch (e) {} };
+    try { window.addEventListener("pagehide", onPagehide); } catch (e) {}
+    this._trailsPagehide = onPagehide;
+    window.__refxTrailsDispose = () => {
+      if (this._trailsFlushT) { try { clearTimeout(this._trailsFlushT); } catch (e) {} this._trailsFlushT = 0; }
+      if (this._trailsPagehide) {
+        try { window.removeEventListener("pagehide", this._trailsPagehide); } catch (e) {}
+        this._trailsPagehide = null;
+      }
+    };
+  }
+
+  _trailsDayKey(ts = Date.now()) {
+    const d = new Date(Number(ts) || Date.now());
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return y + "-" + m + "-" + day;
+  }
+
+  _trailsDayLabel(dayKey) {
+    return "Trail " + String(dayKey || "");
+  }
+
+  async _pluginDataRecord(name, createIfMissing = false) {
+    const recordName = String(name || "").trim();
+    if (!recordName) return null;
+    const cachedGuid = this._pluginDataRecordGuids.get(recordName);
+    if (cachedGuid) {
+      try { const warm = this.data.getRecord?.(cachedGuid); if (warm) return warm; } catch (e) {}
+    }
+    const col = await this._r6ResolveBackingCol();
+    if (!col || this._unloaded) return null;
+    let records = [];
+    try { records = (await col.getAllRecords()) || []; } catch (e) { records = []; }
+    const named = (list) => (list || []).filter((r) => {
+      try { return String(r.getName?.() || "").trim() === recordName; } catch (e) { return false; }
+    }).sort((a, b) => String(a?.guid || "").localeCompare(String(b?.guid || "")));
+    let rec = named(records)[0] || null;
+    if (!rec && createIfMissing) {
+      let guid = null;
+      try { guid = col.createRecord(recordName); } catch (e) {}
+      if (!guid) return null;
+      for (let i = 0; i < 6 && !rec && !this._unloaded; i++) {
+        try { rec = this.data.getRecord?.(guid) || null; } catch (e) {}
+        if (!rec) {
+          try { const all = (await col.getAllRecords()) || []; rec = all.find((r) => r?.guid === guid) || null; } catch (e) {}
+        }
+        if (!rec) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try { const all = (await col.getAllRecords()) || []; rec = named(all)[0] || rec; } catch (e) {}
+    }
+    if (rec?.guid) this._pluginDataRecordGuids.set(recordName, rec.guid);
+    return rec;
+  }
+
+  _trailsLineText(line) {
+    try {
+      const segs = line?.segments || [];
+      return segs.filter((s) => s && s.type === "text").map((s) => (typeof s.text === "string" ? s.text : "")).join("").trim();
+    } catch (e) { return ""; }
+  }
+
+  _trailsParseLineMeta(line) {
+    try {
+      const raw = line?.props?.[this._TRAILS_META_KEY];
+      if (!raw) return [];
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+
+  _trailsMergeEntries(entries) {
+    if (!entries?.length || !this._refxTrail) return;
+    const ring = this._refxTrail.ring || (this._refxTrail.ring = []);
+    const seen = new Set(ring.map((e) => e?.id).filter(Boolean));
+    for (const entry of entries) {
+      const norm = this._trailNormalizeEntry(entry);
+      if (!norm.id || seen.has(norm.id)) continue;
+      ring.push(norm);
+      seen.add(norm.id);
+    }
+    const cap = Math.max(1, Number(this._refxTrail.cap) || 200);
+    while (ring.length > cap) ring.shift();
+  }
+
+  async _trailsEnsureLoaded() {
+    this._connTrailLoadOnce();
+    if (this._trailsLoadedFromRecord || !this._trailsPersist) return;
+    this._trailsLoadedFromRecord = true;
+    const rec = await this._pluginDataRecord(this._TRAILS_RECORD_NAME, false);
+    if (!rec) return;
+    let lines = [];
+    try { lines = (await rec.getLineItems(false)) || []; } catch (e) { lines = []; }
+    const today = this._trailsDayKey();
+    const yesterday = this._trailsDayKey(Date.now() - 86400000);
+    const wanted = new Set([today, yesterday]);
+    for (const line of lines) {
+      const text = this._trailsLineText(line);
+      const dayKey = text.startsWith("Trail ") ? text.slice(6).trim() : "";
+      if (!wanted.has(dayKey)) continue;
+      const entries = this._trailsParseLineMeta(line);
+      if (line?.guid) this._trailsDayLines.set(dayKey, line);
+      this._trailsMergeEntries(entries);
+      try { this._trailsLastFlushed.set(dayKey, JSON.stringify(entries)); } catch (e) {}
+    }
+  }
+
+  _trailsMarkDirty() {
+    if (!this._trailsPersist) return;
+    this._trailsDirty = true;
+    if (this._trailsFlushT) return;
+    this._trailsFlushT = setTimeout(() => {
+      this._trailsFlushT = 0;
+      this._trailsFlushNow().catch(() => {});
+    }, 20000);
+  }
+
+  _trailsEntriesForDay(dayKey, now = Date.now()) {
+    const ring = this._wbTrailRing();
+    const out = [];
+    for (const entry of ring) {
+      if (this._trailsDayKey(entry?.ts) !== dayKey) continue;
+      out.push({
+        id: entry.id,
+        guid: entry.guid,
+        label: entry.label,
+        ts: entry.ts,
+        how: entry.how,
+        kind: entry.kind,
+        parent: entry.parent || "",
+        dwellMs: entry.dwellMs || 0,
+      });
+    }
+    out.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+    while (out.length > this._TRAILS_DAY_CAP) out.shift();
+    return out;
+  }
+
+  async _trailsEnsureDayLine(rec, dayKey) {
+    const label = this._trailsDayLabel(dayKey);
+    let line = this._trailsDayLines.get(dayKey) || null;
+    if (line) return line;
+    let lines = [];
+    try { lines = (await rec.getLineItems(false)) || []; } catch (e) { lines = []; }
+    line = (lines || []).find((li) => this._trailsLineText(li) === label) || null;
+    if (!line) {
+      try { line = await rec.createLineItem(null, null, "text", [{ type: "text", text: label }], null); } catch (e) { line = null; }
+    }
+    if (line) this._trailsDayLines.set(dayKey, line);
+    return line;
+  }
+
+  async _trailsTrashOneOldLine(rec, now = Date.now()) {
+    let lines = [];
+    try { lines = (await rec.getLineItems(false)) || []; } catch (e) { return; }
+    const cutoff = now - (this._TRAILS_RETENTION_DAYS * 86400000);
+    const dayLines = (lines || []).map((line) => {
+      const text = this._trailsLineText(line);
+      const dayKey = text.startsWith("Trail ") ? text.slice(6).trim() : "";
+      const ts = Date.parse(dayKey + "T12:00:00");
+      return { line, dayKey, ts: Number.isFinite(ts) ? ts : 0 };
+    }).filter((row) => row.dayKey && row.ts && row.ts < cutoff)
+      .sort((a, b) => a.ts - b.ts);
+    if (!dayLines.length) return;
+    const victim = dayLines[0].line;
+    try { await victim.delete?.(); } catch (e) {}
+    if (victim?.guid) {
+      for (const [key, li] of [...this._trailsDayLines.entries()]) {
+        if (li === victim || li?.guid === victim.guid) this._trailsDayLines.delete(key);
+      }
+    }
+  }
+
+  async _trailsFlushNow(now = Date.now()) {
+    if (!this._trailsPersist || !this._trailsDirty) return;
+    const dayKey = this._trailsDayKey(now);
+    const payload = this._trailsEntriesForDay(dayKey, now);
+    const serialized = JSON.stringify(payload);
+    if (this._trailsLastFlushed.get(dayKey) === serialized) {
+      this._trailsDirty = false;
+      return;
+    }
+    const rec = await this._pluginDataRecord(this._TRAILS_RECORD_NAME, true);
+    if (!rec) return;
+    const line = await this._trailsEnsureDayLine(rec, dayKey);
+    if (!line || typeof line.setMetaProperty !== "function") return;
+    try {
+      const ok = (await line.setMetaProperty(this._TRAILS_META_KEY, serialized)) !== false;
+      if (!ok) return;
+    } catch (e) { return; }
+    this._trailsLastFlushed.set(dayKey, serialized);
+    this._trailsDirty = false;
+    await this._trailsTrashOneOldLine(rec, now);
+  }
+
+  _trailsBuildApi() {
+    const self = this;
+    return {
+      recent(n = 20) {
+        self._trailsEnsureLoaded();
+        const limit = Math.max(0, Number(n) || 20);
+        return self._wbTrailRing().slice(-limit).map((e) => ({ ...e }));
+      },
+      query(opts = {}) {
+        self._trailsEnsureLoaded();
+        const limit = Math.max(1, Math.min(500, Number(opts?.limit) || 100));
+        let out = self._wbTrailRing().map((e) => ({ ...e }));
+        if (opts.guid) out = out.filter((e) => e.guid === String(opts.guid));
+        if (opts.kind) out = out.filter((e) => e.kind === String(opts.kind));
+        if (opts.parent) out = out.filter((e) => e.parent === String(opts.parent));
+        if (opts.since != null) out = out.filter((e) => (Number(e.ts) || 0) >= Number(opts.since));
+        if (opts.until != null) out = out.filter((e) => (Number(e.ts) || 0) <= Number(opts.until));
+        return out.slice(-limit);
+      },
+      before(guid, opts = {}) {
+        self._trailsEnsureLoaded();
+        const target = String(guid || "");
+        const windowMs = Math.max(0, Number(opts?.windowMs) || 300000);
+        const ring = self._wbTrailRing();
+        let firstCommitIdx = -1;
+        let lastCommitIdx = -1;
+        for (let i = 0; i < ring.length; i++) {
+          const e = ring[i];
+          if (e?.guid !== target || (e.kind !== "click" && e.kind !== "jump")) continue;
+          if (firstCommitIdx < 0) firstCommitIdx = i;
+          lastCommitIdx = i;
+        }
+        if (lastCommitIdx < 0) return [];
+        const anchorTs = Number(ring[lastCommitIdx].ts) || 0;
+        const start = anchorTs - windowMs;
+        const out = [];
+        for (let i = 0; i < firstCommitIdx; i++) {
+          const e = ring[i];
+          if (e?.kind !== "hover") continue;
+          const ts = Number(e.ts) || 0;
+          if (ts < start || ts > anchorTs) continue;
+          out.push({ ...e });
+        }
+        return out;
+      },
+      days() {
+        self._trailsEnsureLoaded();
+        const days = new Set();
+        for (const e of self._wbTrailRing()) days.add(self._trailsDayKey(e?.ts));
+        return [...days].sort();
+      },
+    };
+  }
+
   _connTrailStorageKey() {
     const workspaceGuid = this._wbWorkspaceGuid();
     return workspaceGuid ? "refx_trail_v1:" + workspaceGuid : "";
@@ -37268,7 +39626,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (this._connTrailPersistT) clearTimeout(this._connTrailPersistT);
     this._connTrailPersistT = setTimeout(() => {
       this._connTrailPersistT = 0;
-      try { localStorage.setItem(key, JSON.stringify(this._refxTrail)); } catch (e) {}
+      try {
+        const ring = Array.isArray(this._refxTrail.ring) ? this._refxTrail.ring : [];
+        localStorage.setItem(key, JSON.stringify({ v: 2, ring }));
+      } catch (e) {}
     }, 250);
   }
 
@@ -37293,15 +39654,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     } else {
       this._connTraversalPersist(store);
     }
-    const trail = this._refxTrail || (typeof window !== "undefined" ? window.__refxTrail : null);
-    if (trail && Array.isArray(trail.ring)) {
-      const cap = Math.max(1, Number(trail.cap) || 50);
-      const label = String(this.getOrLoadRecordName(dst) || this._lineTextByGuid(dst) || dst).trim();
-      trail.ring.push({ guid: dst, label, ts: now, how: String(how || "jump") });
-      while (trail.ring.length > cap) trail.ring.shift();
-      this._connTrailPersistSoon();
-      this._wbTrailNotifyChanged();
-    }
+    if (!this._trailsEnabled) return;
+    const howStr = String(how || "jump");
+    let kind = "jump";
+    if (howStr === "pick" || howStr === "expand") kind = "click";
+    else if (howStr === "hover") kind = "hover";
+    const label = this._trailSafeLabel(dst) || String(this._lineTextByGuid(dst) || dst).trim();
+    this._trailRecord({ guid: dst, label, ts: now, how: howStr, kind, parent: src });
   }
 
   _connTrailLoadOnce() {
@@ -37313,31 +39672,68 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       const raw = localStorage.getItem(key);
       if (!raw) return;
       const parsed = JSON.parse(raw);
-      const ring = (parsed && Array.isArray(parsed.ring)) ? parsed.ring
-        : (Array.isArray(parsed) ? parsed : null);
+      let ring = null;
+      if (parsed && parsed.v === 2 && Array.isArray(parsed.ring)) ring = parsed.ring;
+      else if (parsed && Array.isArray(parsed.ring)) ring = parsed.ring;
+      else if (Array.isArray(parsed)) ring = parsed;
       if (!ring || !ring.length) return;
-      const cap = Math.max(1, Number(parsed?.cap || this._refxTrail.cap) || 50);
+      const cap = Math.max(1, Number(parsed?.cap || this._refxTrail.cap) || 200);
       this._refxTrail.cap = cap;
-      this._refxTrail.ring = ring.slice(-cap);
+      this._refxTrail.ring = ring.map((entry, idx) => this._trailNormalizeEntry(entry, idx)).slice(-cap);
     } catch (e) {}
   }
 
+  _wbTrailCommitEntries(ring) {
+    return (ring || []).filter((e) => e && (e.kind === "click" || e.kind === "jump"));
+  }
+
+  _wbTrailStripEntries(ring) {
+    const source = Array.isArray(ring) ? ring : [];
+    return this._trailCommitsOnly ? this._wbTrailCommitEntries(source) : source;
+  }
+
   _wbTrailPaintFingerprint(ring) {
-    return (ring || []).map((e) => String(e.guid || "") + ":" + String(e.ts || 0) + ":" + String(e.label || "")).join("|");
+    return (ring || []).map((e) => [
+      String(e?.id || ""),
+      String(e?.guid || ""),
+      String(e?.ts || 0),
+      String(e?.kind || ""),
+      String(e?.dwellMs || 0),
+      String(e?.label || ""),
+    ].join(":")).join("|") + "|commits:" + (this._trailCommitsOnly ? "1" : "0");
+  }
+
+  _wbTrailHopGlyph(entry) {
+    return entry?.kind === "hover" ? "○" : "●";
   }
 
   _wbTrailHopDisplay(entry) {
+    const glyph = this._wbTrailHopGlyph(entry);
     const label = String(entry?.label || entry?.guid || "").trim();
     const rt = this._relativeTime(entry?.ts);
     const datePart = rt?.absShort ? String(rt.absShort).split(",")[0].trim() : "";
-    const full = datePart ? datePart + " › " + label : label;
-    return full.length > 14 ? full.slice(0, 14) + "…" : full;
+    let full = datePart ? datePart + " › " + label : label;
+    full = glyph + " " + full;
+    if ((Number(entry?.dwellMs) || 0) >= 3000) full += "·3s";
+    return full.length > 16 ? full.slice(0, 16) + "…" : full;
   }
 
   _wbTrailHopTitle(entry) {
     const label = String(entry?.label || entry?.guid || "").trim();
+    const parent = String(entry?.parent || "").trim();
+    const parentLabel = parent
+      ? String(this.getOrLoadRecordName?.(parent) || this._readableLineTitle?.(parent) || parent).trim()
+      : "";
+    const fromPart = parentLabel ? "from " + parentLabel : "";
     const rt = this._relativeTime(entry?.ts);
-    return rt?.rel ? label + " · " + rt.rel : label;
+    const rel = rt?.rel ? " · " + rt.rel : "";
+    return (fromPart || label) + rel;
+  }
+
+  _wbTrailToggleCommitsOnly() {
+    this._trailCommitsOnly = !this._trailCommitsOnly;
+    try { localStorage.setItem("refx_trail_commits_only_v1", this._trailCommitsOnly ? "1" : "0"); } catch (e) {}
+    this._wbTrailNotifyChanged();
   }
 
   _wbTrailRing() {
@@ -37358,7 +39754,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   _wbTrailDistinctRecordGuids() {
     const seen = new Set();
     const out = [];
-    for (const entry of this._wbTrailRing()) {
+    for (const entry of this._wbTrailCommitEntries(this._wbTrailRing())) {
       const g = String(entry?.guid || "").trim();
       if (!g || seen.has(g)) continue;
       if (!this.data.getRecord?.(g)) continue;
@@ -37448,7 +39844,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
 
   async _wbTrailReplay() {
     if (this._wbTrailReplayActive) { this._wbTrailStopReplay(); this._toast("Replay cancelled"); return; }
-    const ring = this._wbTrailRing();
+    const ring = this._wbTrailCommitEntries(this._wbTrailRing());
     if (!ring.length) return;
     const gen = ++this._wbTrailReplayGen;
     try { window.__refxTrailReplayGen = gen; } catch (e) {}
@@ -37482,7 +39878,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       this._wbTrailPaintFp = "";
       return;
     }
-    this._connTrailLoadOnce();
+    this._trailsEnsureLoaded();
     const scroller = panelEl.querySelector(".panel-scroller-y") || panelEl;
     if (!this._wbTrailEl || !this._wbTrailEl.isConnected || this._wbTrailEl.parentElement !== scroller) {
       if (this._wbTrailEl) { try { this._wbTrailEl.remove(); } catch (e) {} }
@@ -37505,14 +39901,16 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       this._wbTrailPaintFp = "";
       return;
     }
+    this._trailsEnsureLoaded();
     const ring = this._wbTrailRing();
+    const stripRing = this._wbTrailStripEntries(ring);
     let el = this._wbTrailEl;
-    if (!ring.length) {
+    if (!stripRing.length) {
       this._wbTrailPaintFp = "";
       if (el) { el.hidden = true; if (el.replaceChildren) el.replaceChildren(); else el.innerHTML = ""; }
       return;
     }
-    const fp = this._wbTrailPaintFingerprint(ring);
+    const fp = this._wbTrailPaintFingerprint(stripRing);
     if (fp === this._wbTrailPaintFp && el && el.isConnected && !el.hidden) return;
     this._wbTrailPaintFp = fp;
     if (!el || !el.isConnected) {
@@ -37533,11 +39931,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       try { scroller.appendChild(el); } catch (e) {}
     }
     if (el.replaceChildren) el.replaceChildren(); else el.innerHTML = "";
-    const visible = ring.slice(-8);
-    if (ring.length > 8) {
+    const toggleBtn = this._wbBtn(this._trailCommitsOnly ? "●" : "○", this._trailCommitsOnly ? "Commits only (on)" : "Show hovers too", () => this._wbTrailToggleCommitsOnly());
+    toggleBtn.classList.add("refx-wb-trail-act", "refx-wb-trail-toggle");
+    el.append(toggleBtn);
+    const visible = stripRing.slice(-8);
+    if (stripRing.length > 8) {
       const more = this._el("button", "refx-wb-trail-more", "…");
       more.type = "button";
-      more.title = "Show all " + ring.length + " hops";
+      more.title = "Show all " + stripRing.length + " hops";
       more.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); this._wbTrailShowFullModal(); });
       el.append(more);
       el.append(this._el("span", "refx-wb-trail-sep", "›"));
@@ -37545,7 +39946,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     for (let i = 0; i < visible.length; i++) {
       if (i > 0) el.append(this._el("span", "refx-wb-trail-sep", "›"));
       const entry = visible[i];
-      const btn = this._el("button", "refx-wb-trail-hop", this._wbTrailHopDisplay(entry));
+      const hopCls = "refx-wb-trail-hop" + (entry?.kind === "hover" ? " refx-wb-trail-hop-hover" : "");
+      const btn = this._el("button", hopCls, this._wbTrailHopDisplay(entry));
       btn.type = "button";
       btn.title = this._wbTrailHopTitle(entry);
       const guid = entry.guid;
@@ -39695,6 +42097,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         row.fullEl.appendChild(this._buildTaskToggleGlyph(line));
       }
       this._renderRefLineText(row.fullEl, rebuilt);
+      if (row.rowEl?.__refxCtx) this._paintRefRowNestedCounts(row.rowEl, row.rowEl.__refxCtx);
       this._writeInlineEditedSegments(line, rebuilt).then((written) => {
         if (!written) this.showToast('Linked References', 'Could not save the edited line.');
       }).catch(() => { this.showToast('Linked References', 'Could not save the edited line.'); });
@@ -40564,16 +42967,17 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // Breadcrumb only (record › parent) — the children slot stays empty
     // because the full tree below replaces the 3-child teaser.
     this._fillRefContextRow(
-      { alive: alive || (() => bodyEl.isConnected), onJump: (g) => { this._bridgeJump(g, {}); }, treeCache: new Map() },
+      { alive: alive || (() => bodyEl.isConnected), onJump: (g) => { this._bridgeJump(g, {}); }, treeCache: new Map(), nestedCounts: false },
       adapter, row.crumbEl, null
     ).catch(() => {});
-    this._wbFillChildTree(bodyEl, item.guid, rec, alive).catch(() => {});
+    const expandDepth = this._wbItemClampDepth(item);
+    this._wbFillChildTree(bodyEl, item.guid, rec, alive, expandDepth).catch(() => {});
   }
 
   // FULL children tree under a Workbench line card (Roam's block outline in a
   // sidebar window): nested, collapsible per node, capped at 5 levels / 50
   // lines. Task children get the same clickable ☐/☑ glyph; any line jumps.
-  async _wbFillChildTree(bodyEl, lineGuid, rec, alive) {
+  async _wbFillChildTree(bodyEl, lineGuid, rec, alive, expandDepth) {
     let items = [];
     try { items = await rec.getLineItems(false); } catch (e) {}
     if (alive && !alive()) return;
@@ -40595,17 +42999,22 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         const lineEl = this._el("div", "refx-wb-tree-line");
         const hasKids = !!(c.children && c.children.length);
         let kidBox = null;
+        const outlineDepth = expandDepth === undefined ? this._refOutlineDepth : expandDepth;
+        const startExpanded = outlineDepth == null ? true : depth <= outlineDepth;
         if (hasKids && depth < 5) {
           kidBox = this._el("div", "refx-wb-tree-kids");
-          const twk = this._el("button", "refx-wb-act refx-wb-tree-twist", "▾");
+          if (!startExpanded) kidBox.classList.add("refx-hidden");
+          const twk = this._el("button", "refx-wb-act refx-wb-tree-twist", startExpanded ? "▾" : "▸");
           twk.type = "button";
-          twk.title = "Collapse children";
+          twk.title = startExpanded ? "Collapse children" : "Expand children";
+          twk.setAttribute("aria-expanded", startExpanded ? "true" : "false");
           twk.addEventListener("click", (ev) => {
             ev.preventDefault();
             ev.stopPropagation();
             const hidden = kidBox.classList.toggle("refx-hidden");
             twk.textContent = hidden ? "▸" : "▾";
             twk.title = hidden ? "Expand children" : "Collapse children";
+            twk.setAttribute("aria-expanded", hidden ? "false" : "true");
           });
           lineEl.append(twk);
         } else {
@@ -40936,8 +43345,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   _wbMutationIgnored(node) {
     if (!node || node.nodeType !== 1) return false;
     try {
-      if (node.matches?.(".refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-shared, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-stack-menu, .refx-wb-hdr")) return true;
-      if (node.closest?.(".refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-stack-menu, .refx-wb-hdr")) return true;
+      if (node.matches?.(".refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-shared, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-stack-menu, .refx-wb-hdr, .refx-wb-ctx, .refx-wb-crumbpop")) return true;
+      if (node.closest?.(".refx-wb-tabs, .refx-wb-trail, .refx-wb-related, .refx-wb-filterbar, .refx-wb-vmenu, .refx-wb-stack-menu, .refx-wb-hdr, .refx-wb-ctx, .refx-wb-crumbpop")) return true;
       if (node.matches?.(".refx-wb-shared")) return true;
       if (node.closest?.(".refx-wb-shared")) return true;
     } catch (e) {}
@@ -41306,8 +43715,11 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       out.push({
         lineGuid: li.guid, line: li, target: li.props.itemref || null,
         variant: li.props.refx_variant || "full",
+        depth: li.props.refx_depth,
         pinned: li.props.refx_pinned === "1" || li.props.refx_pinned === 1,
         collapsed,
+        focus: li.props.refx_focus || null,
+        rootOf: li.props.refx_root_of || null,
       });
     }
     return out;
@@ -41363,23 +43775,79 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (this._wbLivePanel()) { this._wbLiveScheduleRefresh(); return; } // already open
     try { await this._wbRestorePanels(); } catch (e) {}
     if (!this._wbOwnerCurrent(owner)) return;
+    const openT0 = performance.now();
+    try {
+      this._wbBootDiagOpenAt = openT0;
+      this._wbBootDiag = { createdAt: 0, elementNullFrames: 0, attachedAt: null, navigatedAt: null, chromeAt: null, clearedAt: null, clearedBy: null, trail: {} };
+      window.__REFX_WB_BOOT_DIAG = this._wbBootDiag;
+    } catch (e) {}
+    try { await this._wbLoadLive(null, owner); } catch (e) {}
+    if (!this._wbOwnerCurrent(owner)) return;
     let after = null;
     try { const ps = (this.ui.getPanels && this.ui.getPanels()) || []; after = ps.length ? ps[ps.length - 1] : null; } catch (e) {}
     let panel = null;
     try { panel = await this.ui.createPanel(after ? { afterPanel: after } : undefined); } catch (e) { panel = null; }
     if (!this._wbOwnerCurrent(owner)) return;
     if (!panel) { if (!silent) this._toast("Couldn't open a new panel."); return; }
+    this._wbApplyBootCloak(panel);
     try { this._wbLivePanelId = panel.getId && panel.getId(); } catch (e) {} // cache now so _wbLivePanel resolves before the active record settles
     try { await panel.navigateTo({ type: "edit_panel", rootId: guid, subId: null, workspaceGuid: this.workspaceGuid || null }); } catch (e) {}
     if (!this._wbOwnerCurrent(owner)) return;
+    try { if (this._wbBootDiag) this._wbBootDiag.navigatedAt = performance.now() - openT0; } catch (e) {}
+    this._wbApplyBootCloak(panel);
     try { if (panel.setTitle) panel.setTitle("Reference Workbench"); } catch (e) {}
-    this._wbLiveScheduleRefresh(500);
+    this._wbLiveScheduleRefresh(0, { immediate: true });
     setTimeout(() => { if (this._wbOwnerCurrent(owner)) this._wbSyncStatusIcon(); }, 300);
   }
 
-  _wbLiveScheduleRefresh(delay) {
+  _wbApplyBootCloak(panel) {
+    if (!panel) return;
+    const t0 = this._wbBootDiagOpenAt || performance.now();
+    const diag = this._wbBootDiag;
+    const armFailsafe = (pe) => {
+      if (this._wbBootClearT) { try { clearTimeout(this._wbBootClearT); } catch (e) {} }
+      this._wbBootClearT = setTimeout(() => {
+        this._wbBootClearT = 0;
+        this._wbClearBootCloak(pe, 'failsafe');
+      }, 1500);
+    };
+    const tryAttach = () => {
+      try {
+        // getElement() on a new panel is its .empty-panel placeholder, which
+        // navigation replaces; the cloak CSS keys on the stable .panel host.
+        const content = panel.getElement && panel.getElement();
+        const pe = content && content.closest ? content.closest(".panel") : null;
+        if (pe) {
+          if (this._wbBootAttachRaf) { try { cancelAnimationFrame(this._wbBootAttachRaf); } catch (e) {} this._wbBootAttachRaf = 0; }
+          if (!pe.dataset.refxWbBoot) {
+            pe.dataset.refxWbBoot = "1";
+            try { if (diag && diag.attachedAt == null) diag.attachedAt = performance.now() - t0; } catch (e) {}
+          }
+          armFailsafe(pe);
+          return true;
+        }
+      } catch (e) {}
+      try { if (diag) diag.elementNullFrames = (diag.elementNullFrames || 0) + 1; } catch (e) {}
+      return false;
+    };
+    if (tryAttach()) return;
+    let frames = 0;
+    const loop = () => {
+      this._wbBootAttachRaf = 0;
+      if (this._unloaded || !this._wbOwnerCurrent(this._wbOwner)) return;
+      if (tryAttach()) return;
+      frames++;
+      if (frames >= 40) return;
+      this._wbBootAttachRaf = requestAnimationFrame(loop);
+    };
+    if (this._wbBootAttachRaf) { try { cancelAnimationFrame(this._wbBootAttachRaf); } catch (e) {} }
+    this._wbBootAttachRaf = requestAnimationFrame(loop);
+  }
+
+  _wbLiveScheduleRefresh(delay, opts = {}) {
     const owner = this._wbOwner;
     if (!this._wbOwnerCurrent(owner) || !this._wbBackingGuid || this._wbStormTripped) return false;
+    const immediate = !!(opts && opts.immediate);
     const refreshSeq = ++this._wbRefreshSeq;
     const wait = Math.max(0, delay == null ? 120 : Number(delay) || 0);
     if (this._wbLiveRefreshT) { try { clearTimeout(this._wbLiveRefreshT); } catch (e) {} }
@@ -41392,8 +43860,15 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         return;
       }
       const sinceLast = this._wbRefreshLastAt ? now - this._wbRefreshLastAt : 250;
-      if (sinceLast < 250) {
+      if (!immediate && sinceLast < 250) {
         this._wbLiveScheduleRefresh(250 - sinceLast);
+        return;
+      }
+      if (immediate) {
+        if (!this._wbRefreshCurrent(owner, null, refreshSeq) || this._wbStormTripped) return;
+        this._wbLiveRefresh(null, owner, refreshSeq).then((ok) => {
+          if (ok !== false) this._wbRefreshStormRecordRun();
+        }).catch(() => {});
         return;
       }
       this._runBackgroundWork('visible-workbench-refresh', async (generation) => {
@@ -41419,7 +43894,8 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
         if (this._wbAdoptBootRuns > 15) { this._wbStormTrip(); return false; }
       }
     }
-    if (!backgroundGeneration || !this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
+    if (!backgroundGeneration && !this._wbRefreshCurrent(owner, null, refreshSeq)) return false;
+    if (backgroundGeneration && !this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
     const panel = this._wbLivePanel();
     if (!panel) { this._wbLiveTeardownObserver(); this._wbSyncStatusIcon(); return; }
     let panelEl = null;
@@ -41434,20 +43910,64 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     try { const ar = panel.getActiveRecord && panel.getActiveRecord(); if (ar && ar.guid === this._wbBackingGuid && panel.setTitle) panel.setTitle("Reference Workbench"); } catch (e) {}
     const items = await this._wbLoadLive(backgroundGeneration, owner, refreshSeq);
     if (!this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
+    this._wbCtxCheckRegistryKick();
     this._wbStackListCache = null;
     panelEl.classList.add("refx-wb-live");
     const byLine = new Map(items.map((it) => [it.lineGuid, it]));
     this._wbLiveEnsureObserver(panelEl);
     // drop headers (and any A3 prop card) whose item line is gone from the shelf
-    for (const [lg, h] of [...this._wbHeaders]) { if (!byLine.has(lg)) { try { h.el.remove(); } catch (e) {} this._wbHeaders.delete(lg); this._wbLiveDropPropCard(lg); } }
+    for (const [lg, h] of [...this._wbHeaders]) {
+      if (!byLine.has(lg)) {
+        this._wbCtxCancelWarmRetry(h);
+        try {
+          const gone = panelEl.querySelector('.listitem-transclusion[data-guid="' + lg + '"]');
+          this._wbClampTeardown(lg, gone);
+        } catch (e) {}
+        try { if (h.ctx) h.ctx.remove(); h.el.remove(); } catch (e) {}
+        this._wbHeaders.delete(lg);
+        this._wbCtxClearCacheWritten(lg);
+        this._wbLiveDropPropCard(lg);
+      }
+    }
     // inject / update a header per item
+    let decorated = 0;
     for (const it of items) {
       if (!this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
       const node = panelEl.querySelector('.listitem-transclusion[data-guid="' + it.lineGuid + '"]');
       if (!node) continue;
       this._wbLiveDecorate(node, it, backgroundGeneration, owner, refreshSeq);
+      decorated++;
     }
     if (!this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
+    // v4.58 U3: shared-ancestor grouping from warm chains cached during decorate.
+    const warmChains = [];
+    for (const it of items) {
+      const h = this._wbHeaders.get(it.lineGuid);
+      if (!h?.ctxChain?.complete) continue;
+      warmChains.push({
+        lineGuid: it.lineGuid,
+        ownerGuid: h.ctxChain.ownerGuid,
+        chain: h.ctxChain.chain,
+        complete: true,
+      });
+    }
+    const ctxGroups = this._wbCtxGroups(warmChains);
+    const ctxGroupsFp = this._wbCtxGroupsFingerprint(ctxGroups);
+    this._wbCtxGroupAnnot = this._wbCtxAnnotByLine(items, ctxGroups, warmChains);
+    const ctxGroupsChanged = ctxGroupsFp !== this._wbCtxGroupsFp;
+    if (ctxGroupsChanged) this._wbCtxGroupsFp = ctxGroupsFp;
+    for (const it of items) {
+      const h = this._wbHeaders.get(it.lineGuid);
+      if (!h?.ctx || !h.ctxChain?.complete) continue;
+      const annot = this._wbCtxGroupAnnot.get(String(it.lineGuid)) || null;
+      if (ctxGroupsChanged) {
+        this._wbLiveRenderContextPaint(h.ctx, h.ctxChain, it, h, () => true, annot);
+      } else {
+        this._wbLiveRenderContextApplyGroups(h, annot, ctxGroupsFp);
+      }
+    }
+    if (!this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return false;
+    this._wbLiveFocusRulesSync(items);
     this._wbLiveFilterBarEnsure(panelEl, items);
     this._wbLiveTabsEnsure(panelEl, items);
     this._wbLiveTrailEnsure(panelEl, items);
@@ -41457,7 +43977,31 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this._wbPokeDatacore();
     this._wbRelatedScheduleRefresh();
     this._wbSharedScheduleRefresh();
+    // Lift the boot cloak only once the host has actually rendered the shelf; an
+    // early refresh can run while the panel still shows its placeholder.
+    try {
+      const host = panelEl.closest ? panelEl.closest(".panel") : null;
+      const ar = panel.getActiveRecord && panel.getActiveRecord();
+      const onBacking = !!(ar && ar.guid === this._wbBackingGuid);
+      if (host?.dataset?.refxWbBoot && onBacking && (decorated > 0 || items.length === 0)) this._wbClearBootCloak(host, 'refresh');
+    } catch (e) {}
     return true;
+  }
+
+  _wbClearBootCloak(panelEl, clearedBy) {
+    if (this._wbBootAttachRaf) { try { cancelAnimationFrame(this._wbBootAttachRaf); } catch (e) {} this._wbBootAttachRaf = 0; }
+    try {
+      const el = panelEl || (this._wbLivePanel()?.getElement?.());
+      if (el?.dataset?.refxWbBoot) delete el.dataset.refxWbBoot;
+    } catch (e) {}
+    try { document.querySelectorAll('[data-refx-wb-boot]').forEach((n) => { delete n.dataset.refxWbBoot; }); } catch (e) {}
+    if (this._wbBootClearT) { try { clearTimeout(this._wbBootClearT); } catch (e) {} this._wbBootClearT = 0; }
+    if (clearedBy && this._wbBootDiag && this._wbBootDiagOpenAt) {
+      try {
+        this._wbBootDiag.clearedAt = performance.now() - this._wbBootDiagOpenAt;
+        this._wbBootDiag.clearedBy = clearedBy;
+      } catch (e) {}
+    }
   }
 
   // v4.49.7: Datacore's own scan only reaches the ACTIVE panel on most ticks, so
@@ -41504,6 +44048,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     const registryHas = !!(((window.g_universe && window.g_universe.itemsByGuid) || {})[it.target]) || !!this._liveStateByGuid(it.target);
     const dangling = !!it.target && !this.data.getRecord(it.target) && !registryHas && !this._wbTxRendered(node);
     node.classList.toggle("refx-wb-dangling", !!dangling);
+    h.ctxIt = it;
+    h.target = it.target;
+    // v4.58 U1: ancestor context trail for line-target items (above native body).
+    this._wbLiveRenderContext(node, it, h, dangling, backgroundGeneration, owner, refreshSeq);
     // (re)render the read-only body for card/refs variants
     this._wbLiveRenderVariantBody(node, it, dangling, backgroundGeneration, owner, refreshSeq);
     // refresh header labels if state changed
@@ -41519,8 +44067,226 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       const cur = titleEl && titleEl.textContent;
       if (!cur || cur === "…") this._wbLiveHeaderSync(h.el, it, dangling, backgroundGeneration, owner, refreshSeq);
     }
-    // v3.55.0: mount fold twisties on WB body parent lines (expanded items only).
-    if (!it.collapsed && !dangling && it.variant === "full") this._wbFoldMount(node, it.lineGuid);
+    // v3.55.0 / v4.61 U8: fold twisties on full + children native bodies.
+    if (!it.collapsed && !dangling && (it.variant === "full" || it.variant === "children")) {
+      this._wbFoldMount(node, it.lineGuid);
+      this._wbClampApply(node, it);
+    } else if (dangling || it.variant === "card" || it.variant === "refs") {
+      this._wbClampTeardown(it.lineGuid, node);
+    }
+    if (this._wbScrollFocusOnce.has(it.lineGuid)) {
+      const scrollContainer = node.querySelector('.transclusion-container-div');
+      if (scrollContainer && it.focus) {
+        let focusEl = null;
+        for (const li of scrollContainer.querySelectorAll('.listitem[data-guid]')) {
+          if (li.getAttribute('data-guid') === it.focus) { focusEl = li; break; }
+        }
+        if (focusEl) {
+          try { focusEl.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+          this._wbScrollFocusOnce.delete(it.lineGuid);
+          this._wbScrollFocusTries.delete(it.lineGuid);
+        } else {
+          const tries = (this._wbScrollFocusTries.get(it.lineGuid) || 0) + 1;
+          this._wbScrollFocusTries.set(it.lineGuid, tries);
+          if (tries >= 12) {
+            this._wbScrollFocusOnce.delete(it.lineGuid);
+            this._wbScrollFocusTries.delete(it.lineGuid);
+          }
+        }
+      }
+    }
+  }
+
+  // v4.58 U1: read-only ancestor trail above the native transclusion body.
+  _wbLiveRenderContext(node, it, h, dangling, backgroundGeneration = null, owner = this._wbOwner, refreshSeq = null) {
+    const isLineTarget = !!(it.target && !this.data.getRecord(it.target));
+    if (!isLineTarget || dangling) {
+      this._wbCtxCancelWarmRetry(h);
+      if (h.ctx) { try { h.ctx.remove(); } catch (e) {} h.ctx = null; h.ctxExpanded = false; h.ctxChain = null; }
+      return;
+    }
+    if (backgroundGeneration && !this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq)) return;
+    const alive = () => !backgroundGeneration || this._wbRefreshCurrent(owner, backgroundGeneration, refreshSeq);
+    if (!h.ctx) {
+      const el = this._el("div", "refx-wb-ctx");
+      el.setAttribute("contenteditable", "false");
+      el.dataset.refxWbLine = it.lineGuid;
+      h.ctx = el;
+      h.ctxExpanded = false;
+    } else {
+      h.ctx.dataset.refxWbLine = it.lineGuid;
+    }
+    h.ctxWarmIt = it;
+    h.ctxWarmNode = node;
+    h.ctxWarmDangling = dangling;
+    h.ctxWarmBg = backgroundGeneration;
+    h.ctxWarmOwner = owner;
+    h.ctxWarmRefreshSeq = refreshSeq;
+    if (h.ctxChain?.complete && !h.ctxChain?.cached) {
+      this._wbCtxCancelWarmRetry(h);
+      if (h.el.nextSibling !== h.ctx) { try { node.insertBefore(h.ctx, h.el.nextSibling); } catch (e) {} }
+      const annot = this._wbCtxGroupAnnot?.get?.(String(it.lineGuid)) || null;
+      this._wbLiveRenderContextPaint(h.ctx, h.ctxChain, it, h, alive, annot);
+      return;
+    }
+    let cachedPainted = false;
+    if (!h.ctxChain?.complete) {
+      const cached = this._wbCtxParseCachedChain(it);
+      if (cached) {
+        cachedPainted = true;
+        h.ctxChain = cached;
+        if (h.el.nextSibling !== h.ctx) { try { node.insertBefore(h.ctx, h.el.nextSibling); } catch (e) {} }
+        const annot = this._wbCtxGroupAnnot?.get?.(String(it.lineGuid)) || null;
+        this._wbLiveRenderContextPaint(h.ctx, cached, it, h, alive, annot);
+        try { h.ctx.classList.add("is-cached"); } catch (e) {}
+        try {
+          const bootT0 = this._wbBootDiagOpenAt || performance.now();
+          this._wbCtxTrailDiag(it.lineGuid, {
+            cachedAt: performance.now() - bootT0,
+            source: "cache",
+          });
+        } catch (e) {}
+      }
+    }
+    if (!cachedPainted) {
+      this._wbCtxCancelWarmRetry(h);
+      h.ctxResolveGen = (h.ctxResolveGen || 0) + 1;
+      try { h.ctx.replaceChildren(); h.ctx.remove(); } catch (e) {}
+      h.ctxChain = null;
+    } else if (!h.ctxResolving) {
+      h.ctxResolveGen = (h.ctxResolveGen || 0) + 1;
+    }
+    if (!h.ctxChain?.complete) {
+      this._wbCtxWarmResolve(h, it, node, dangling, backgroundGeneration, owner, refreshSeq, 0);
+    }
+  }
+
+  _wbLiveToggleGuidFilter(members, lcaGuid) {
+    const list = (members || []).map((g) => String(g));
+    const cur = this._wbLiveGuidFilter;
+    const active = cur && list.length === cur.size && list.every((g) => cur.has(g));
+    this._wbLiveGuidFilter = active ? null : new Set(list);
+    this._wbLiveApplyFilter();
+  }
+
+  _wbLiveRenderContextApplyGroups(h, annot, fp) {
+    if (!h?.ctx || !annot || !fp) return 0;
+    if (h.ctxGroupsFp === fp) return 0;
+    let writes = 0;
+    const crumbEl = h.ctx.querySelector(".trc-ref-popover-crumb");
+    if (!crumbEl) return 0;
+    for (const pill of crumbEl.querySelectorAll(".refx-wb-ctx-pill")) {
+      pill.remove();
+      writes++;
+    }
+    for (const el of crumbEl.querySelectorAll(".is-shared")) {
+      el.classList.remove("is-shared");
+      writes++;
+    }
+    const pillGuid = annot.pill?.guid;
+    const filterActive = this._wbLiveGuidFilter
+      && annot.pill?.members
+      && annot.pill.members.length === this._wbLiveGuidFilter.size
+      && annot.pill.members.every((g) => this._wbLiveGuidFilter.has(g));
+    if (pillGuid) {
+      const target = crumbEl.querySelector('[data-guid="' + CSS.escape(String(pillGuid)) + '"]');
+      if (target) {
+        const pill = this._el("button", "refx-wb-ctx-pill" + (filterActive ? " is-active" : ""), "⧉" + annot.pill.n);
+        pill.type = "button";
+        pill.title = "Show " + annot.pill.n + " shelf items from this context";
+        pill.addEventListener("click", (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          this._wbLiveToggleGuidFilter(annot.pill.members, annot.pill.guid);
+        });
+        const host = target.classList.contains("trc-ref-popover-crumb-rec") ? target : (target.closest(".trc-ref-crumb-anc") || target.parentElement || target);
+        host.append(pill);
+        writes++;
+      }
+    }
+    if (annot.dimPrefix && annot.shared && annot.shared.size) {
+      for (const el of crumbEl.querySelectorAll("[data-guid]")) {
+        const g = el.dataset.guid;
+        if (!g || !annot.shared.has(g)) continue;
+        const host = el.classList.contains("trc-ref-popover-crumb-rec") ? el : (el.closest(".trc-ref-crumb-anc") || el);
+        if (host && !host.querySelector(".refx-wb-ctx-pill")) {
+          host.classList.add("is-shared");
+          writes++;
+        }
+      }
+    }
+    h.ctxGroupsFp = fp;
+    return writes;
+  }
+
+  _wbLiveRenderContextPaint(ctxEl, chainResult, it, h, alive, annot = null) {
+    if (!ctxEl || !alive()) return;
+    h.ctxGroupsFp = null;
+    const { ownerGuid, chain } = chainResult;
+    const plan = this._wbCtxTrailPlan(chain);
+    const treeCache = new Map();
+    const ctx = {
+      onJump: (g) => { this._bridgeJump(g, {}); },
+      alive,
+      treeCache,
+      sourceRecordGuid: ownerGuid,
+    };
+    const wbCrumbClick = (guid, ev) => {
+      if (ev.shiftKey) { this._bridgeJump(guid, { newPanel: true }); return; }
+      if (ev.metaKey || ev.ctrlKey) { this._bridgeJump(guid, {}); return; }
+      this._wbLiveReroot(it, guid, it.focus || it.target);
+    };
+    const onCrumbClick = (anc, ev) => wbCrumbClick(anc.guid, ev);
+    const mkAncActions = (anc, lineEl, labelEl) => {
+      const acts = this._el("span", "trc-ref-crumb-acts");
+      acts.append(this._mkRefRowAction("↗", "Jump to line", () => { ctx.onJump(anc.guid); }));
+      acts.append(this._mkRefRowAction("◧", "Open in side panel", () => { this._bridgeJump(anc.guid, { newPanel: true }); }));
+      for (const action of this._refRowClipboardActions(anc.guid, this._navigatorContextText(anc))) {
+        acts.append(this._mkRefRowAction(action.label, action.title, action.fn));
+      }
+      return acts;
+    };
+    ctxEl.replaceChildren();
+    const crumbEl = this._el("span", "trc-ref-popover-crumb");
+    const ownerText = ownerGuid ? (this.getOrLoadRecordName(ownerGuid) || ownerGuid) : '';
+    const chainTexts = (chain || []).map((anc) => this._wbCtxAncDisplayText(anc)).filter(Boolean);
+    const dropOwner = ownerGuid && this._wbCtxDropRedundantOwner(ownerText, chainTexts);
+    if (ownerGuid && !dropOwner) {
+      const recEl = this._el("button", "trc-ref-popover-crumb-rec trc-ref-popover-crumb-parent", ownerText);
+      recEl.type = "button";
+      recEl.title = "Zoom out to here · Shift: side panel · ⌘: jump";
+      this._ensureElDataset(recEl).dataset.guid = ownerGuid;
+      recEl.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); wbCrumbClick(ownerGuid, ev); });
+      crumbEl.append(recEl);
+    }
+    const expanded = !!h.ctxExpanded;
+    const renderChain = (ancChain) => {
+      const oldFirst = (ancChain || []).slice().reverse();
+      this._appendFlatAncestorTrail(crumbEl, oldFirst, ctx, mkAncActions, {
+        onCrumbClick,
+      });
+    };
+    if (!expanded && plan.hidden.length) {
+      crumbEl.append(this._el("span", "trc-ref-popover-crumb-sep", "›"));
+      const dots = this._el("button", "refx-wb-ctx-dots trc-ref-popover-crumb-parent", "…");
+      dots.type = "button";
+      dots.title = "Show " + plan.hidden.length + " hidden ancestor" + (plan.hidden.length === 1 ? "" : "s");
+      dots.addEventListener("click", (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        h.ctxExpanded = true;
+        this._wbLiveRenderContextPaint(ctxEl, chainResult, it, h, alive);
+      });
+      crumbEl.append(dots);
+      renderChain(plan.tail);
+    } else {
+      renderChain([...plan.hidden, ...plan.tail]);
+    }
+    const leadSep = crumbEl.firstElementChild;
+    if (leadSep && leadSep.classList && leadSep.classList.contains("trc-ref-popover-crumb-sep")) {
+      try { leadSep.remove(); } catch (e) {}
+    }
+    ctxEl.append(crumbEl);
+    this._wbCtxTruncateCrumbLabels(crumbEl);
+    if (annot) this._wbLiveRenderContextApplyGroups(h, annot, this._wbCtxGroupsFp);
   }
 
   // Did the native transclusion resolve + render its target's content? (real
@@ -41684,10 +44450,20 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       }).catch(() => {});
     }
     const actions = this._el("span", "refx-wb-hdr-actions");
+    const more = this._el("span", "refx-wb-hdr-actions-more");
     if (!dangling) {
-      actions.append(this._wbBtn(it.pinned ? "📌" : "📍", it.pinned ? "Unpin" : "Pin to top", () => this._wbLiveTogglePin(it)));
+      if (it.focus && it.focus !== it.target) {
+        actions.append(this._wbBtn("⤵", "Zoom in one level (toward the line you opened)", () => { this._wbLiveZoomInOne(it); }));
+      }
+      if (it.rootOf) {
+        actions.append(this._wbBtn("⤓ back", "Back to original", () => {
+          this._wbLiveReroot(it, it.rootOf, null, true);
+        }));
+      }
+      more.append(this._wbBtn(it.pinned ? "📌" : "📍", it.pinned ? "Unpin" : "Pin to top", () => this._wbLiveTogglePin(it)));
+      more.append(this._wbBtn("⇱", "Swap to main panel", () => this._wbLiveSwapToMain(it)));
+      actions.append(more);
       actions.append(this._wbBtn("⋯", "View as: full / children / card / refs", (e) => this._wbLiveVariantMenu(it, e)));
-      actions.append(this._wbBtn("⇱", "Swap to main panel", () => this._wbLiveSwapToMain(it)));
     }
     actions.append(this._wbBtn("✕", "Remove from Workbench", () => this._wbLiveRemove(it)));
     el.append(actions);
@@ -41735,7 +44511,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     } else {
       // card: a record shows its first lines; a line shows breadcrumb + row + tree
       if (this.data.getRecord(it.target)) this._wbFillRecord(slot, it.target, alive, { recGuids: new Set() });
-      else this._wbFillLine(slot, { guid: it.target, type: "line" }, { entry: { editing: null, targetGuid: it.target }, row: null, line: null }, { recGuids: new Set() }, alive).catch(() => {});
+      else this._wbFillLine(slot, { guid: it.target, type: "line", depth: it.depth, variant: it.variant }, { entry: { editing: null, targetGuid: it.target }, row: null, line: null }, { recGuids: new Set() }, alive).catch(() => {});
     }
   }
 
@@ -41781,6 +44557,58 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
       row.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._wbLiveSetVariant(it, v); try { pop.remove(); } catch (er) {} });
       pop.append(row);
     }
+    pop.append(this._el("div", "refx-wb-vmenu-sep"));
+    const depthOrder = [
+      { n: 1, label: "Direct children" },
+      { n: 2, label: "Two levels" },
+      { n: null, label: "Everything" },
+    ];
+    const curDepth = it.depth == null || it.depth === "" ? null : Number(it.depth);
+    for (const d of depthOrder) {
+      const on = d.n == null ? (curDepth == null || curDepth === 0 || !Number.isFinite(curDepth)) : curDepth === d.n;
+      const row = this._el("button", "refx-wb-vmenu-row" + (on ? " is-on" : ""), (on ? "✓ " : "") + d.label);
+      row.type = "button";
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+      row.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._wbLiveSetDepth(it, d.n); try { pop.remove(); } catch (er) {} });
+      pop.append(row);
+    }
+    pop.append(this._el("div", "refx-wb-vmenu-sep"));
+    const mkNavRow = (label, fn) => {
+      const row = this._el("button", "refx-wb-vmenu-row", label);
+      row.type = "button";
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+      row.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); fn(); try { pop.remove(); } catch (er) {} });
+      pop.append(row);
+    };
+    if (it.target && !this.data.getRecord(it.target)) {
+      const chainResult = this._wbCtxChain(it.target);
+      if (chainResult.chain.length > 0) {
+        mkNavRow("Zoom out one level", () => {
+          const parent = chainResult.chain[0];
+          if (parent) this._wbLiveReroot(it, parent.guid, it.focus || it.target);
+        });
+      }
+      if (it.focus && it.focus !== it.target) {
+        mkNavRow("Zoom in one level", () => { this._wbLiveZoomInOne(it); });
+      }
+      if (it.rootOf) {
+        mkNavRow("Back to original", () => { this._wbLiveReroot(it, it.rootOf, null, true); });
+      }
+    }
+    const hdr = this._wbHeaders.get(it.lineGuid)?.el;
+    const narrow = hdr && hdr.clientWidth < 420;
+    if (narrow) {
+      pop.append(this._el("div", "refx-wb-vmenu-sep"));
+      const mkNarrow = (label, fn) => {
+        const row = this._el("button", "refx-wb-vmenu-row", label);
+        row.type = "button";
+        row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        row.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); fn(); try { pop.remove(); } catch (er) {} });
+        pop.append(row);
+      };
+      mkNarrow(it.pinned ? "Unpin" : "Pin to top", () => this._wbLiveTogglePin(it));
+      mkNarrow("Swap to main panel", () => this._wbLiveSwapToMain(it));
+    }
     document.body.append(pop);
     try {
       const r = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect && ev.currentTarget.getBoundingClientRect()) || { left: 200, bottom: 200 };
@@ -41794,7 +44622,18 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   async _wbLiveSetVariant(it, variant) {
     const owner = this._wbOwner;
     if (!this._wbOwnerCurrent(owner)) return;
+    this._wbClampTeardown(it.lineGuid);
     try { await it.line.setMetaProperty("refx_variant", variant); } catch (e) {}
+    if (!this._wbOwnerCurrent(owner)) return;
+    this._wbLiveScheduleRefresh();
+  }
+
+  async _wbLiveSetDepth(it, depth) {
+    const owner = this._wbOwner;
+    if (!this._wbOwnerCurrent(owner)) return;
+    this._wbClampTeardown(it.lineGuid);
+    const val = depth == null ? "" : String(depth);
+    try { await it.line.setMetaProperty("refx_depth", val); } catch (e) {}
     if (!this._wbOwnerCurrent(owner)) return;
     this._wbLiveScheduleRefresh();
   }
@@ -41904,9 +44743,11 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   async _wbLiveRemove(it, silent) {
     const owner = this._wbOwner;
     if (!this._wbOwnerCurrent(owner)) return;
+    this._wbClampTeardown(it.lineGuid);
     this._wbPushClosed(it);
     const h = this._wbHeaders.get(it.lineGuid);
-    if (h) { try { if (h.slot) h.slot.remove(); h.el.remove(); } catch (e) {} this._wbHeaders.delete(it.lineGuid); }
+    if (h) { this._wbCtxCancelWarmRetry(h); try { if (h.slot) h.slot.remove(); if (h.ctx) h.ctx.remove(); h.el.remove(); } catch (e) {} this._wbHeaders.delete(it.lineGuid); }
+    this._wbCtxClearCacheWritten(it.lineGuid);
     try { await it.line.delete(); } catch (e) {}
     if (!this._wbOwnerCurrent(owner)) return;
     if (!silent) this._toast("Removed from Workbench");
@@ -41962,7 +44803,88 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     const props = { itemref: item.target, refx_wb: 1, refx_variant: item.variant || "full" };
     if (item.pinned) props.refx_pinned = "1";
     if (item.collapsed) props.refx_collapsed = "1";
+    if (item.focus) props.refx_focus = item.focus;
+    if (item.rootOf) props.refx_root_of = item.rootOf;
     return rec.createLineItem(null, after, "transclusion", null, props);
+  }
+
+  // v4.62 U6: step one level back down toward it.focus (Alt+→, header ⤵, ⋯ menu).
+  _wbLiveZoomInOne(it) {
+    if (!it || !it.focus || it.focus === it.target) return null;
+    const uni = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const focusItem = uni[it.focus];
+    const parentOfFocus = (focusItem && focusItem.parent && focusItem.parent.guid) || (focusItem && focusItem.parent_guid) || null;
+    let zoomGuid = null;
+    if (parentOfFocus === it.target) zoomGuid = it.focus;
+    else {
+      for (const anc of this._wbCtxChain(it.focus).chain) {
+        const ancItem = uni[anc.guid];
+        const p = (ancItem && ancItem.parent && ancItem.parent.guid) || (ancItem && ancItem.parent_guid) || null;
+        if (p === it.target) { zoomGuid = anc.guid; break; }
+      }
+    }
+    if (!zoomGuid) return null;
+    this._wbLiveReroot(it, zoomGuid, it.focus);
+    return zoomGuid;
+  }
+
+  // v4.58 U2: slide the shelf item's window up/down the ancestor chain in place.
+  // Create-then-delete preserves order; awaited setter is the commit (no readback).
+  async _wbLiveReroot(it, newTargetGuid, focusGuid, isBack) {
+    const owner = this._wbOwner;
+    if (!it || !it.line || !newTargetGuid || !this._wbOwnerCurrent(owner)) return;
+    const rec = this._wbBackingRecord;
+    if (!rec || (rec.guid || rec.getGuid?.()) !== this._wbBackingValidatedGuid) return;
+    const writeItem = {
+      target: newTargetGuid,
+      variant: it.variant || "full",
+      pinned: !!it.pinned,
+      collapsed: !!it.collapsed,
+    };
+    if (!isBack) {
+      writeItem.focus = focusGuid || it.focus || it.target;
+      writeItem.rootOf = it.rootOf || it.target;
+    }
+    let newLine = null;
+    try { newLine = await this._wbWriteShelfLine(rec, it.line, writeItem); } catch (e) { return; }
+    if (!this._wbOwnerCurrent(owner)) return;
+    const oldLineGuid = it.lineGuid;
+    const h = this._wbHeaders.get(oldLineGuid);
+    if (h) {
+      try { if (h.slot) h.slot.remove(); if (h.ctx) h.ctx.remove(); h.el.remove(); } catch (e) {}
+      this._wbHeaders.delete(oldLineGuid);
+      this._wbCtxClearCacheWritten(oldLineGuid);
+      this._wbLiveDropPropCard(oldLineGuid);
+    }
+    try { await it.line.delete(); } catch (e) {}
+    if (!this._wbOwnerCurrent(owner)) return;
+    if (newLine && newLine.guid) this._wbScrollFocusOnce.add(newLine.guid);
+    this._wbLiveScheduleRefresh();
+    return newLine;
+  }
+
+  // v4.58 U2: highlight refx_focus lines via Thymer's native data-guid (no marker class).
+  _wbLiveFocusRulesSync(items) {
+    const styleId = "refx-wb-focus-rules";
+    let style = document.getElementById(styleId);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = styleId;
+      try { document.head.appendChild(style); } catch (e) {}
+    }
+    const guids = new Set();
+    for (const it of items || []) {
+      const f = it && it.focus;
+      const t = it && it.target;
+      if (!f || f === t) continue;
+      if (/^[A-Za-z0-9_-]{6,64}$/.test(String(f))) guids.add(String(f));
+    }
+    const rules = [];
+    for (const g of guids) {
+      rules.push('.refx-wb-live .listitem[data-guid="' + g + '"] > .line-div { position: relative; }');
+      rules.push('.refx-wb-live .listitem[data-guid="' + g + '"] > .line-div::before { content: ""; position: absolute; top: -1px; bottom: -1px; left: -10px; right: -6px; border: 2px solid var(--refx-wb-focus-ring, #e6b422); border-radius: 6px; pointer-events: none; z-index: 1; }');
+    }
+    style.textContent = rules.join("\n");
   }
 
   async _wbClearRecordLines(rec) {
@@ -43029,6 +45951,9 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
             if (node) { if (node.firstChild !== h.el) { try { node.insertBefore(h.el, node.firstChild); } catch (e) {} } }
             else structural = true;
           }
+          if (h.ctx && !h.ctx.isConnected && h.el.isConnected) {
+            try { h.el.parentNode.insertBefore(h.ctx, h.el.nextSibling); } catch (e) {}
+          }
         }
         // v3.55.0: keep-alive for WB body fold twisty nodes (line-div swap wipes them).
         for (const [k, e] of this._wbFoldTwists) {
@@ -43050,7 +45975,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
           if (this._wbMutationIgnored(m.target)) continue;
           for (const n of (m.addedNodes || [])) {
             if (this._wbMutationIgnored(n)) continue;
-            if (n.nodeType === 1 && (n.classList?.contains("refx-wb-hdr") || n.classList?.contains("refx-wb-slot") || n.classList?.contains("refx-wb-twist"))) continue;
+            if (n.nodeType === 1 && (n.classList?.contains("refx-wb-hdr") || n.classList?.contains("refx-wb-ctx") || n.classList?.contains("refx-wb-slot") || n.classList?.contains("refx-wb-twist"))) continue;
             if (n.nodeType === 1 && (n.matches?.(".listitem-transclusion[data-guid]") || n.querySelector?.(".listitem-transclusion[data-guid]"))) { structural = true; }
             // Body-line added: may need a new twisty if it has children
             if (n.nodeType === 1 && n.matches?.(".listitem[data-guid]")) {
@@ -43075,6 +46000,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     try { obs.observe(panelEl, options); } catch (e) {}
     this._wbLiveObs = obs; this._wbLiveObsEl = panelEl;
     window.__refxWbLiveObs = obs;
+    if (this._wbCrumbHoverBound !== panelEl) {
+      if (this._wbCrumbHoverBound) {
+        try { this._wbCrumbHoverBound.removeEventListener("mouseover", this._wbCrumbHover, true); } catch (e) {}
+      }
+      try { panelEl.addEventListener("mouseover", this._wbCrumbHover, true); } catch (e) {}
+      this._wbCrumbHoverBound = panelEl;
+    }
   }
 
   _wbLiveTeardownObserver(opts) {
@@ -43084,6 +46016,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // reused for another record). _wbLiveEnsureObserver early-returns for the
     // same panel, so a normal same-panel refresh never reaches this.
     try { if (this._wbLiveObsEl) this._wbLiveObsEl.classList.remove("refx-wb-live"); } catch (e) {}
+    if (this._wbCrumbHoverBound) {
+      try { this._wbCrumbHoverBound.removeEventListener("mouseover", this._wbCrumbHover, true); } catch (e) {}
+      this._wbCrumbHoverBound = null;
+    }
     // v3.25.0: reset the "Reference Workbench" title override once the panel has
     // navigated to a normal page. Settle-proof: getActiveRecord()/getName() is
     // often null right after nav (unsettled), so retry on a short backoff until
@@ -43091,8 +46027,10 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     // stuck (the residual v3.24.0 bug).
     this._wbResetPanelTitle(this._wbLiveObsEl, 6);
     this._wbLiveObs = null; this._wbLiveObsEl = null; window.__refxWbLiveObs = null;
-    for (const [lg, h] of [...this._wbHeaders]) { try { if (h.slot) h.slot.remove(); h.el.remove(); } catch (e) {} this._wbLiveDropPropCard(lg); }
+    this._wbCtxCancelAllWarmRetries();
+    for (const [lg, h] of [...this._wbHeaders]) { try { if (h.slot) h.slot.remove(); if (h.ctx) h.ctx.remove(); h.el.remove(); } catch (e) {} this._wbLiveDropPropCard(lg); }
     this._wbHeaders.clear();
+    if (this._wbCtxCacheWritten) this._wbCtxCacheWritten.clear();
     // v3.55.0: remove all WB fold twistie nodes and reset fold state
     for (const [, e] of this._wbFoldTwists) { try { if (e.node) e.node.remove(); } catch (err) {} }
     this._wbFoldTwists.clear(); this._wbFolds.clear();
@@ -43109,6 +46047,166 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     this._wbTabsScrollFn = null; this._wbTabsScrollEl = null;
     if (this._wbTabsScrollT) { try { cancelAnimationFrame(this._wbTabsScrollT); } catch (e) { try { clearTimeout(this._wbTabsScrollT); } catch (e2) {} } this._wbTabsScrollT = 0; }
     if (!opts || (!opts.keepStorm && !opts.rebind)) this._wbResetStormCounters();
+  }
+
+  // v4.61 U7/U8: clamp depth for native bodies and card child trees.
+  _wbItemClampDepth(it) {
+    const raw = it && (it.depth != null ? it.depth : it.line?.props?.refx_depth);
+    if (raw != null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    if (it && it.variant === "children") return 1;
+    return null;
+  }
+
+  _wbClampTeardown(wbLineGuid, wbItemNode) {
+    if (wbItemNode) {
+      try {
+        const container = wbItemNode.querySelector('.transclusion-container-div');
+        if (container) {
+          for (const li of container.querySelectorAll('.listitem[data-guid]')) li.classList.remove('refx-wb-foreignhide');
+        }
+      } catch (e) {}
+      const note = this._wbClampNotes.get(wbLineGuid);
+      if (note) { try { note.remove(); } catch (e) {} }
+    }
+    this._wbClampLift.delete(wbLineGuid);
+    this._wbClampNotes.delete(wbLineGuid);
+    const seeded = this._wbClampSeeded.get(wbLineGuid);
+    if (seeded) { for (const k of seeded) this._wbFolds.delete(k); }
+    this._wbClampSeeded.delete(wbLineGuid);
+  }
+
+  _wbClampApply(wbItemNode, it) {
+    const wbLineGuid = it.lineGuid;
+    const container = wbItemNode.querySelector('.transclusion-container-div');
+    if (!container) { this._wbClampTeardown(wbLineGuid, wbItemNode); return; }
+    if (window.g_universe === null) return;
+    const uni = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    let homeRec = null;
+    if (this.data.getRecord(it.target)) homeRec = it.target;
+    else if (uni[it.target]?.rguid) homeRec = uni[it.target].rguid;
+    else {
+      const resolved = this._wbCtxResolveOwner(it.target, wbItemNode);
+      homeRec = resolved && resolved.ownerGuid;
+    }
+    if (!homeRec) return;
+
+    const clampDepth = this._wbItemClampDepth(it);
+    const lift = this._wbClampLift.get(wbLineGuid) || new Set();
+    const foreignLifted = lift.has('foreign');
+    let total = 0;
+    let foreign = 0;
+    let seededFolds = 0;
+    const foreignRecords = new Map();
+    const bodyLines = container.querySelectorAll('.listitem[data-guid]');
+    const cap = Math.min(bodyLines.length, 1500);
+    let seededNow = false;
+
+    if (clampDepth != null && !this._wbClampSeeded.has(wbLineGuid)) {
+      const isRecordTarget = !!this.data.getRecord(it.target);
+      const seedDepth = isRecordTarget ? clampDepth - 1 : clampDepth;
+      const seededKeys = new Set();
+      let focusPath = null;
+      if (it.focus) focusPath = new Set(this._wbCtxChain(it.focus).chain.map((a) => a.guid));
+      for (let i = 0; i < cap; i++) {
+        const li = bodyLines[i];
+        const bodyGuid = li.getAttribute('data-guid');
+        if (!bodyGuid || bodyGuid === it.target) continue;
+        if (focusPath && focusPath.has(bodyGuid)) continue;
+        let depth = 0;
+        let cur = li.parentElement;
+        while (cur && cur !== container) {
+          if (cur.classList && cur.classList.contains('listitem') && cur.getAttribute('data-guid')) depth++;
+          cur = cur.parentElement;
+        }
+        if (depth !== seedDepth) continue;
+        const uItem = uni[bodyGuid];
+        if (!uItem || !uItem.children || !uItem.children.length) continue;
+        const k = wbLineGuid + '>' + bodyGuid;
+        this._wbFolds.set(k, true);
+        seededKeys.add(k);
+        seededFolds++;
+        seededNow = true;
+      }
+      this._wbClampSeeded.set(wbLineGuid, seededKeys);
+    }
+
+    if (this._wbClampForeign) {
+      for (let i = 0; i < cap; i++) {
+        const li = bodyLines[i];
+        const guid = li.getAttribute('data-guid');
+        if (!guid) continue;
+        const tx = li.closest('.listitem-transclusion');
+        if (tx && tx !== wbItemNode) continue;
+        total++;
+        const rguid = uni[guid] && uni[guid].rguid;
+        const isForeign = !!(rguid && rguid !== homeRec);
+        if (isForeign) {
+          foreign++;
+          foreignRecords.set(rguid, (foreignRecords.get(rguid) || 0) + 1);
+        }
+        if (!foreignLifted) li.classList.toggle('refx-wb-foreignhide', isForeign);
+        else li.classList.remove('refx-wb-foreignhide');
+      }
+    } else {
+      for (let i = 0; i < cap; i++) bodyLines[i].classList.remove('refx-wb-foreignhide');
+      total = cap;
+    }
+
+    if (seededNow) this._wbFoldMount(wbItemNode, wbLineGuid);
+
+    let note = this._wbClampNotes.get(wbLineGuid);
+    const entries = [...foreignRecords.entries()].sort((a, b) => b[1] - a[1]);
+    if (!entries.length || foreignLifted) {
+      if (note) { try { note.remove(); } catch (e) {} this._wbClampNotes.delete(wbLineGuid); }
+    } else {
+      if (!note || !note.isConnected) {
+        note = this._el('div', 'refx-wb-clamp-note');
+        this._wbClampNotes.set(wbLineGuid, note);
+        try { wbItemNode.appendChild(note); } catch (e) {}
+      }
+      try { note.replaceChildren(); } catch (e) { while (note.firstChild) note.removeChild(note.firstChild); }
+      const show = entries.slice(0, 3);
+      const more = entries.length - show.length;
+      for (const [rguid, count] of show) {
+        const name = (this.data.getRecord(rguid) && this.data.getRecord(rguid).getName && this.data.getRecord(rguid).getName()) || rguid;
+        const btn = this._el('button', '', '▸ ' + count + ' lines from ' + name);
+        btn.type = 'button';
+        btn.addEventListener('mousedown', (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          const s = this._wbClampLift.get(wbLineGuid) || new Set();
+          s.add('foreign');
+          this._wbClampLift.set(wbLineGuid, s);
+          this._wbClampApply(wbItemNode, it);
+        });
+        note.append(btn);
+      }
+      if (more > 0) {
+        const btn = this._el('button', '', '+' + more + ' more');
+        btn.type = 'button';
+        btn.addEventListener('mousedown', (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          const s = this._wbClampLift.get(wbLineGuid) || new Set();
+          s.add('foreign');
+          this._wbClampLift.set(wbLineGuid, s);
+          this._wbClampApply(wbItemNode, it);
+        });
+        note.append(btn);
+      }
+    }
+
+    try {
+      const diag = window.__refxWbClampDiag || { at: Date.now(), items: [] };
+      diag.at = Date.now();
+      const row = { lineGuid: wbLineGuid, target: it.target, homeRec, total, foreign, seededFolds, foreignRecords: entries.map(([rguid, count]) => ({ rguid, count })) };
+      const idx = diag.items.findIndex((x) => x.lineGuid === wbLineGuid);
+      if (idx >= 0) diag.items[idx] = row; else diag.items.push(row);
+      window.__refxWbClampDiag = diag;
+    } catch (e) {}
   }
 
   // v3.55.0: mount/refresh fold twisties on the body lines of one WB item node.
@@ -43233,6 +46331,46 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if ((tries || 0) > 1) setTimeout(() => { if (!this._unloaded) this._wbResetPanelTitle(el, tries - 1); }, 150);
   }
 
+  _wbFclearCount() {
+    const c = this._wbFilterBar?.querySelector?.(".refx-wb-fcount");
+    if (!c) return 0;
+    const m = String(c.textContent || "").match(/^(\d+)/);
+    return m ? Number(m[1]) : 0;
+  }
+
+  _wbFclearDisarm(btn) {
+    if (this._wbFclearArmT) { try { clearTimeout(this._wbFclearArmT); } catch (e) {} this._wbFclearArmT = null; }
+    if (this._wbFclearDisarmDoc) {
+      const { esc, out } = this._wbFclearDisarmDoc;
+      try { document.removeEventListener("keydown", esc, true); } catch (e) {}
+      try { document.removeEventListener("mousedown", out, true); } catch (e) {}
+      this._wbFclearDisarmDoc = null;
+    }
+    if (btn) {
+      try { btn.removeAttribute("data-refx-armed"); } catch (e) {}
+      btn.textContent = "Clear all";
+    }
+  }
+
+  _wbFclearArm(btn) {
+    const n = this._wbFclearCount();
+    this._wbFclearDisarm(btn);
+    try { btn.setAttribute("data-refx-armed", "1"); } catch (e) {}
+    btn.textContent = "Clear " + n + "?";
+    const esc = (e) => {
+      if (e.key !== "Escape") return;
+      this._wbFclearDisarm(btn);
+    };
+    const out = (e) => {
+      if (btn.contains(e.target)) return;
+      this._wbFclearDisarm(btn);
+    };
+    this._wbFclearDisarmDoc = { esc, out };
+    document.addEventListener("keydown", esc, true);
+    document.addEventListener("mousedown", out, true);
+    this._wbFclearArmT = setTimeout(() => this._wbFclearDisarm(btn), 4000);
+  }
+
   // A slim sticky bar at the top of the live panel: count, filter box, clear-all.
   _wbLiveFilterBarEnsure(panelEl, items) {
     const scroller = panelEl.querySelector(".panel-scroller-y") || panelEl;
@@ -43242,12 +46380,25 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     }
     if (this._wbFilterBar) { try { this._wbFilterBar.remove(); } catch (e) {} }
     const bar = this._el("div", "refx-wb-filterbar");
+    try {
+      if (this._wbBootDiag && this._wbBootDiagOpenAt && this._wbBootDiag.chromeAt == null) {
+        this._wbBootDiag.chromeAt = performance.now() - this._wbBootDiagOpenAt;
+      }
+    } catch (e) {}
     bar.setAttribute("contenteditable", "false");
     bar.append(this._el("span", "refx-wb-fcount", items.length + " item" + (items.length === 1 ? "" : "s")));
     const input = this._el("input", "refx-wb-finput");
     input.type = "text"; input.placeholder = "Filter…"; input.value = this._wbLiveFilter || "";
     input.addEventListener("input", () => { this._wbLiveFilter = input.value; this._wbLiveApplyFilter(); });
-    input.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { input.value = ""; this._wbLiveFilter = ""; this._wbLiveApplyFilter(); } });
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        input.value = "";
+        this._wbLiveFilter = "";
+        this._wbLiveGuidFilter = null;
+        this._wbLiveApplyFilter();
+      }
+    });
     bar.append(input);
     const stackBtn = this._wbBtn("▤", "Workbench stacks", (e) => this._wbLiveStackMenu(e));
     stackBtn.classList.add("refx-wb-fstack");
@@ -43279,7 +46430,14 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     ], "manual", (m) => this._wbLiveSortNow(m)));
     sort.classList.add("refx-wb-fsort");
     bar.append(sort);
-    const clear = this._wbBtn("Clear all", "Remove every item from the Workbench", () => this._wbLiveClearAll());
+    const clear = this._wbBtn("Clear all", "Remove every item from the Workbench", () => {
+      if (clear.hasAttribute("data-refx-armed")) {
+        this._wbFclearDisarm(clear);
+        this._wbLiveClearAll();
+      } else {
+        this._wbFclearArm(clear);
+      }
+    });
     clear.classList.add("refx-wb-fclear");
     bar.append(clear);
     try { scroller.insertBefore(bar, scroller.firstChild); } catch (e) { try { scroller.appendChild(bar); } catch (e2) {} }
@@ -43292,17 +46450,33 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (!panelEl) return;
     const q = (this._wbLiveFilter || "").trim();
     const plan = q ? this._searchPlan(q) : null;
+    const guidFilter = this._wbLiveGuidFilter;
     for (const [lg, h] of this._wbHeaders) {
       const node = panelEl.querySelector('.listitem-transclusion[data-guid="' + lg + '"]');
       if (!node) continue;
-      if (!q) { node.classList.remove("refx-wb-filtered"); continue; }
-      if (!h.el._refxFilterKey) {
-        const title = (h.el.querySelector('.refx-wb-hdr-title')?.textContent || '').trim();
-        h.el._refxFilterKey = title ? this._searchKey(title) : null;
+      let hide = false;
+      if (guidFilter && guidFilter.size) hide = !guidFilter.has(lg);
+      if (!hide && q) {
+        if (!h.el._refxFilterKey) {
+          const title = (h.el.querySelector('.refx-wb-hdr-title')?.textContent || '').trim();
+          h.el._refxFilterKey = title ? this._searchKey(title) : null;
+        }
+        const hit = h.el._refxFilterKey && plan
+          && this._searchMatchFromKey(h.el._refxFilterKey, plan, { strict: false }).score >= 0;
+        hide = !hit;
       }
-      const hit = h.el._refxFilterKey && plan
-        && this._searchMatchFromKey(h.el._refxFilterKey, plan, { strict: false }).score >= 0;
-      node.classList.toggle("refx-wb-filtered", !hit);
+      node.classList.toggle("refx-wb-filtered", hide);
+    }
+    for (const [lg, hdr] of this._wbHeaders) {
+      if (!hdr?.ctx) continue;
+      for (const pill of hdr.ctx.querySelectorAll(".refx-wb-ctx-pill")) {
+        const annot = this._wbCtxGroupAnnot?.get?.(String(lg)) || null;
+        const active = annot?.pill?.members
+          && guidFilter
+          && annot.pill.members.length === guidFilter.size
+          && annot.pill.members.every((g) => guidFilter.has(g));
+        pill.classList.toggle("is-active", !!active);
+      }
     }
   }
 
@@ -43874,8 +47048,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     const targets = [];
     for (const lineEl of lineEls) {
       if (!lineEl.isConnected || !lineEl.offsetParent) continue;
-      if (lineEl.closest('.listitem-transclusion')) continue;
-      if (lineEl.closest('.refx-inline-refs, .refx-propcard, .trc-ref-popover')) continue;
+      if (!this._targetBadgeAllowedHost(lineEl)) continue;
       const guid = (lineEl.getAttribute('data-guid') || '').trim();
       if (!this.looksLikeGuid(guid)) continue;
       if (!this._lineHasMeaningfulContent(lineEl, guid)) {
@@ -45553,8 +48726,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     for (const lineEl of nodes) {
       if (lines.length >= this._targetBadgeMaxLines) break;
       if (!lineEl.offsetParent) continue; // hidden (collapsed) lines
-      if (lineEl.closest('.listitem-transclusion')) continue; // never inside embeds
-      if (lineEl.closest('.refx-inline-refs, .refx-propcard, .trc-ref-popover')) continue; // our decorator DOM
+      if (!this._targetBadgeAllowedHost(lineEl)) continue;
       const guid = (lineEl.getAttribute('data-guid') || '').trim();
       if (!this.looksLikeGuid(guid)) continue;
       // Seed EMPTY lines too. collectReferenceTargets only sees lines that
@@ -45753,6 +48925,13 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
   // last glyph of the shrink-wrapped `.line-div`.
   resolveTargetCountHost(lineEl) {
     return lineEl || null;
+  }
+
+  _targetBadgeAllowedHost(lineEl) {
+    if (lineEl.closest('.refx-inline-refs, .refx-propcard, .trc-ref-popover')) return false;
+    const tx = lineEl.closest('.listitem-transclusion');
+    if (!tx) return true;
+    return !!(this._wbBadgesInItems && tx.closest('.refx-wb-item'));
   }
 
   upsertTargetBadge(lineEl, guid, info) {
@@ -48819,6 +51998,120 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     await Promise.all(Array.from({ length: Math.min(lim, arr.length) }, worker));
   }
 
+  _refNestCountRequest(guid, anchorEl) {
+    if (!guid) return Promise.resolve(null);
+    if (!this._refNestCountJobs) this._refNestCountJobs = new Map();
+    if (!this._refNestCountQueue) this._refNestCountQueue = [];
+    let job = this._refNestCountJobs.get(guid);
+    if (job) {
+      if (anchorEl) job.waiters.add(anchorEl);
+      return job.promise;
+    }
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    job = { promise, resolve, waiters: new Set(anchorEl ? [anchorEl] : []), started: false };
+    this._refNestCountJobs.set(guid, job);
+    this._refNestCountQueue.push(guid);
+    const pump = () => {
+      while (this._refNestCountInFlight < 4 && this._refNestCountQueue.length) {
+        const g = this._refNestCountQueue.shift();
+        const j = this._refNestCountJobs.get(g);
+        if (!j) continue;
+        let hasWaiter = false;
+        for (const w of j.waiters) {
+          if (w && w.isConnected !== false) { hasWaiter = true; break; }
+        }
+        if (!hasWaiter) {
+          this._refNestCountJobs.delete(g);
+          j.resolve(null);
+          continue;
+        }
+        j.started = true;
+        this._refNestCountInFlight++;
+        this.getCountInfoForGuid(g).then(
+          (info) => j.resolve(info),
+          () => j.resolve(null)
+        ).finally(() => {
+          this._refNestCountInFlight--;
+          this._refNestCountJobs.delete(g);
+          pump();
+        });
+      }
+    };
+    pump();
+    return promise;
+  }
+
+  _refNestCountQueueReveal(el, count, kind) {
+    if (!this._refNestRevealPending) this._refNestRevealPending = new Map();
+    this._refNestRevealPending.set(el, { count, kind });
+    if (this._refNestRevealRaf) return;
+    const flush = () => {
+      this._refNestRevealRaf = 0;
+      let n = 0;
+      for (const [target, data] of this._refNestRevealPending) {
+        if (n >= 100) break;
+        this._refNestRevealPending.delete(target);
+        n++;
+        if (target.isConnected === false) continue;
+        this._refNestCountWrite(target, data.count, data.kind);
+      }
+      if (this._refNestRevealPending.size) {
+        this._refNestRevealRaf = requestAnimationFrame(flush);
+      }
+    };
+    this._refNestRevealRaf = requestAnimationFrame(flush);
+  }
+
+  _refNestCountWrite(el, count, kind) {
+    if (!el) return;
+    if (count > 0) {
+      const v = String(count);
+      if (el.getAttribute('data-count') !== v) {
+        el.setAttribute('data-count', v);
+        const label = count + (count === 1 ? ' reference' : ' references') + (kind === 'line' ? ' to this line' : ' to this reference');
+        el.setAttribute('aria-label', label);
+        el.setAttribute('title', label);
+      }
+    } else if (el.getAttribute('data-count') != null) {
+      el.removeAttribute('data-count');
+    }
+  }
+
+  _refCountWhenNearViewport(el, run, { fallbackRun = false } = {}) {
+    if (!el || typeof run !== 'function') return;
+    if (!this._refCountViewportPending) this._refCountViewportPending = new Map();
+    if (typeof IntersectionObserver !== 'function') {
+      if (fallbackRun) run();
+      return;
+    }
+    let obs = this._refCountViewportObserverInstance;
+    if (!obs) {
+      try {
+        obs = new IntersectionObserver((entries) => {
+          for (const entry of entries || []) {
+            if (!entry || entry.isIntersecting !== true) continue;
+            const target = entry.target;
+            const fn = this._refCountViewportPending.get(target);
+            if (!fn) continue;
+            try { obs.unobserve(target); } catch (e) {}
+            this._refCountViewportPending.delete(target);
+            try { fn(); } catch (e) {}
+          }
+        }, { rootMargin: '240px 0px', threshold: 0.01 });
+        this._refCountViewportObserverInstance = obs;
+      } catch (e) {
+        if (fallbackRun) run();
+        return;
+      }
+    }
+    this._refCountViewportPending.set(el, run);
+    try { obs.observe(el); } catch (e) {
+      this._refCountViewportPending.delete(el);
+      if (fallbackRun) run();
+    }
+  }
+
   getCachedCountInfo(guid) {
     const entry = this._countCache.get(guid) || null;
     if (!entry || typeof entry.count !== 'number') return null;
@@ -50191,7 +53484,7 @@ body.refx-cv-transclusions .listitem-transclusion .transclusion-container-div:ha
     if (!this._targetLineBadges) return;
     for (const lineEl of document.querySelectorAll('.listitem[data-guid="' + esc + '"]')) {
       if (!lineEl.isConnected || !lineEl.offsetParent) continue;
-      if (lineEl.closest('.listitem-transclusion, .refx-inline-refs, .refx-propcard, .trc-ref-popover')) continue;
+      if (!this._targetBadgeAllowedHost(lineEl)) continue;
       if (!show || info.count <= 0) this.removeTargetBadgeFromLine(lineEl);
       else this.upsertTargetBadge(lineEl, guid, info);
     }
