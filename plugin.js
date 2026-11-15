@@ -123,42 +123,30 @@ class Plugin extends AppPlugin {
   // wired via _wireEmbedBodyClick; the observer re-marks after a re-render.
   _lineEmbeds = new Map();
   _lineRaf = 0;
-  _themeObs = null; // re-copies card colours on data-theme change
-  _blobUrls = new Map(); // file-prop blob guid -> {url} (object URLs, revoked on unload)
+  // PAGE EMBEDS (2026-11-02): a page reference expanded on the desktop shows the REAL page panel
+  // (Thymer's own properties + body) inside our transclusion line, instead of a homemade card.
+  // embedLineGuid -> {recordGuid, panel, slot, ready}. See "page embeds: the real page panel".
+  _pageEmbeds = new Map();
+  _pePark = null;
+  _peWatchT = 0;
+  _peCreating = null; // the last attach in flight (they are chained, see _peAttach)
+  _pePool = [];       // idle borrowed panels {panel, slot}, parked, reused by the next expand
+  _peHide = new Map(); // embed lineGuid -> 0 (open/opening) or the time its hiding may end (closing)
+  _peHideT = 0;
+  _PE_POOL = 3;
+  _PE_CAP = 6; // panels Thymer allows are limited (it warns at 10); beyond this the native body shows
   _cardObs = null;
   _cardObsTarget = null;
-  _cardEditing = false;
-  _cardRaf = 0;
-  _cardPopup = null;
   _navHandler = null;
   _recUpdHandler = null;
   _discoverT = 0; // debounce timer for re-discovering embeds (focus / remote edits)
   _discoverRefresh = false; // latched: the pending discovery should also refresh present cards
-  _discoverPending = null; // discovery deferred while an editor is open (flushed on close, no timer loop)
   _fieldTypes = null; // lazy {fieldId -> PROP_TYPE} from all collections' config fields (schema-based kind detection)
   _fieldMeta = null;  // fieldId -> {type, filter_colguid} (relation target collection)
   _colByGuid = null;  // collection guid -> PluginCollectionAPI
   _fieldTypesRebuildT = 0; // debounced schema-map self-heal when an unknown declared field is seen
-  // lineGuid -> refcount of in-flight commit polls that own that card's refresh
-  // (a COUNTING map, not a Set: overlapping commits on two fields of one card must
-  // not release ownership when the first poll completes).
-  _commitInFlight = new Map();
-  _activeEdit = null; // {lineGuid, cancel} of the open inline text/number editor (so teardown paths can close it — removing a focused <input> fires no blur in Chromium)
-  _rowRefreshT = new Map(); // lineGuid -> timer: coalesces record.updated bursts into one in-place refresh
   _rehydrateT = 0; // the load-time retry timer (cleared on unload so a late retry can't resurrect a dead instance)
   _unloaded = false;
-  // Keyboard nav of the property card: a CLASS-based cursor (refx-nav-focus) over
-  // the card's value cells, driven by a window-capture handler — mirrors Thymer's
-  // native title→properties arrow-nav (injected DOM can't hold real focus, but a
-  // class cursor + our own keydown handler can). _cardNav = {lineGuid, recordGuid,
-  // index}; the DOM class is the source of truth for WHICH cell, so it survives a
-  // card re-injection (never store element refs).
-  _cardNav = null;
-  // When an edit is opened from nav, we stash {lineGuid, recordGuid, index} so the
-  // cursor is re-established on the same cell after the edit's card re-render (the
-  // edit swaps the value cell for an input / rebuilds the card, which would drop
-  // the class cursor). Robust to _cardNav being cleared mid-edit by DOM churn.
-  _cardNavResume = null;
   _isMac = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "");
   _STYLE_ID = "refalias-style";
   // Line DESCRIPTIONS: a subtitle under a line, stored as the line's own meta
@@ -207,15 +195,7 @@ class Plugin extends AppPlugin {
   _descLastDown = null;    // first press of a possible double-click on a description
   _descSwallowUntil = 0;   // eat the rest of that pointer sequence
   _DESC_NATIVE_KEY = "refx-desc-native";
-  _CARD_CLASS = "refx-propcard";
   _CARD_SKIP = new Set(["Created", "Modified", "Banner", "Icon", "Scene", "Canvas Text", "Assets", "Assets 2", "Assets 3", "Assets 4", "Scene Rev", "Scene Schema", "Source Note", "Chunks", "Manifest"]);
-
-  // The one always-on listener (capture phase). Cheap-first guards reject the
-  // Commit-ownership refcounting (see _commitInFlight): claim before a write,
-  // release when its poll settles; owned() gates every competing refresh path.
-  _commitClaim(g) { this._commitInFlight.set(g, (this._commitInFlight.get(g) || 0) + 1); }
-  _commitRelease(g) { const n = (this._commitInFlight.get(g) || 0) - 1; if (n > 0) this._commitInFlight.set(g, n); else this._commitInFlight.delete(g); }
-  _commitOwned(g) { return (this._commitInFlight.get(g) || 0) > 0; }
 
   // vast majority of keystrokes (plain typing) before doing anything else.
   _handleKeydown = (e) => {
@@ -308,8 +288,6 @@ class Plugin extends AppPlugin {
     const isDown = e.key === "ArrowDown", isUp = e.key === "ArrowUp";
     if (!isDown && !isUp) return;
     if (this._modal || this._link) return;
-    this._healWedgedEditing(); // an orphaned editor flag would brick all expand/collapse
-    if (this._cardEditing) return; // never collapse/expand under an open editor
     const hit = this._detect();
     if (!hit) return;
     // THE KEYBOARD BELONGS TO THE FOCUSED PANEL. _detect() falls back to any
@@ -353,26 +331,6 @@ class Plugin extends AppPlugin {
     this._expandRef(hit, ref);
   };
 
-  // Plain ArrowDown on a record reference whose embed is open steps the keyboard
-  // "nav cursor" into that embed's property card (like native title→properties).
-  // Cheap-first guards keep ordinary arrowing untouched — we only intercept when a
-  // record reference is selected AND it has an open card with at least one cell.
-  _handleCardNavTrigger = (e) => {
-    if (e.key !== "ArrowDown") return;
-    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-    if (this._cardNav || this._cardEditing || this._modal || this._link) return;
-    if (!this._cards.size) return;
-    const hit = this._detect();
-    if (!hit) return;
-    const ref = this._selectedRef(hit);
-    if (!ref || ref.isText) return;              // only record refs have a card
-    const lineGuid = this._openEmbedForRef(hit, ref.targetGuid);
-    if (!lineGuid) return;                        // no open embed under this ref
-    if (!this._cardNavItems(lineGuid).length) return;
-    e.preventDefault(); e.stopImmediatePropagation();
-    this._enterCardNav(lineGuid, ref.targetGuid, 0);
-  };
-
   // The property card is decorator DOM (not part of the synced document), so it
   // only exists on clients that have DISCOVERED the embed. Switching to an already-
   // open client, or a multiplayer edit, doesn't fire panel.navigated — so re-run
@@ -380,13 +338,17 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.4.1"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.5.0-dev"; } catch (e) {} // live-version tell for debugging
     // Build tag, bumped on every dev deploy: the app can serve a STALE plugin
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.4.1-release"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0-dev.1"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
+    // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
+    // running instance and not only the store.
+    try { window.__refxGen = (window.__refxGen || 0) + 1; } catch (e) {}
+    this._peCloseOrphans();
     this._injectStyle();
     // Restore the cached native indent-line geometry before the first paint, so a
     // page with no undescribed parent still lands on real measurements.
@@ -396,7 +358,6 @@ class Plugin extends AppPlugin {
       if (v && isFinite(v.above) && isFinite(v.below)) this._descNative = v;
     } catch (e) {}
     this._rebuildDescCSS(); // line descriptions: paint before the first frame
-    this._ensureThemeObserver();
     this._buildFieldTypes(); // async; schema-based property typing (empty fields)
 
     this._cmd = this.ui.addCommandPaletteCommand({
@@ -440,15 +401,15 @@ class Plugin extends AppPlugin {
     window.addEventListener("keydown", this._handleKeydown, true);
     window.addEventListener("keydown", this._handleBracketKey, true);
     window.addEventListener("keydown", this._handleExpandKey, true);
-    window.addEventListener("keydown", this._handleCardNavTrigger, true);
     window.addEventListener("keydown", this._handleConvertKey, true);
+    window.addEventListener("keydown", this._peKey, true);
     for (const t of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) window.addEventListener(t, this._handleDescPointer, true);
     window.__refxDescDbl = this._handleDescPointer; // hot-reload stash
     // Window-singleton stash of the always-on handlers: a hot-reload re-runs onLoad
     // on the SAME document without disposing the prior instance, so without this
     // every update stacks another copy of all four capture listeners (and the old
     // ones' stopImmediatePropagation can starve the live instance).
-    window.__refxKeyHandlers = [this._handleKeydown, this._handleBracketKey, this._handleExpandKey, this._handleCardNavTrigger, this._handleConvertKey];
+    window.__refxKeyHandlers = [this._handleKeydown, this._handleBracketKey, this._handleExpandKey, this._handleConvertKey, this._peKey];
 
     // Embeds persist across reload, so re-discover the record embeds on the
     // active page and (re)attach their property cards; repeat on navigation.
@@ -474,27 +435,13 @@ class Plugin extends AppPlugin {
     // Descriptions can change on another client (or on a page that just loaded
     // its lines) — a debounced stylesheet rebuild is the whole keep-alive.
     this._scheduleDescCSS();
-    // Refresh any open cards for the changed record IN PLACE (its title/props
-    // changed) — no teardown, so a local edit (which fires record.updated too) or a
-    // remote change doesn't flicker the card. COALESCED per lineGuid: typing in an
-    // embed body streams record.updated per keystroke, and an undebounced refresh
-    // would re-read all properties every keypress.
+    // An embedded page that changed needs nothing from us: its panel is Thymer's own and live.
     let tracked = false;
-    if (g && this._cards.size) {
-      for (const [lineGuid, e] of this._cards) {
-        if (e.recordGuid !== g) continue;
-        tracked = true;
-        if (this._rowRefreshT.has(lineGuid)) continue;
-        this._rowRefreshT.set(lineGuid, setTimeout(() => {
-          this._rowRefreshT.delete(lineGuid);
-          if (this._cards.has(lineGuid)) this._refreshCardInPlace(lineGuid, g);
-        }, 150));
-      }
-    }
+    if (g && this._cards.size) for (const e of this._cards.values()) if (e.recordGuid === g) { tracked = true; break; }
     // A remote/multiplayer edit may have ADDED or removed an embed on the page
-    // we're viewing — re-discover (debounced) so its card appears/clears without a
-    // navigation. Skip when the update is for a record we already track (the
-    // targeted refresh above handled it — no structural change implied).
+    // we're viewing — re-discover (debounced) so it appears/clears without a
+    // navigation. Skip when the update is for a page we already embed (typing in an
+    // embedded body streams record.updated per keystroke; no structural change implied).
     if (!tracked) this._scheduleDiscover(false);
   }
 
@@ -509,15 +456,6 @@ class Plugin extends AppPlugin {
     this._discoverT = setTimeout(() => { this._discoverT = 0; const rp = this._discoverRefresh; this._discoverRefresh = false; this._discover(rp); }, 400);
   }
 
-  // Discovery deferred while an editor was open gets flushed by the editor's own
-  // close paths (no self-rescheduling timer loop while a popup sits open).
-  _flushDeferredDiscover() {
-    if (this._discoverPending == null) return;
-    const rp = !!this._discoverPending;
-    this._discoverPending = null;
-    this._scheduleDiscover(rp);
-  }
-
   onUnload() {
     // Mark dead FIRST: in-flight async continuations (_discover awaits, the
     // _rehydrate retry, _attachPropCard record polls) all bail on this flag /
@@ -529,31 +467,24 @@ class Plugin extends AppPlugin {
     // onLoad never ran — the snippet guards that itself.
     try { refxVoUnregister(REFX_VO_ID); } catch (e) {}
     if (this._rehydrateT) { try { clearTimeout(this._rehydrateT); } catch (e) {} this._rehydrateT = 0; }
-    if (this._activeEdit) { try { this._activeEdit.cancel(); } catch (e) {} this._activeEdit = null; }
-    for (const t of this._rowRefreshT.values()) { try { clearTimeout(t); } catch (e) {} }
-    this._rowRefreshT.clear();
     this._cards.clear();
     this._queryEmbeds.clear();
     if (this._queryRaf) { try { cancelAnimationFrame(this._queryRaf); } catch (e) {} this._queryRaf = 0; }
-    if (this._themeObs) { try { this._themeObs.disconnect(); } catch (e) {} this._themeObs = null; }
-    for (const b of this._blobUrls.values()) { try { if (b.url) URL.revokeObjectURL(b.url); } catch (e) {} }
-    this._blobUrls.clear();
-    if (window.__refxThemeObs) { try { window.__refxThemeObs.disconnect(); } catch (e) {} window.__refxThemeObs = null; }
     window.removeEventListener("keydown", this._handleKeydown, true);
     window.removeEventListener("keydown", this._handleBracketKey, true);
     window.removeEventListener("keydown", this._handleExpandKey, true);
-    window.removeEventListener("keydown", this._handleCardNavTrigger, true);
     window.removeEventListener("keydown", this._handleConvertKey, true);
+    window.removeEventListener("keydown", this._peKey, true);
     try { for (const t of ["pointerdown", "mousedown", "mouseup", "click", "dblclick"]) window.removeEventListener(t, this._handleDescPointer, true); } catch (e) {}
     window.__refxDescDbl = null;
     window.__refxKeyHandlers = null;
-    this._exitCardNav();
     try { document.removeEventListener("visibilitychange", this._discoverTrigger, false); } catch (e) {}
     try { window.removeEventListener("focus", this._discoverTrigger, false); } catch (e) {}
     window.__refxDiscoverTrigger = null;
     if (this._discoverT) { try { clearTimeout(this._discoverT); } catch (e) {} this._discoverT = 0; }
     // Embeds are real document lines and intentionally PERSIST — only tear down
-    // the plugin's own UI (observer + injected cards), never the embeds.
+    // the plugin's own UI (observer + injected cards + borrowed page panels), never the embeds.
+    this._peCloseAll();
     this._teardownCardObserver();
     if (this._navHandler) { try { this.events.off(this._navHandler); } catch (e) {} this._navHandler = null; }
     if (this._recUpdHandler) { try { this.events.off(this._recUpdHandler); } catch (e) {} this._recUpdHandler = null; }
@@ -1651,6 +1582,7 @@ class Plugin extends AppPlugin {
       try { if (!(line.props && line.props.itemref)) line.setMetaProperty("itemref", ref.targetGuid); } catch (e) {}
       // Record (page) reference → show its properties as an editable card.
       if (!ref.isText) {
+        if (this._peOn()) this._peHideOn(line.guid); // before its first paint: never Thymer's own body
         this._cards.set(line.guid, { recordGuid: ref.targetGuid, line });
         this._ensureCardObserver();
         this._attachPropCard(line.guid, ref.targetGuid);
@@ -1709,6 +1641,7 @@ class Plugin extends AppPlugin {
       // A search can return PAGES too — then the "line" IS a record, and the
       // embed gets the editable property card like any page embed.
       if (this.data.getRecord(targetGuid)) {
+        if (this._peOn()) this._peHideOn(line.guid);
         this._cards.set(line.guid, { recordGuid: targetGuid, line });
         this._attachPropCard(line.guid, targetGuid);
       }
@@ -1901,25 +1834,6 @@ class Plugin extends AppPlugin {
     return null;
   }
 
-  // The lineGuid of an OPEN card-bearing embed for `targetGuid` under the caret's
-  // block. DOM-synchronous (the keydown handler must decide instantly). The embed
-  // line is a child of the ref's block, so it's a descendant of the caret line's
-  // node; fall back to any tracked embed for the record with a live rendered node.
-  _openEmbedForRef(hit, targetGuid) {
-    const scope = hit && hit.lineNode;
-    if (scope && scope.querySelectorAll) {
-      let nodes = [];
-      try { nodes = [...scope.querySelectorAll(".listitem-transclusion[data-guid]")]; } catch (e) {}
-      for (const n of nodes) {
-        const g = n.getAttribute && n.getAttribute("data-guid");
-        const entry = g && this._cards.get(g);
-        if (entry && entry.recordGuid === targetGuid) return g;
-      }
-    }
-    for (const [g, entry] of this._cards) if (entry.recordGuid === targetGuid && this._transclusionNode(g)) return g;
-    return null;
-  }
-
   // Sync (keydown-time) test: does the caret's LINE have any of our embeds
   // open under it? Line-level on purpose: on a multi-ref line the "selected"
   // ref is a nearest-guess, and gating per target let Cmd+Up fall through to
@@ -1972,7 +1886,7 @@ class Plugin extends AppPlugin {
     try {
       const n = hit.lineNode || hit.anchorNode;
       if (!n || !n.closest) return false;
-      if (n.closest("." + this._CARD_CLASS)) return true;
+      if (n.closest(".panel.refx-pemb")) return true;
       const li = n.closest(".listitem");
       if (li) { const g = li.getAttribute && li.getAttribute("data-guid"); if (g && this._cards.has(g)) return true; }
       return !!n.closest(".listitem-transclusion, .lineitem-transcludes, [data-itemref]");
@@ -2015,14 +1929,10 @@ class Plugin extends AppPlugin {
   async _deleteEmbedLine(line) {
     if (!line) return;
     const g = line.guid;
-    // Close any editor tied to this card first — removing a focused <input> fires
-    // no blur in Chromium, which would leave _cardEditing wedged true.
-    if (this._activeEdit && this._activeEdit.lineGuid === g) { try { this._activeEdit.cancel(); } catch (e) {} this._activeEdit = null; }
     const savedEntry = this._cards.get(g) || null;
     this._cards.delete(g);
     this._queryEmbeds.delete(g);
     this._lineEmbeds.delete(g);
-    if (this._cardNav && this._cardNav.lineGuid === g) this._exitCardNav();
     this._removeCardEl(g);
     try {
       let ok = await line.delete();
@@ -2055,6 +1965,535 @@ class Plugin extends AppPlugin {
     try { const p = this.ui.getActivePanel && this.ui.getActivePanel(); return (p && p.getActiveRecord && p.getActiveRecord()) || null; } catch (e) { return null; }
   }
 
+  // ------------------------------------------------ page embeds: the real page panel
+  //
+  // A page reference expanded on the desktop shows THYMER'S OWN page panel (its properties and its
+  // body, editable, exactly as on the page) inside our transclusion line. The line stays the data:
+  // synced, undoable, and on the phone (one panel at a time, so nothing to borrow) or without this
+  // plugin it renders as Thymer's native transclusion, the body only.
+  // The machinery is Storyroom's and Timer's (playbook §7, "The real editor"): borrow a panel with
+  // ui.createPanel, keep it out of the grid (park, grid columns put back), navigate it to the page,
+  // move its .panel into the row, hide its chrome (tab bar, banner, title, backlinks) by CSS.
+  // Proven in his app on 2026-11-02 (prototype, his OK): it grows with its content, scrolls with the
+  // document, and survives Thymer rebuilding the row (the observer puts it back before the paint).
+  // Two looks, after Tana: a line that is ONLY the reference unfolds in place without a frame
+  // ("line"); a reference inside text opens a framed box under its line ("box").
+
+  _peOn() {
+    if (document.documentElement.getAttribute("data-mobile-type") === "phone") return false;
+    return !!(this.ui && this.ui.createPanel);
+  }
+  // Shared with Storyroom and Timer: a panel in this set is someone's embedded editor.
+  _peClaims() { return (window.__thymerPanelClaims = window.__thymerPanelClaims || new Set()); }
+  _pePid(p) { try { return p.getId(); } catch (e) { return null; } }
+  _peWs() { return (window.g_universe && window.g_universe.workspaceGuid) || null; }
+  _peNav(root) { return { type: "edit_panel", rootId: root, subId: null, workspaceGuid: this._peWs(), state: { positions: [root, "empty-" + root, 0, "L"], refxEmbed: 1 } }; }
+  // createPanel adds a real column to the grid and closePanel recomputes it: put his columns back
+  // after either, or a blank split appears beside his page.
+  _peGridCols() { const g = document.querySelector(".panels-grid"); return g ? g.style.gridTemplateColumns : null; }
+  _peGridRestore(cols) {
+    const g = document.querySelector(".panels-grid");
+    if (g && cols != null && g.style.gridTemplateColumns !== cols) g.style.gridTemplateColumns = cols;
+    this._peNormaliseGrid();
+  }
+  // The template must have exactly one track per panel really IN the grid (Timer's rule): a
+  // borrowed panel that left the grid once left a blank second column beside his page. Only a
+  // MISMATCH is corrected, so widths he dragged himself are kept.
+  _peNormaliseGrid() {
+    try {
+      const g = document.querySelector(".panels-grid");
+      if (!g) return;
+      const n = [...g.children].filter((c) => c.classList && c.classList.contains("panel")).length;
+      const cur = g.style.gridTemplateColumns || "";
+      if (!n || !cur) return;
+      if (cur.split("var(--panel-sizer-width)").length !== n) {
+        const a = []; for (let i = 0; i < n; i++) a.push("1fr");
+        g.style.gridTemplateColumns = a.join(" var(--panel-sizer-width) ");
+      }
+    } catch (e) {}
+  }
+  // A panel loads, and waits for its row, here: clipped but laid out (an unlaid-out editor
+  // renders no lines), and still in the document (a detached panel may be closed by the app).
+  _peParkEl() {
+    let p = this._pePark;
+    if (!p || !p.isConnected) {
+      p = document.querySelector(".refx-pe-park") || this._el("div", "refx-pe-park");
+      if (!p.isConnected) document.body.appendChild(p);
+      this._pePark = p;
+    }
+    return p;
+  }
+  // Thymer's "open in the other panel" must never pick a borrowed panel (Storyroom's flag + patch).
+  _peGuardTargeting(panel) {
+    try {
+      const inner = panel && panel._getPanel ? panel._getPanel() : null;
+      if (!inner) return;
+      inner.srEmbedded = true;
+      const layout = inner.getParentLayout ? inner.getParentLayout() : null;
+      const proto = layout ? Object.getPrototypeOf(layout) : null;
+      if (!proto || proto.__srTargetGuard) return;
+      const orig = proto.isExcludedFromTargeting;
+      if (typeof orig !== "function") return;
+      proto.isExcludedFromTargeting = function (pn) { try { if (pn && pn.srEmbedded) return true; } catch (e) {} return orig.call(this, pn); };
+      proto.__srTargetGuard = true;
+    } catch (e) {}
+  }
+
+  // ONE panel opens at a time, from createPanel until its navigation has landed: two embeds opened
+  // together were handed the SAME panel, and a panel created while the previous one was still
+  // navigating left that one empty for good (both seen 2026-11-02). So attaches are chained.
+  _peAttach(lineGuid, recordGuid) {
+    const prev = this._peCreating || Promise.resolve();
+    const run = prev.catch(() => {}).then(() => this._peAttachInner(lineGuid, recordGuid)).then((ok) => {
+      // not ours after all (cap reached, collapsed meanwhile): let Thymer's own body show again
+      if (!ok && !this._pageEmbeds.has(lineGuid)) this._peHideOff(lineGuid);
+      return ok;
+    });
+    this._peCreating = run.catch(() => {});
+    return run;
+  }
+
+  async _peAttachInner(lineGuid, recordGuid) {
+    if (this._unloaded || !this._peOn()) return false;
+    let e = this._pageEmbeds.get(lineGuid);
+    if (e) {
+      if (e.recordGuid === recordGuid) { this._pePlace(lineGuid); return true; }
+      this._peClose(lineGuid);
+    }
+    if (!this._cards.has(lineGuid)) return false; // collapsed while it waited its turn
+    if (this._pageEmbeds.size >= this._PE_CAP) return false;
+    e = { recordGuid, panel: null, slot: null, ready: false };
+    this._pageEmbeds.set(lineGuid, e);
+    this._peHideOn(lineGuid);
+    const mine = () => !this._unloaded && this._pageEmbeds.get(lineGuid) === e;
+    // give the panel back exactly once: through _peClose while the entry is still ours
+    const drop = () => { if (this._pageEmbeds.get(lineGuid) === e) this._peClose(lineGuid, e); else this._peDispose(e); };
+    const cols = this._peGridCols();
+    // an idle panel from the pool first (no createPanel, no grid churn at all)
+    let panel = null, slot = null;
+    while (!panel && this._pePool.length) {
+      const idle = this._pePool.shift();
+      if (this._peAlive(idle.panel) && idle.slot) { panel = idle.panel; slot = idle.slot; }
+      else this._peDispose(idle, true);
+    }
+    // A fresh createPanel writes a split template and puts the new panel in the grid (his page went
+    // to a third of its width for ~7 ms, measured). Timer's guard: while mounting, every panel that
+    // was already there is marked to stay, any other is taken out of the grid by CSS, and his
+    // columns are held.
+    const unmount = panel ? null : this._peMountGuard(cols);
+    // refuse a panel someone already claimed (Timer's rule: createPanel can hand out one in use)
+    for (let t = 0; t < 5 && !panel && mine(); t++) {
+      let got = null;
+      try { got = await this.ui.createPanel(); } catch (err) {}
+      if (!got) break;
+      const id = this._pePid(got);
+      if (id && this._peClaims().has(id)) { await new Promise((r) => setTimeout(r, 220)); continue; }
+      panel = got;
+    }
+    if (panel) { e.panel = panel; this._peClaims().add(this._pePid(panel)); this._peGuardTargeting(panel); }
+    if (!panel || !mine()) { if (unmount) unmount(); if (panel) e.slot = slot; drop(); this._peGridRestore(cols); return false; }
+    for (let i = 0; i < 40 && !slot; i++) {
+      try { const el = panel.getElement(); slot = el && el.closest ? el.closest(".panel") : null; } catch (err) {}
+      if (!slot) await new Promise((r) => setTimeout(r, 25));
+    }
+    if (!slot || !mine()) { if (unmount) unmount(); drop(); this._peGridRestore(cols); return false; }
+    e.slot = slot;
+    slot.classList.add("refx-pemb");
+    slot.style.clipPath = "inset(100%)";
+    this._peParkEl().appendChild(slot);
+    if (unmount) unmount();
+    this._peGridRestore(cols);
+    // poll the NAVIGATION, never "has any line": a fresh panel shows its default page first.
+    // Re-issued every second in case one does not land.
+    let ok = false;
+    for (let i = 0; i < 100 && !ok; i++) {
+      if (i % 20 === 0) { try { Promise.resolve(panel.navigateTo(this._peNav(recordGuid))).catch(() => {}); } catch (err) {} }
+      await new Promise((r) => setTimeout(r, 50));
+      if (!mine()) return false;
+      let nv = null; try { nv = panel.getNavigation(); } catch (err) {}
+      ok = !!(nv && nv.rootId === recordGuid && slot.querySelector(".page-props-editor-container, .listview-items"));
+    }
+    this._peGridRestore(cols);
+    if (!ok) { this._peClose(lineGuid); return false; }
+    e.ready = true;
+    this._pePlace(lineGuid);
+    this._peEnsureWatch();
+    return true;
+  }
+
+  // Into its row when the row is rendered, else back to the park.
+  _pePlace(lineGuid) {
+    const e = this._pageEmbeds.get(lineGuid);
+    if (!e || !e.slot) return;
+    const host = e.ready ? this._transclusionNode(lineGuid) : null;
+    if (!host || !host.classList.contains("listitem-transclusion")) {
+      const park = this._peParkEl();
+      if (e.slot.parentNode !== park) { e.slot.style.clipPath = "inset(100%)"; park.appendChild(e.slot); }
+      return;
+    }
+    if (!host.classList.contains("refx-pemb-host")) host.classList.add("refx-pemb-host");
+    const mode = this._peMode(lineGuid);
+    if (e.slot.dataset.mode !== mode) e.slot.dataset.mode = mode;
+    if (e.slot.parentNode !== host) host.appendChild(e.slot);
+    if (e.slot.style.clipPath) e.slot.style.clipPath = "";
+  }
+
+  // A recycled row element can keep our host class for a line that is not embedded any more.
+  _peSweepHosts() {
+    try {
+      for (const n of document.querySelectorAll(".listitem-transclusion.refx-pemb-host")) {
+        const g = n.getAttribute("data-guid");
+        const e = g && this._pageEmbeds.get(g);
+        if (!e || e.slot.parentNode !== n) n.classList.remove("refx-pemb-host");
+      }
+    } catch (e) {}
+  }
+
+  // "line" when the reference line holds nothing but the reference, else "box" (Tana's two looks).
+  _peMode(lineGuid) {
+    const m = (window.g_universe && window.g_universe.itemsByGuid) || {};
+    const it = m[lineGuid];
+    if (!it || (it.props && it.props.refx_at)) return "box"; // a live-search embed sits under a result row
+    const pg = (it.parent && it.parent.guid) || it.parent_guid;
+    const segs = pg && m[pg] ? this._segmentsFromState(m[pg]) : [];
+    const refs = segs.filter((s) => s.type === "ref");
+    const other = segs.filter((s) => s.type !== "ref" && !(typeof s.text === "string" && !s.text.trim()));
+    return refs.length === 1 && !other.length ? "line" : "box";
+  }
+
+  // closePanel makes Thymer recompute the grid into an EQUAL split for a moment before the panel
+  // goes: his page jumped to half width with an empty column beside it for ~0.2 s on every collapse
+  // (his recording 2026-11-02, frames 226-253). Quick Capture's cure (2026-06-28): put the panel on
+  // <body>, hidden, BEFORE closing it; out of the grid there is nothing for Thymer to split.
+  // Thymer's own rendering of an embed row (the page BODY in a frame) must never show on the
+  // desktop: not while the panel is still on its way, and not in the ~50 ms between our closing it
+  // and the line being deleted (both flashed in his recording 2026-11-02, 21:54). A class on the
+  // row could not do it: the row may not exist yet, and Thymer recycles row elements for other
+  // lines. So a stylesheet keyed on the line's guid, from the moment we take it until a while after
+  // we let go.
+  _peHideOn(g) { this._peHide.set(g, 0); this._peHideSync(); }
+  _peHideOff(g) {
+    if (!this._peHide.has(g)) return;
+    this._peHide.set(g, Date.now() + 1500);
+    if (!this._peHideT) this._peHideT = setTimeout(() => { this._peHideT = 0; this._peHideSync(); }, 1600);
+  }
+  _peHideSync() {
+    const now = Date.now();
+    for (const [g, until] of [...this._peHide]) if (until && until <= now && !this._pageEmbeds.has(g)) this._peHide.delete(g);
+    let st = document.getElementById("refx-pe-hide");
+    if (!this._peHide.size) { if (st) st.textContent = ""; return; }
+    if (!st) { st = document.createElement("style"); st.id = "refx-pe-hide"; document.head.appendChild(st); }
+    const sel = [];
+    for (const g of this._peHide.keys()) {
+      const k = '.listitem-transclusion[data-guid="' + this._escCssAttr(g) + '"]';
+      sel.push(k + " > .transclusion-container-div", k + " > .line-fold-chevron");
+    }
+    const css = sel.join(",") + "{display:none !important;}";
+    if (st.textContent !== css) st.textContent = css;
+    if ([...this._peHide.values()].some((u) => u) && !this._peHideT) this._peHideT = setTimeout(() => { this._peHideT = 0; this._peHideSync(); }, 1600);
+  }
+
+  // Returns the release function. Safe to call twice.
+  _peMountGuard(cols) {
+    const g = document.querySelector(".panels-grid");
+    if (!g) return () => {};
+    for (const pn of g.querySelectorAll(":scope > .panel")) pn.dataset.refxKeep = "1";
+    g.classList.add("refx-pe-mounting");
+    let lock = null;
+    if (cols != null) {
+      lock = new MutationObserver(() => { if (g.style.gridTemplateColumns !== cols) g.style.gridTemplateColumns = cols; });
+      try { lock.observe(g, { attributes: true, attributeFilter: ["style"] }); } catch (e) { lock = null; }
+    }
+    let done = false;
+    return () => {
+      if (done) return; done = true;
+      if (lock) lock.disconnect();
+      g.classList.remove("refx-pe-mounting");
+      for (const pn of g.querySelectorAll(":scope > .panel[data-refx-keep]")) delete pn.dataset.refxKeep;
+    };
+  }
+
+  _peAlive(panel) {
+    try { const id = this._pePid(panel); return !!id && (this.ui.getPanels() || []).some((p) => this._pePid(p) === id); } catch (e) { return false; }
+  }
+
+  // EVERY closePanel flashes a split of his page (see below), so a collapsed embed's panel is NOT
+  // closed: it goes back to the park, hidden, and the next expand reuses it. Only unload (final)
+  // or a pool that is full really closes one.
+  _peDispose(e, final) {
+    if (!e) return;
+    if (!final && e.panel && e.slot && this._pePool.length < this._PE_POOL && !this._unloaded && this._peAlive(e.panel)) {
+      try { e.slot.style.clipPath = "inset(100%)"; delete e.slot.dataset.mode; this._peParkEl().appendChild(e.slot); } catch (err) {}
+      this._pePool.push({ panel: e.panel, slot: e.slot });
+      return;
+    }
+    const slot = e.slot;
+    if (slot) {
+      try { slot.style.setProperty("display", "none", "important"); document.body.appendChild(slot); } catch (err) {}
+    }
+    if (e.panel) {
+      this._peClaims().delete(this._pePid(e.panel));
+      // ...and that alone did NOT stop it (his second recording): Thymer still counts the closing
+      // panel while it animates out, and writes a split template meanwhile. So HOLD his columns
+      // for the length of the close (Timer's embLockGrid idea): any template written in that
+      // window is put straight back, synchronously, before it paints.
+      // Measured: the closing panel is put BACK into the grid for its animation (his page went to
+      // width 0 for a moment). The mount guard takes it out of the grid and holds his columns.
+      const cols = this._peGridCols();
+      const release = this._peMountGuard(cols);
+      try { this.ui.closePanel(e.panel); } catch (err) {}
+      this._peGridRestore(cols);
+      setTimeout(() => { release(); this._peNormaliseGrid(); }, 700);
+    }
+    if (slot) setTimeout(() => { try { if (slot.parentNode === document.body) slot.remove(); } catch (err) {} }, 700);
+  }
+
+  // only: close it only while the entry is still that one (a newer attach may have replaced it)
+  _peClose(lineGuid, only) {
+    const e = this._pageEmbeds.get(lineGuid);
+    if (!e || (only && e !== only)) return;
+    this._pageEmbeds.delete(lineGuid);
+    this._peDispose(e);
+    this._peHideOff(lineGuid);
+    setTimeout(() => this._peSweepHosts(), 1600);
+    if (!this._pageEmbeds.size) this._peStopWatch();
+  }
+
+  _peCloseAll() {
+    for (const [g, e] of [...this._pageEmbeds]) { this._pageEmbeds.delete(g); this._peDispose(e, true); }
+    for (const idle of this._pePool.splice(0)) this._peDispose(idle, true);
+    this._peStopWatch();
+    try { document.querySelectorAll(".refx-pemb-host").forEach((n) => n.classList.remove("refx-pemb-host")); } catch (e) {}
+    try { document.querySelectorAll(".refx-pe-park").forEach((n) => n.remove()); } catch (e) {}
+    this._pePark = null;
+    this._peHide.clear();
+    if (this._peHideT) { clearTimeout(this._peHideT); this._peHideT = 0; }
+    try { const st = document.getElementById("refx-pe-hide"); if (st) st.remove(); } catch (e) {}
+  }
+
+  // A panel an earlier load of this plugin borrowed and never handed back (a reload, a crash).
+  _peCloseOrphans() {
+    try {
+      const own = new Set([...this._pageEmbeds.values(), ...this._pePool].map((x) => x.panel && this._pePid(x.panel)));
+      for (const p of (this.ui.getPanels() || [])) {
+        const id = this._pePid(p);
+        if (own.has(id)) continue;
+        let nv = null; try { nv = p.getNavigation(); } catch (e) {}
+        if (!(nv && nv.state && nv.state.refxEmbed)) continue;
+        this._peDispose({ panel: p, slot: (() => { try { const s = p.getElement().closest(".panel"); return s && !(s.parentNode && s.parentNode.classList && s.parentNode.classList.contains("panels-grid")) ? s : null; } catch (e) { return null; } })() }, true);
+      }
+    } catch (e) {}
+  }
+
+  _peEnsureWatch() { if (!this._peWatchT && !this._unloaded) this._peWatchT = setInterval(() => this._peTick(), 250); }
+  _peStopWatch() { if (this._peWatchT) { clearInterval(this._peWatchT); this._peWatchT = 0; } }
+  // Every 250 ms while a page panel is open: drop one the app closed, and send a link followed
+  // INSIDE the panel to the page it sits on (the panel itself goes back to its page).
+  _peTick() {
+    if (this._unloaded || !this._pageEmbeds.size) { this._peStopWatch(); return; }
+    this._peNormaliseGrid();
+    let ids = null; try { ids = new Set((this.ui.getPanels() || []).map((p) => this._pePid(p))); } catch (e) {}
+    for (const [g, e] of [...this._pageEmbeds]) {
+      if (!e.ready || !e.panel) continue;
+      if (ids && !ids.has(this._pePid(e.panel))) { this._pageEmbeds.delete(g); try { if (e.slot && e.slot.parentNode) e.slot.parentNode.removeChild(e.slot); } catch (err) {} continue; }
+      let nv = null; try { nv = e.panel.getNavigation(); } catch (err) {}
+      if (nv && nv.rootId && nv.rootId !== e.recordGuid) {
+        this._peOpenInHost(e, nv);
+        try { Promise.resolve(e.panel.navigateTo(this._peNav(e.recordGuid))).catch(() => {}); } catch (err) {}
+      }
+    }
+  }
+  _peOpenInHost(e, nv) {
+    try {
+      const outer = e.slot && e.slot.parentElement && e.slot.parentElement.closest(".panel");
+      const host = outer && (this.ui.getPanels() || []).find((p) => { try { return p.getElement().closest(".panel") === outer; } catch (err) { return false; } });
+      if (!host) return;
+      Promise.resolve(host.navigateTo({ type: nv.type || "edit_panel", rootId: nv.rootId, subId: nv.subId || null, workspaceGuid: nv.workspaceGuid || this._peWs() })).catch(() => {});
+    } catch (err) {}
+  }
+
+  // ---- page embeds: the keyboard ----
+  // The page's own editor does not know the panel is there: from the reference line, ArrowDown
+  // would walk into the transclusion row's HIDDEN body and the caret would vanish. So, on plain
+  // ArrowUp/ArrowDown at a line's top/bottom VISUAL line (a wrapped line walks within itself first):
+  //   page line just above an open page panel  -> its first body line;
+  //   page line just below it                  -> its last body line;
+  //   first / last body line of the panel      -> the page line above / below the panel.
+  // Neighbours are found by GEOMETRY within the same panel (rows are flat and absolutely placed).
+  _peKey = (ev) => {
+    if (!this._pageEmbeds.size) return;
+    if (ev.key !== "ArrowUp" && ev.key !== "ArrowDown") return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
+    if (this._modal || this._link) return;
+    // A page panel's PROPERTIES have the keyboard: Thymer walks them itself (arrows, Enter edits,
+    // past the last one into the body). Only ArrowUp on the first one is ours: Thymer would send
+    // it to the page title, which is hidden here, so it goes back to the page line above instead.
+    const fc = window.g_focusedComponent;
+    const fcEmbed = fc && fc.node && fc.node.closest && fc.node.closest(".panel.refx-pemb");
+    if (fcEmbed) {
+      if (ev.key !== "ArrowUp" || !fc.focusState || fc.focusState.isEditing) return;
+      const t = this._pePropTargets(fc);
+      if (!t.length || fc.focusState.fieldId !== t[0]) return;
+      const host = fcEmbed.parentNode;
+      const target = host && host.classList && host.classList.contains("refx-pemb-host") ? this._peRowNear(host, "before") : null;
+      if (!target) return;
+      ev.preventDefault(); ev.stopImmediatePropagation();
+      this._peCaretAt(target, "end", this._pePosClass());
+      return;
+    }
+    const c = this._peCaret();
+    if (!c) return;
+    const down = ev.key === "ArrowDown";
+    if (!this._peOnEdge(c, down ? "bottom" : "top")) return;
+    let target = null, where = down ? "start" : "end";
+    if (c.embed) {
+      const lines = this._peLines(c.embed);
+      if (!lines.length || c.li !== (down ? lines[lines.length - 1] : lines[0])) return;
+      // up from the first body line: into the properties (their last row), as on a page
+      if (!down && this._pePropTargets(this._pePropsOf(c.embed)).length) {
+        ev.preventDefault(); ev.stopImmediatePropagation();
+        this._peEnterProps(c.embed, true);
+        return;
+      }
+      const host = c.embed.slot.parentNode;
+      target = host && (down ? this._peRowNear(host, "after") : this._peRowNear(host, "before"));
+    } else {
+      const e = this._peAdjacent(c.li, down);
+      // down from the page line above: into the properties first (their first row), as on a page
+      if (e && down && this._pePropTargets(this._pePropsOf(e)).length) {
+        ev.preventDefault(); ev.stopImmediatePropagation();
+        this._peEnterProps(e, false);
+        return;
+      }
+      const lines = e ? this._peLines(e) : [];
+      target = lines.length ? (down ? lines[0] : lines[lines.length - 1]) : null;
+    }
+    if (!target) return;
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    this._peCaretAt(target, where, c.PosC);
+  };
+
+  // The page panel's own properties editor (Thymer's component: body.children[i].propseditor).
+  _pePropsOf(e) {
+    try {
+      const body = e && e.panel && e.panel._getPanel && e.panel._getPanel().body;
+      for (const c of (body && body.children) || []) if (c && c.propseditor && typeof c.propseditor.focusFirstRow === "function") return c.propseditor;
+    } catch (err) {}
+    return null;
+  }
+  // The rows Thymer's arrows walk; none when the properties are folded into pills or hidden.
+  _pePropTargets(pe) {
+    try {
+      if (!pe || (pe._isTableVisible && !pe._isTableVisible())) return [];
+      return (pe._getKeyboardNavTargets && pe._getKeyboardNavTargets()) || [];
+    } catch (e) { return []; }
+  }
+  // Give the panel, then its properties editor, the keyboard: focusFirstRow / focusLastRow are
+  // Thymer's own (they make the editor the focused component), so from there it is all native.
+  _peEnterProps(e, last) {
+    const pe = this._pePropsOf(e);
+    if (!pe) return false;
+    try { if (this.ui.setActivePanel) this.ui.setActivePanel(e.panel); } catch (err) {}
+    try { if (last) pe.focusLastRow(); else pe.focusFirstRow(); } catch (err) { return false; }
+    try { e.slot.scrollIntoView({ block: "nearest" }); } catch (err) {}
+    return true;
+  }
+  _pePosClass() {
+    for (const lv of (window.g_universe && window.g_universe.listviews) || []) { try { const p = lv.selection._caret.pos; if (p) return p.constructor; } catch (e) {} }
+    return null;
+  }
+
+  // The caret's line element, its panel, and the page embed it is in (null in a page itself).
+  _peCaret() {
+    for (const lv of (window.g_universe && window.g_universe.listviews) || []) {
+      try {
+        if (!(lv.hasFocus && lv.hasFocus())) continue;
+        const car = lv.selection && lv.selection._caret;
+        const pos = car && car.pos;
+        const li = pos && pos.list_item && pos.list_item.$node;
+        if (!li) continue;
+        const pnl = lv.$container && lv.$container.closest && lv.$container.closest(".panel");
+        let embed = null;
+        if (pnl && pnl.classList.contains("refx-pemb")) for (const e of this._pageEmbeds.values()) if (e.slot === pnl) embed = e;
+        return { li, caretEl: car.$caret, embed, PosC: pos.constructor };
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // Is the caret on the first (top) or last (bottom) visual line of its line?
+  _peOnEdge(c, edge) {
+    try {
+      const cr = c.caretEl.getBoundingClientRect();
+      const tx = c.li.querySelector(".lineitem-text");
+      const rs = tx ? [...tx.getClientRects()].filter((r) => r.height) : [];
+      if (!rs.length) return true;
+      return edge === "top" ? cr.top < rs[0].bottom - 1 : cr.top >= rs[rs.length - 1].top - 2;
+    } catch (e) { return true; }
+  }
+
+  // The body lines of a page panel a person can stand on, top to bottom.
+  _peLines(e) {
+    if (!e || !e.slot) return [];
+    return [...e.slot.querySelectorAll(".listview-items > .listitem")]
+      .filter((li) => li.closest(".panel") === e.slot && li.offsetHeight > 0)
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  }
+
+  // An open page panel whose row starts right below (down) or ends right above (up) this line.
+  _peAdjacent(li, down) {
+    const pnl = li.closest(".panel");
+    const r = li.getBoundingClientRect();
+    for (const e of this._pageEmbeds.values()) {
+      const host = e.ready && e.slot && e.slot.parentNode;
+      if (!host || !host.classList || !host.classList.contains("refx-pemb-host") || host.closest(".panel") !== pnl) continue;
+      const h = host.getBoundingClientRect();
+      if (down ? Math.abs(h.top - r.bottom) < 6 : Math.abs(r.top - h.bottom) < 6) return e;
+    }
+    return null;
+  }
+
+  // The page line just after / before a row, in the row's own panel.
+  _peRowNear(row, side) {
+    const pnl = row.closest(".panel");
+    const h = row.getBoundingClientRect();
+    let best = null, bestY = side === "after" ? Infinity : -Infinity;
+    for (const li of pnl.querySelectorAll(".listitem[data-guid]")) {
+      if (li === row || li.closest(".panel") !== pnl || !li.offsetHeight) continue;
+      const r = li.getBoundingClientRect();
+      if (side === "after" ? (r.top >= h.bottom - 2 && r.top < bestY) : (r.bottom <= h.top + 2 && r.bottom > bestY)) { best = li; bestY = side === "after" ? r.top : r.bottom; }
+    }
+    return best;
+  }
+
+  // Put the caret at the start/end of a line in whichever panel holds it, the deterministic way
+  // (playbook §3: build a Pos from the line's view, collapse the selection onto it, give that panel
+  // the keyboard). A synthetic click is only the fallback: a chip-only line (a bare reference)
+  // ignores synthetic presses entirely.
+  _peCaretAt(li, where, PosC) {
+    const guid = li.getAttribute("data-guid");
+    const pnl = li.closest(".panel");
+    for (const lv of (window.g_universe && window.g_universe.listviews) || []) {
+      try {
+        if (!lv.$container || lv.$container.closest(".panel") !== pnl) continue;
+        let iv = null;
+        for (const c of lv.containers || []) { if (c && c.items_by_guid && c.items_by_guid[guid]) { iv = c.items_by_guid[guid]; break; } }
+        if (!iv) continue;
+        const spans = iv.linespans || [];
+        if (!PosC || !spans.length) break;
+        const sp = where === "end" ? spans[spans.length - 1] : spans[0];
+        const pos = new PosC(iv, sp, where === "end" ? (sp.grapheme_length || 0) : 0, "L");
+        const P = (this.ui.getPanels() || []).find((p) => { try { return p.getElement().closest(".panel") === pnl; } catch (e) { return false; } });
+        if (P && this.ui.setActivePanel) this.ui.setActivePanel(P);
+        lv.selection.collapse(pos, true);
+        try { window.g_virtual_input.$textarea.focus({ preventScroll: true }); } catch (e) {}
+        try { li.scrollIntoView({ block: "nearest" }); } catch (e) {}
+        return true;
+      } catch (e) {}
+    }
+    return this._hitTestCaret(li.querySelector(".lineitem-text") || li);
+  }
+
   // Keyboard-first property editing. Injected card values can't hold focus inside
   // Thymer's editor, so this opens a normal (focus-owning) modal instead.
   _onEditEmbedCommand() {
@@ -2085,7 +2524,6 @@ class Plugin extends AppPlugin {
           if (!item || item.v === null || item.v === undefined) continue;
           if (String(item.v) !== String(item.field.value == null ? "" : item.field.value)) this._writeCardProp(rec, item.field, item.v);
         }
-        for (const [lg, e] of this._cards) if (e.recordGuid === recordGuid) this._renderFreshCard(lg, recordGuid, true);
       },
       render: (body) => {
         if (!fields.length) body.append(this._el("div", "refalias-sub", "This record has no editable properties."));
@@ -2096,7 +2534,7 @@ class Plugin extends AppPlugin {
           if (f.kind === "relation") {
             ctl = this._el("input", "refalias-input"); ctl.type = "text";
             ctl.value = f.value == null ? "" : String(f.value); ctl.disabled = true;
-            ctl.title = "Edit relations by clicking the value in the card";
+            ctl.title = "Edit relations in the page itself";
           } else if (f.kind === "choice") {
             ctl = this._el("select", "refalias-input");
             const blank = this._el("option", null, "—"); blank.value = ""; ctl.append(blank);
@@ -2135,7 +2573,6 @@ class Plugin extends AppPlugin {
           btn.addEventListener("click", async () => {
             btn.disabled = true; btn.textContent = "Added — close and edit it inline";
             try { await rec.createLineItem(null, null, "text"); } catch (e) {}
-            for (const [lg, e] of this._cards) if (e.recordGuid === recordGuid) this._renderFreshCard(lg, recordGuid, true);
           });
           addRow.append(btn);
           body.append(addRow);
@@ -2157,22 +2594,17 @@ class Plugin extends AppPlugin {
   async _onNavigated() {
     if (this._unloaded) return;
     this._scheduleDescCSS(); // a new page's lines just entered the model
-    // Close any UI tied to the page we just left — UNCONDITIONALLY (previously only
-    // the zero-embed branch cleaned up, so programmatic navigation to a page that
-    // also had embeds left the nav key-handler armed for a gone card, and an open
-    // popup floating over the new page, still writing on Enter).
-    if (this._activeEdit) { try { this._activeEdit.cancel(); } catch (e) {} this._activeEdit = null; }
-    this._exitCardNav();
-    this._closeCardPopup();
-    this._removeAllCardEls();
     this._cards.clear();
     this._queryEmbeds.clear();
     this._lineEmbeds.clear();
     await this._indexEmbeds();
     if (this._unloaded) return;
+    // Page panels are NOT all closed here (navigating ONE panel must not close and reopen the
+    // embeds showing in another): close only those whose embed line is gone.
+    for (const g of [...this._pageEmbeds.keys()]) if (!this._cards.has(g)) this._peClose(g);
     if (this._cards.size || this._queryEmbeds.size || this._lineEmbeds.size) {
       this._ensureCardObserver();
-      this._reattachAllCards();
+      for (const [lineGuid, e] of this._cards) this._attachPropCard(lineGuid, e.recordGuid);
       for (const [g, qe] of this._queryEmbeds) this._placeQueryEmbed(g, qe.resultRealGuid, 0);
       for (const g of this._lineEmbeds.keys()) this._markLineEmbed(g, 0);
     } else this._teardownCardObserver();
@@ -2190,10 +2622,6 @@ class Plugin extends AppPlugin {
   // re-rendering every open card on each keystroke a remote edit streams.
   async _discover(refreshPresent) {
     if (this._unloaded) return;
-    // Never re-render mid-edit (would wipe an open inline input / picker). LATCH the
-    // request — the editor's close paths flush it. (A self-rescheduling timer here
-    // sustained a 2.5Hz loop for as long as a popup sat open.)
-    if (this._cardEditing) { this._discoverPending = refreshPresent || this._discoverPending || false; return; }
     // Cheap empty-case gate: with no tracked cards AND no transclusion rendered
     // anywhere, there is nothing to discover — skip the per-panel getLineItems +
     // full tree walk entirely (this is what keeps the plugin idle-cheap while
@@ -2228,23 +2656,13 @@ class Plugin extends AppPlugin {
       walk(items);
     }
     if (this._unloaded) return;
-    // Add cards for newly-seen embeds, and SILENT-refresh existing ones so that
-    // switching back to this client (or a remote property change) shows current
-    // values even when the card wasn't wiped (a prop change doesn't re-render the
-    // transclusion body). Silent = no loading flash; nav cursor re-lands via the
-    // _renderCardInto resume/paint path.
+    // Register newly seen page embeds, and make sure every one has its page panel (an existing
+    // panel is only re-placed, which is cheap).
     for (const [lineGuid, f] of found) {
-      if (this._commitOwned(lineGuid)) continue; // its commit poll owns this card
       const entry = this._cards.get(lineGuid);
-      if (!entry) { this._cards.set(lineGuid, { recordGuid: f.ref, line: f.line }); this._attachPropCard(lineGuid, f.ref); }
-      else {
-        if (!entry.line) entry.line = f.line; // backfill for collapse support
-        if (refreshPresent) this._refreshCardInPlace(lineGuid, entry.recordGuid);
-        else if (!(entry.cardEl && entry.cardEl.isConnected)) {
-          const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-          if (!document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]')) this._attachPropCard(lineGuid, entry.recordGuid, true);
-        }
-      }
+      if (!entry) this._cards.set(lineGuid, { recordGuid: f.ref, line: f.line });
+      else if (!entry.line) entry.line = f.line; // backfill for collapse support
+      this._attachPropCard(lineGuid, f.ref);
     }
     // Drop entries whose embed line no longer exists anywhere (collapsed elsewhere).
     for (const lineGuid of [...this._cards.keys()]) {
@@ -2319,10 +2737,6 @@ class Plugin extends AppPlugin {
         this._rehydrateT = setTimeout(() => this._rehydrate(attempt + 1), 350 + attempt * 350);
       }
     }).catch(() => {});
-  }
-
-  _reattachAllCards() {
-    for (const [lineGuid, e] of this._cards) this._attachPropCard(lineGuid, e.recordGuid);
   }
 
   // Build {fieldId -> PROP_TYPE} from every collection's config schema. ASYNC —
@@ -2533,302 +2947,6 @@ class Plugin extends AppPlugin {
     return { mode, hidden: new Set(Array.isArray(c.hidden) ? c.hidden : []) };
   }
 
-  async _applyCardPrefs(mode, hidden, keepOpen) {
-    try { localStorage.setItem("refx-card-prefs", JSON.stringify({ mode, hidden: [...hidden] })); } catch (e) {}
-    // Scroll strategy (measured live): the browser's own scroll anchoring keeps
-    // the viewport visually still through the card's height change — DON'T fight
-    // it with scrollTop restores (that caused the jump). Shrinks land pixel-
-    // stable; growth leaves a ~10px residue from post-anchoring settle, so take
-    // ONE gentle correction at the end, anchored on a line the user actually
-    // SEES: remember a visible line's viewport offset, and after everything
-    // settles nudge its scroller by the drift.
-    let anchor = null;
-    try {
-      const vh = window.innerHeight;
-      const it = [...document.querySelectorAll(".listitem")].find((el) => { const r = el.getBoundingClientRect(); return r.top >= 80 && r.top < vh - 120 && r.height > 8; });
-      if (it && it.getAttribute("data-guid")) anchor = { guid: it.getAttribute("data-guid"), top: it.getBoundingClientRect().top };
-    } catch (e) {}
-    if (!keepOpen) this._closeCardPopup();
-    await Promise.all([...this._cards].map(([lg, e]) => this._renderFreshCard(lg, e.recordGuid, true)));
-    if (anchor) {
-      setTimeout(() => {
-        try {
-          const esc = (window.CSS && CSS.escape) ? CSS.escape(anchor.guid) : anchor.guid;
-          const el = document.querySelector('.listitem[data-guid="' + esc + '"]');
-          if (!el) return;
-          const d = el.getBoundingClientRect().top - anchor.top;
-          const sc = el.closest(".panel-scroller-y");
-          if (sc && Math.abs(d) > 3) sc.scrollTop += d;
-        } catch (e) {}
-      }, 650);
-    }
-  }
-
-  // Popup mirroring the native property chooser: a "View properties ..." filter
-  // field, view modes (Filled in / All / Custom), then a per-property checklist.
-  // The checkmarks SHOW WHAT THE CARD CURRENTLY SHOWS; toggling a field switches
-  // to Custom seeded from the current view, so "All" always means all.
-  _openPropsChooser(rec, lineGuid, anchorEl) {
-    const pop = this._el("div", "refalias-pop refx-cardpop refx-propchooser");
-    const inp = this._el("input", "refalias-input");
-    inp.placeholder = "View properties ...";
-    const list = this._el("div", "refalias-results");
-
-    // The record's user fields + emptiness (drives "what shows" per mode). Read
-    // through _recCardFields UNFILTERED by briefly pinning prefs to "all" — one
-    // source of truth for field typing/values, no duplicated probing logic.
-    let fields = [];
-    try {
-      const saved = localStorage.getItem("refx-card-prefs");
-      localStorage.setItem("refx-card-prefs", JSON.stringify({ mode: "all", hidden: [] }));
-      const allFields = this._recCardFields(rec);
-      if (saved != null) localStorage.setItem("refx-card-prefs", saved); else localStorage.removeItem("refx-card-prefs");
-      fields = allFields.map((f) => ({ name: f.name, empty: f.value === "" || f.value == null }));
-    } catch (e) {}
-
-    const visibleNow = () => {
-      const p = this._cardPrefs();
-      return new Set(fields.filter((f) => {
-        if (p.mode === "filled") return !f.empty;
-        if (p.mode === "custom") return !p.hidden.has(f.name);
-        return true;
-      }).map((f) => f.name));
-    };
-
-    const rebuild = () => {
-      list.innerHTML = "";
-      const p = this._cardPrefs();
-      const vis = visibleNow();
-      const addRow = (label, checked, cb, isMode) => {
-        const r = this._el("div", "refalias-result");
-        if (isMode) r.dataset.mode = "1";
-        const chk = this._el("span", "refx-chk ti " + (checked ? "ti-check" : ""));
-        r.append(chk, this._el("span", "refx-chooser-lbl", label));
-        r.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); cb(); });
-        list.append(r);
-      };
-      addRow("Filled in", p.mode === "filled", () => { this._applyCardPrefs("filled", p.hidden, true); rebuild(); }, true);
-      addRow("All", p.mode === "all", () => { this._applyCardPrefs("all", p.hidden, true); rebuild(); }, true);
-      addRow("Custom", p.mode === "custom", () => { this._applyCardPrefs("custom", p.hidden, true); rebuild(); }, true);
-      list.append(this._el("div", "refx-chooser-sep"));
-      const q = (inp.value || "").toLowerCase();
-      for (const f of fields) {
-        if (q && !f.name.toLowerCase().includes(q)) continue;
-        addRow(f.name, vis.has(f.name), () => {
-          // Toggling a field = switch to Custom, seeded from what's visible NOW.
-          const want = visibleNow();
-          if (want.has(f.name)) want.delete(f.name); else want.add(f.name);
-          const hidden = new Set(fields.map((x) => x.name).filter((n) => !want.has(n)));
-          this._applyCardPrefs("custom", hidden, true);
-          rebuild();
-        });
-      }
-    };
-    inp.addEventListener("input", rebuild);
-    rebuild();
-    pop.append(inp, list);
-    this._openCardPopup(pop, anchorEl, {}); // default: focuses the input → arrows/Enter/Esc work
-  }
-
-
-  _buildPropCard(rec, fields, lineGuid) {
-    const card = this._el("div", this._CARD_CLASS);
-    card.append(this._el("div", "refx-propcard-title", (rec.getName && rec.getName()) || "Untitled"));
-    // "Properties · All ⌄" chooser row, structured like the native pane header
-    // (muted label · mode chip).
-    const head = this._el("div", "refx-props-header");
-    head.append(this._el("span", null, "Properties"), this._el("span", null, "·"));
-    const mode = this._el("span", "refx-props-mode");
-    const m0 = this._cardPrefs().mode;
-    mode.append(document.createTextNode(m0 === "filled" ? "Filled in" : (m0 === "custom" ? "Custom" : "All")));
-    const car = this._el("span", "ti ti-selector");
-    mode.append(car);
-    const openCh = (e) => { e.preventDefault(); e.stopPropagation(); this._openPropsChooser(rec, lineGuid, head); };
-    mode.addEventListener("mousedown", openCh);
-    mode.addEventListener("click", openCh);
-    head.append(mode);
-    card.append(head);
-    if (fields.length) {
-      // Wrap the rows in the native property-editor containers so Thymer's own
-      // row/cell/pill CSS applies (native look, theme-following).
-      const wrap = this._el("div", "page-props-editor refx-native-props");
-      const props = this._el("div", "id--props");
-      for (const f of fields) {
-        const row = this._el("div", "refx-propcard-row");
-        this._fillPropRow(rec, lineGuid, f, row);
-        props.append(row);
-      }
-      wrap.append(props);
-      card.append(wrap);
-    } else {
-      card.append(this._el("div", "refx-propcard-empty", "No properties"));
-    }
-    // (No "+ Add content" affordance for an empty body: the empty box itself is
-    // a stable-height click-to-type target now, and the vanishing button was
-    // its own layout jump. _cardNavItems/keyboard-Enter still handle the class
-    // defensively if an old card lingers through a hot reload.)
-    return card;
-  }
-
-  // ---- keyboard nav of the property card (class-based cursor, like native) ----
-
-  // The card's nav cells in DOM order: property values, then the add-body action.
-  _cardNavItems(lineGuid) {
-    const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-    const card = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]');
-    if (!card) return [];
-    return [...card.querySelectorAll(".refx-propcard-value, .refx-propcard-addbody")];
-  }
-
-  _enterCardNav(lineGuid, recordGuid, startIndex) {
-    this._exitCardNav(); // idempotent: safe to (re)enter from a resume or fresh trigger
-    this._cardNav = { lineGuid, recordGuid, index: startIndex || 0 };
-    this._paintCardNav();
-    window.addEventListener("keydown", this._onCardNavKey, true);
-    window.addEventListener("mousedown", this._cardNavClickAway, true);
-    window.__refxCardNavKey = this._onCardNavKey;
-    window.__refxCardNavClick = this._cardNavClickAway;
-  }
-
-  // Paint the cursor onto the current cell (the DOM class is the source of truth).
-  // Re-resolves cells live so it survives a card re-injection; clamps the index.
-  // If the card is transiently absent (mid re-render), just skip — DON'T exit nav
-  // (a spurious exit here was dropping the cursor after an inline edit); a later
-  // render repaints, and genuine collapses exit via _deleteEmbedLine.
-  // scroll=true only for explicit arrow navigation; a repaint/resume must NOT
-  // scrollIntoView (that yanked the page around after an edit — the "it moves" bug).
-  _paintCardNav(scroll) {
-    const nav = this._cardNav;
-    if (!nav) return;
-    const items = this._cardNavItems(nav.lineGuid);
-    if (!items.length) return;
-    if (nav.index >= items.length) nav.index = items.length - 1;
-    if (nav.index < 0) nav.index = 0;
-    for (const el of document.querySelectorAll(".refx-nav-focus")) el.classList.remove("refx-nav-focus");
-    const cur = items[nav.index];
-    cur.classList.add("refx-nav-focus");
-    if (scroll) { try { cur.scrollIntoView({ block: "nearest" }); } catch (e) {} }
-  }
-
-  _moveCardNav(dir) {
-    const nav = this._cardNav;
-    if (!nav) return;
-    const items = this._cardNavItems(nav.lineGuid);
-    if (!items.length) { this._exitCardNav(); return; }
-    const next = nav.index + dir;
-    if (next < 0) return this._handleCardNavExitUp();
-    if (next >= items.length) return this._handleCardNavExitDown();
-    nav.index = next;
-    this._paintCardNav(true);
-  }
-
-  _onCardNavKey = (e) => {
-    if (!this._cardNav) return;
-    if (this._cardEditing) return; // an editor/popup owns the keyboard
-    if (e.key === "ArrowDown") { e.preventDefault(); e.stopImmediatePropagation(); this._moveCardNav(1); return; }
-    if (e.key === "ArrowUp") { e.preventDefault(); e.stopImmediatePropagation(); this._moveCardNav(-1); return; }
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopImmediatePropagation(); this._activateCardNav(); return; }
-    if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); this._handleCardNavExitUp(); return; }
-    // Any other navigation/typing key releases the cursor and passes through.
-    this._exitCardNav();
-  };
-
-  _cardNavClickAway = (e) => {
-    const nav = this._cardNav;
-    if (!nav) return;
-    const esc = (window.CSS && CSS.escape) ? CSS.escape(nav.lineGuid) : nav.lineGuid;
-    const card = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]');
-    if (card && card.contains(e.target)) return; // click within the card keeps nav
-    // A choice/relation popup lives on document.body, outside the card.
-    try { if (e.target && e.target.closest && e.target.closest(".refx-cardpop, .refx-pop-backdrop")) return; } catch (e2) {}
-    this._exitCardNav();
-  };
-
-  _activateCardNav() {
-    const nav = this._cardNav;
-    if (!nav) return;
-    const items = this._cardNavItems(nav.lineGuid);
-    const el = items[nav.index];
-    if (!el) { this._exitCardNav(); return; }
-    if (el.classList.contains("refx-propcard-addbody")) {
-      // Empty record → create the first body line and drop the caret into it.
-      const lineGuid = nav.lineGuid;
-      this._exitCardNav();
-      this._addBodyLine(lineGuid);
-      return;
-    }
-    const field = el.dataset && el.dataset.refxField;
-    const rec = field && this.data.getRecord(nav.recordGuid);
-    if (!field || !rec) { this._exitCardNav(); return; }
-    const f = this._recCardFields(rec).find((x) => x.name === field);
-    const rowEl = el.closest(".refx-propcard-row");
-    if (!f || !rowEl) { this._exitCardNav(); return; }
-    // Remember where we are so nav is re-established on the same cell after the
-    // edit's card re-render (the edit may clear _cardNav via DOM churn).
-    this._cardNavResume = { lineGuid: nav.lineGuid, recordGuid: nav.recordGuid, index: nav.index };
-    // Reuse the existing real-input editor (it DOES hold focus).
-    this._editCardValue(rec, nav.lineGuid, f, el, rowEl);
-  }
-
-  _exitCardNav() {
-    this._cardNavResume = null;
-    if (!this._cardNav) return;
-    this._cardNav = null;
-    try { window.removeEventListener("keydown", this._onCardNavKey, true); } catch (e) {}
-    try { window.removeEventListener("mousedown", this._cardNavClickAway, true); } catch (e) {}
-    window.__refxCardNavKey = null; window.__refxCardNavClick = null;
-    for (const el of document.querySelectorAll(".refx-nav-focus")) el.classList.remove("refx-nav-focus");
-  }
-
-  // Re-establish the nav cursor on the cell that was being edited, once the card is
-  // present again. Robust to _cardNav having been cleared mid-edit — it re-adds the
-  // listeners via _enterCardNav. Keeps the stash pending if the card isn't ready
-  // yet (e.g. a transient "Loading…" render), so the next full render consumes it.
-  _consumeNavResume(lineGuid) {
-    const r = this._cardNavResume;
-    if (!r) return;
-    if (lineGuid && r.lineGuid !== lineGuid) return;
-    if (!this._cardNavItems(r.lineGuid).length) return; // card not ready → stay pending
-    this._cardNavResume = null;
-    this._enterCardNav(r.lineGuid, r.recordGuid, r.index);
-  }
-
-  // Exit UP: back onto the reference line above the embed (ArrowUp-from-first, Esc).
-  _handleCardNavExitUp() {
-    const nav = this._cardNav;
-    this._exitCardNav();
-    if (nav) this._focusRefLineForEmbed(nav.lineGuid);
-  }
-
-  // Exit DOWN past the last value: into the embed's body (mirrors native props→body).
-  async _handleCardNavExitDown() {
-    const nav = this._cardNav;
-    this._exitCardNav();
-    if (!nav) return;
-    const rec = this.data.getRecord(nav.recordGuid);
-    let first = null;
-    if (rec) { try { const items = await rec.getLineItems(); first = items && items[0] && items[0].guid; } catch (e) {} }
-    if (first) this._focusEmbeddedLine(nav.lineGuid, first, 0);
-  }
-
-  // Place the native caret on the reference line owning `embedLineGuid`. The embed
-  // line is a child of the ref's block, so the nearest non-transclusion .listitem
-  // ancestor is that block; hit-test its text span (same mechanism as the embed).
-  _focusRefLineForEmbed(embedLineGuid) {
-    try {
-      const node = this._transclusionNode(embedLineGuid);
-      if (!node) return;
-      let li = node.parentElement;
-      while (li && li !== document.body) {
-        if (li.classList && li.classList.contains("listitem") && !li.classList.contains("listitem-transclusion")) {
-          const t = li.querySelector && li.querySelector(".lineitem-text");
-          if (t) { this._hitTestCaret(t); return; }
-        }
-        li = li.parentElement;
-      }
-    } catch (e) {}
-  }
-
   // Place Thymer's (model-based, not DOM-selection) caret by hit-testing a click on
   // a line's text span, exactly as a real click there would. Returns true if fired.
   _hitTestCaret(t) {
@@ -2847,268 +2965,6 @@ class Plugin extends AppPlugin {
       t.dispatchEvent(new MouseEvent("click", up));
       return true;
     } catch (e) { return false; }
-  }
-
-  // (Re)render a single property row: label + clickable value (— when empty).
-  // NATIVE-LOOK ROWS: reuse Thymer's own property-editor classes so the card rows
-  // pick up the exact native styling (typography, spacing, pills) and follow the
-  // theme for free. Structure mirrors the real .page-props-row (confirmed live):
-  //   .page-props-cell.page-prop-type  → type icon + .prop-label-text
-  //   .page-props-cell.page-prop-val   → value (pills / plain text) + hover pencil
-  // The refx-* classes stay on the same elements — all nav/edit/refresh code keys
-  // off them and is unchanged.
-  _fillPropRow(rec, lineGuid, field, rowEl) {
-    rowEl.innerHTML = "";
-    rowEl.dataset.refxRow = field.name; // maps row → field for in-place refresh
-    rowEl.classList.add("page-props-row", "id-prop-row");
-    const typeCell = this._el("div", "page-props-cell page-prop-type page-props-cell-fixed-width");
-    // Native shows the FIELD's own schema icon (e.g. ti-user on People fields),
-    // ti-align-left as default, with an inline 8px margin — mirror it exactly
-    // so color/size come from the same native classes.
-    const meta = this._fieldMeta && field.id ? this._fieldMeta[field.id] : null;
-    let tic = (meta && meta.icon) || null;
-    if (tic && String(tic).indexOf("ti-") !== 0) tic = "ti-" + tic;
-    const icEl = this._el("span", "ti " + (tic || "ti-align-left"));
-    icEl.style.marginRight = "8px";
-    typeCell.append(icEl);
-    typeCell.append(this._el("span", "prop-label-text refx-propcard-label", field.name));
-    rowEl.append(typeCell);
-
-    const empty = field.value === "" || field.value == null;
-    const shown = empty ? "" : String(field.display || (field.kind === "date" && this._fmtDateDisplay(field.value)) || field.value);
-    const valCell = this._el("div", "page-props-cell page-prop-val");
-    const val = this._el("span", "refx-propcard-value" + (empty ? " refx-propcard-empty" : ""));
-    this._renderValContent(rec, val, field, empty, shown);
-    if (!empty) val.title = shown;
-    // Keyed by name so the keyboard-nav cursor + in-place refresh can re-derive
-    // the field (the row itself is keyed via rowEl.dataset.refxRow above).
-    val.dataset.refxField = field.name;
-    // Open the editor on mousedown OR click (whichever the environment delivers
-    // first); _editCardValue no-ops if an editor is already open, so no double.
-    const open = (e) => { e.preventDefault(); e.stopPropagation(); this._editCardValue(rec, lineGuid, field, val, rowEl); };
-    val.addEventListener("mousedown", open);
-    val.addEventListener("click", open);
-    valCell.addEventListener("mousedown", open); // blank cell area edits too (native empties are blank)
-    valCell.addEventListener("click", open);
-    valCell.append(val);
-    // Native-style hover pencil as the edit affordance (empties render blank).
-    valCell.append(this._el("span", "refx-propcard-pencil ti ti-pencil"));
-    rowEl.append(valCell);
-  }
-
-  // Render a value span's CONTENT the way the native property pane does:
-  // Thymer's own choice palette, extracted verbatim from the app bundle (the
-  // `It` table + `zr()` default): a choice's `color` is an INDEX into this list;
-  // missing/out-of-range → 13 = zinc, the native default gray. NOTE the order is
-  // NOT the CSS var declaration order (that would map 13 to rose — wrong).
-  _ENUM_PALETTE = ["red", "orange", "green", "cyan", "blue", "purple", "pink", "fuchsia", "rose", "stone", "teal", "sky", "indigo", "zinc", "yellow"];
-  _enumClass(color) {
-    const n = Number(color);
-    return (color != null && color !== "" && Number.isFinite(n) && this._ENUM_PALETTE[n]) || "zinc";
-  }
-
-  // relation/choice → one pill per value (native .prop-status chip, enum colors,
-  // the target's collection icon leading — native markup verbatim);
-  // date/text/number → plain text. Empty → blank (native shows nothing).
-  // The display string is stashed on the span so refresh can no-op cheaply.
-  _renderValContent(rec, val, field, empty, display) {
-    val.dataset.refxDisplay = display || "";
-    val.innerHTML = "";
-    if (empty) return;
-    if (field.kind === "file") return this._renderFileValue(rec, val, field);
-    if (field.kind === "relation" || field.kind === "choice") {
-      let parts = (field.pills && field.pills.length) ? field.pills : null;
-      // An OPTIMISTIC row update clones the field with a NEW value but the OLD
-      // pills (built for the previous value) — the pill then showed the stale
-      // label until the write propagated. For choice, re-derive the pill from
-      // the shown label (color+icon come from field.choices, which is current).
-      if (field.kind === "choice" && (!parts || parts.length !== 1 || String(parts[0].t) !== display)) {
-        const co = (field.choices || []).find((c) => c.label === display) || null;
-        let cic = (co && co.icon) || null;
-        if (cic && String(cic).indexOf("ti-") !== 0) cic = "ti-" + cic;
-        parts = [{ t: display, icon: cic, guid: null, color: co ? co.color : null }];
-      }
-      if (!parts) parts = [{ t: display, icon: null }];
-      const host = parts.length > 1 ? this._el("span", "prop-multi-values") : val;
-      for (const p of parts) {
-        const chip = this._el("span", "prop-status prop-status-record");
-        const en = this._enumClass(p.color); // relations carry no color → zinc, like native record chips
-        chip.style.backgroundColor = "var(--enum-" + en + "-bg)";
-        chip.style.color = "var(--enum-" + en + "-fg)";
-        if (p.icon) { const ic = this._el("span", "ti " + p.icon); ic.style.marginRight = "5px"; chip.append(ic); }
-        chip.append(document.createTextNode(p.t != null ? p.t : String(p)));
-        // Native record chips end with a clickable ↗ that opens the record (this is
-        // also what gives native chips their height — the arrow is the tallest part).
-        if (p.guid) {
-          const ar = this._el("span", "link-menu-opener ti ti-arrow-up-right refx-chip-arrow");
-          // Native arrows carry these data attrs; if Thymer's link-menu handling is
-          // event-delegated, our arrows inherit the full native hover menu ("Open in
-          // other panel" etc.) for free. Our own click nav stays as the guaranteed
-          // baseline (same destination, so a double-handle is harmless).
-          ar.setAttribute("data-mode", "link");
-          ar.setAttribute("data-guid", p.guid);
-          ar.setAttribute("data-padding", "3px");
-          const go = (e) => { e.preventDefault(); e.stopPropagation(); this._openRecord(p.guid); };
-          ar.addEventListener("mousedown", go);
-          ar.addEventListener("click", go);
-          chip.append(ar);
-        }
-        host.append(chip);
-      }
-      if (host !== val) val.append(host);
-    } else {
-      // Plain values (dates, text, numbers) get the native plain-value class so
-      // size/typography match the real pane exactly and track the theme.
-      const span = this._el("span", "prop-status prop-status-0p", display);
-      // A URL opens on CLICK of the text itself, like native — no extra chrome.
-      // Editing stays on the pencil / the rest of the cell. (An earlier ↗ badge
-      // reused link-menu-opener, which dragged in Thymer's big hover menu.)
-      if (/^https?:\/\/\S+$/i.test(display)) {
-        span.classList.add("refx-url-value");
-        span.title = display;
-        span.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
-        span.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); try { window.open(display, "_blank"); } catch (err) {} });
-      }
-      val.append(span);
-    }
-  }
-
-  // File/image property (native shows the image inline; we showed
-  // "[object Object]"). imgData/imgUrl render at once; a blob GUID resolves
-  // async via prop.fileBlob().download() into a cached object URL — a
-  // paperclip+filename chip shows meanwhile and stays for non-image files.
-  _renderFileValue(rec, val, field) {
-    const fv = field.file;
-    const name = (fv && fv.name) || "file";
-    const chip = () => {
-      val.innerHTML = "";
-      const s = this._el("span", "prop-status prop-status-0p");
-      s.append(this._el("span", "ti ti-paperclip refx-file-ico"));
-      s.append(document.createTextNode(name));
-      val.append(s);
-    };
-    const showImg = (src) => {
-      val.innerHTML = "";
-      const img = this._el("img", "refx-propcard-img");
-      img.alt = name; img.title = name; img.src = src;
-      // Native anatomy: click = edit (file picker); right-click = image menu.
-      img.addEventListener("contextmenu", (e) => {
-        e.preventDefault(); e.stopPropagation();
-        this._openImageMenu(rec, val, field, img, name, src);
-      });
-      val.append(img);
-    };
-    if (!fv) return chip();
-    if (fv.imgData) return showImg(fv.imgData);
-    if (fv.imgUrl) return showImg(fv.imgUrl);
-    if (!fv.guid) return chip();
-    const cached = this._blobUrls.get(fv.guid);
-    if (cached) return cached.url ? showImg(cached.url) : chip();
-    chip(); // instant; upgraded below when the blob resolves as an image
-    (async () => {
-      try {
-        const p = rec.prop(field.name);
-        const blob = p && p.fileBlob && await p.fileBlob();
-        if (!blob) return;
-        const isImage = /^image\//i.test(blob.contentType || "") || /\.(png|jpe?g|gif|webp|avif|svg)$/i.test(blob.fileName || "");
-        if (!isImage) { this._blobUrls.set(fv.guid, { url: null }); return; }
-        const buf = await blob.download();
-        if (!buf) return;
-        const url = URL.createObjectURL(new Blob([buf], { type: blob.contentType || "image/*" }));
-        this._blobUrls.set(fv.guid, { url });
-        if (val.isConnected) showImg(url);
-      } catch (e) {}
-    })();
-  }
-
-  // Replace/add the image on a file property: OS file picker -> uploadBlob ->
-  // setFileFromBlob (the SDK's supported write path), then force-refresh the
-  // row (same filename must still swap the pixels, so bypass the display
-  // dedupe). Native's own "Pick a file" dialog isn't reachable from a plugin.
-  _editFileValue(rec, lineGuid, field, valEl, rowEl) {
-    const input = this._el("input", "");
-    input.type = "file";
-    // image/banner fields want images; a plain file field accepts anything
-    const mt = this._fieldMeta && field.id ? this._fieldMeta[field.id] : null;
-    if (!(mt && mt.type === "file")) input.accept = "image/*";
-    input.style.display = "none";
-    document.body.append(input);
-    input.addEventListener("change", async () => {
-      const file = input.files && input.files[0];
-      input.remove();
-      if (!file) return;
-      try {
-        const blob = await this.data.uploadBlob(file);
-        if (!blob) return this._toast("Upload failed.");
-        const p = rec.prop(field.name);
-        const ok = p && p.setFileFromBlob && p.setFileFromBlob(blob);
-        if (!ok) return this._toast("Couldn't set the file property.");
-        this._commitClaim(lineGuid);
-        setTimeout(() => {
-          this._commitRelease(lineGuid);
-          try {
-            const fresh = this._recCardFields(rec).find((x) => x.name === field.name);
-            const row = rowEl && rowEl.isConnected ? rowEl : null;
-            if (fresh) { if (valEl) valEl.dataset.refxDisplay = "\u0000"; this._applyRowValue(rec, lineGuid, fresh, row); }
-          } catch (e) {}
-        }, 500);
-      } catch (e) { this._toast("Upload failed."); }
-    });
-    input.click();
-  }
-
-  // Right-click menu on a file-property image: Open image (in-app lightbox),
-  // Download, Delete. ("Open to the right" needs Thymer's internal image-panel
-  // routing, which no plugin API reaches — deliberately left out.)
-  _openImageMenu(rec, valEl, field, img, name, src) {
-    const lineGuid = (valEl.closest("." + this._CARD_CLASS) || {}).dataset ? (valEl.closest("." + this._CARD_CLASS).dataset.refxFor || null) : null;
-    const pop = this._el("div", "refalias-pop refx-cardpop refx-imgmenu");
-    const item = (icon, label, fn, cls) => {
-      const r = this._el("div", "refalias-result" + (cls ? " " + cls : ""));
-      r.append(this._el("span", "refx-opt-ico ti " + icon));
-      r.append(this._el("span", "refalias-result-text", label));
-      r.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); this._closeCardPopup(); fn(); });
-      pop.append(r);
-    };
-    item("ti-arrow-up-right", "Open image", () => this._openLightbox(src, name));
-    item("ti-download", "Download", () => {
-      const a = this._el("a", "");
-      a.href = src; a.download = name || "image";
-      document.body.append(a); a.click(); a.remove();
-    });
-    item("ti-trash", "Delete", () => {
-      if (lineGuid) this._commitClaim(lineGuid);
-      let p = null; try { p = rec.prop(field.name); } catch (e) {}
-      if (!p) return;
-      // The ONLY clear that lands on a file property is removeValue(value) —
-      // set("")/set([])/set(null)/setFile(null)/removeValueAt all silently
-      // no-op (verified live against a real Poster).
-      try { const vs = (p.values && p.values()) || []; for (const v of vs) { try { p.removeValue(v); } catch (e2) {} } } catch (e) {}
-      if (lineGuid) this._commitRefreshRow(rec, lineGuid, field, field.value, null, "", "", null);
-    }, "refx-cardpop-clear");
-    this._openCardPopup(pop, img, { focusInput: false });
-  }
-
-  // Minimal in-app lightbox: full image on a dimmed backdrop, click/Esc closes.
-  _openLightbox(src, name) {
-    const wrap = this._el("div", "refx-lightbox");
-    const img = this._el("img", "");
-    img.src = src; img.alt = name || "";
-    wrap.append(img);
-    const close = () => { try { wrap.remove(); } catch (e) {} window.removeEventListener("keydown", onKey, true); };
-    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); close(); } };
-    wrap.addEventListener("mousedown", (e) => { e.preventDefault(); close(); });
-    window.addEventListener("keydown", onKey, true);
-    document.body.append(wrap);
-  }
-
-  // Open a record in the active panel (the chip arrow's action, like native).
-  _openRecord(guid) {
-    try {
-      const p = this.ui.getActivePanel && this.ui.getActivePanel();
-      const ws = (window.g_universe && window.g_universe.workspaceGuid) || null;
-      if (p && p.navigateTo) p.navigateTo({ type: "edit_panel", rootId: guid, subId: null, workspaceGuid: ws, state: { positions: [guid, "empty-" + guid, 0, "L"] } });
-    } catch (e) {}
   }
 
   // The icon shown in a native record pill = the record's OWN icon (the "Icon"
@@ -3130,128 +2986,6 @@ class Plugin extends AppPlugin {
   }
 
 
-  // Update ONE row's value IN PLACE — no card teardown/rebuild, so editing a value
-  // doesn't flicker the whole card. Handles the value-span-present case
-  // (choice/relation/number/date) and the input-present case (a text edit just
-  // committed → swap the <input> back to a value span). Preserves the nav cursor
-  // class if it's on the span (we set textContent, we don't replace the node).
-  // Display `field` (with its .value) in the row — caller passes the value to show
-  // (a known optimistic value, or a freshly re-read one). Never re-reads itself.
-  _applyRowValue(rec, lineGuid, field, rowEl) {
-    // Robust to a stale/detached rowEl: re-find the current row for this field.
-    if (!rowEl || !rowEl.isConnected) {
-      const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-      const card = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]');
-      rowEl = card ? [...card.querySelectorAll(".refx-propcard-row")].find((r) => r.dataset.refxRow === field.name) : null;
-      if (!rowEl) return;
-    }
-    const empty = field.value === "" || field.value == null;
-    const display = empty ? "" : String(field.display || (field.kind === "date" && this._fmtDateDisplay(field.value)) || field.value);
-    let val = rowEl.querySelector(".refx-propcard-value");
-    if (val) {
-      // Skip no-op writes: a DOM swap is a mutation the body observer wakes on —
-      // a refresh pass over unchanged rows would otherwise amplify into observer
-      // callbacks for nothing. The last-rendered display is stashed on the span.
-      if (val.dataset.refxDisplay !== display) this._renderValContent(rec, val, field, empty, display);
-      if (val.classList.contains("refx-propcard-empty") !== empty) val.classList.toggle("refx-propcard-empty", empty);
-      if (empty) { if (val.hasAttribute("title")) val.removeAttribute("title"); } else if (val.title !== display) val.title = display;
-      if (val.dataset.refxField !== field.name) val.dataset.refxField = field.name;
-    } else {
-      // The open editor is an <input> (number) OR a <textarea> (text) — match
-      // both, else a committed/cancelled text edit left its <textarea> stranded
-      // beside the new value span (and the row looked wedged).
-      const input = rowEl.querySelector("input, textarea");
-      val = this._el("span", "refx-propcard-value" + (empty ? " refx-propcard-empty" : ""));
-      this._renderValContent(rec, val, field, empty, display);
-      val.dataset.refxField = field.name;
-      if (!empty) val.title = display;
-      const open = (e) => { e.preventDefault(); e.stopPropagation(); this._editCardValue(rec, lineGuid, field, val, rowEl); };
-      val.addEventListener("mousedown", open);
-      val.addEventListener("click", open);
-      const cell = rowEl.querySelector(".page-prop-val") || rowEl;
-      if (input) input.replaceWith(val);
-      else { const pen = cell.querySelector(".refx-propcard-pencil"); if (pen) cell.insertBefore(val, pen); else cell.append(val); }
-    }
-  }
-
-  // Smoothly reflect a just-written value with NO card teardown:
-  //   1) optimistically show `optimistic` immediately (instant, no flicker/lag), then
-  //   2) poll until the async write propagates and re-apply the confirmed value.
-  // The row is updated in place both times; the nav cursor is re-established after.
-  // NOTE: every caller pre-arms _commitClaim(lineGuid) BEFORE its write (so the
-  // write's synchronous record.updated is already gated); this poll RELEASES that
-  // claim exactly once when it settles. Do not claim again here.
-  _commitRefreshRow(rec, lineGuid, field, prevValue, rowEl, optimistic, optimisticDisplay, optimisticPills) {
-    if (arguments.length >= 6) {
-      // Replace `display` — the old one belongs to the PREVIOUS value. Callers that
-      // know the native formatted text (typed granular dates) pass it; otherwise
-      // the date-kind fallback formatter in _applyRowValue keeps it native-looking.
-      // Also replace `pills` (they were built for the previous value): the relation
-      // editor passes fresh ones from its own state; otherwise null lets
-      // _renderValContent re-derive (choice) or fall back to the display text.
-      this._applyRowValue(rec, lineGuid, Object.assign({}, field, { value: optimistic, display: optimisticDisplay || "", pills: optimisticPills || null }), rowEl);
-      this._consumeNavResume(lineGuid);
-    }
-    const hasOpt = arguments.length >= 6;
-    let n = 0;
-    const tick = () => {
-      if (!this._cards.has(lineGuid)) { this._commitRelease(lineGuid); return; }
-      // Never repaint while an editor is open — replacing a focused <input> fires
-      // no blur in Chromium, so its commit/cancel would never run and _cardEditing
-      // would wedge true (bricking all card editing). The editor's own close path
-      // repaints; we just hand ownership back.
-      if (this._cardEditing) { this._commitRelease(lineGuid); return; }
-      let fresh = null;
-      try { fresh = this._recCardFields(rec).find((x) => x.name === field.name) || null; } catch (e) {}
-      const cur = fresh ? fresh.value : null;
-      const propagated = String(cur) !== String(prevValue);
-      if (propagated || n >= 8) {
-        // On a slow write that never propagated within the poll window, do NOT
-        // repaint the still-stale read — keep the optimistic (known) value, and
-        // schedule one deferred silent refresh to pick up the confirmed/formatted
-        // value once it lands.
-        const show = (propagated || !hasOpt) ? (fresh || field) : Object.assign({}, field, { value: optimistic, display: "", pills: optimisticPills || null });
-        this._applyRowValue(rec, lineGuid, show, rowEl);
-        this._consumeNavResume(lineGuid);
-        this._commitRelease(lineGuid);
-        if (!propagated || !(fresh && fresh.display)) {
-          const rg = (this._cards.get(lineGuid) || {}).recordGuid;
-          if (rg) setTimeout(() => { if (this._cards.has(lineGuid)) this._refreshCardInPlace(lineGuid, rg); }, 1200);
-        }
-        return;
-      }
-      n++; setTimeout(tick, 80);
-    };
-    tick();
-  }
-
-  // Refresh a card's values IN PLACE (no teardown → no flicker) when its record
-  // changed. Updates the title + each field's row, matching rows BY NAME. Crucially
-  // it NEVER removes/rebuilds the card node — an earlier "structure mismatch → full
-  // rebuild" fallback was the real flicker source: the rebuild replaced the node,
-  // which then made the keep-alive observer + discovery see a "missing" card and
-  // pile on with loading-flash rebuilds (and the value lagged a step because each
-  // rebuild read pre-propagation data). A genuinely-absent/loading card still gets a
-  // fresh build; a truly changed field SET just won't show the new field until the
-  // next expand (rare). Skipped while editing / during a commit poll.
-  _refreshCardInPlace(lineGuid, recordGuid) {
-    if (this._cardEditing) return;
-    if (this._commitOwned(lineGuid)) return; // its own commit poll owns the refresh
-    const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-    const card = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]');
-    if (!card || card.classList.contains("refx-propcard-loading")) { this._renderFreshCard(lineGuid, recordGuid, true); return; }
-    const rec = this.data.getRecord(recordGuid);
-    if (!rec) return;
-    let fields; try { fields = this._recCardFields(rec); } catch (e) { return; }
-    const titleEl = card.querySelector(".refx-propcard-title");
-    if (titleEl) { const nm = (rec.getName && rec.getName()) || "Untitled"; if (titleEl.textContent !== nm) titleEl.textContent = nm; }
-    for (const f of fields) {
-      const row = [...card.querySelectorAll(".refx-propcard-row")].find((r) => r.dataset.refxRow === f.name);
-      if (row) this._applyRowValue(rec, lineGuid, f, row);
-    }
-    if (this._cardNav && this._cardNav.lineGuid === lineGuid) this._paintCardNav();
-  }
-
   // Give an empty record a first body line to type into, then focus it. The
   // transclusion mirrors the target's body, so the new line renders in the embed.
   async _addBodyLine(lineGuid) {
@@ -3262,9 +2996,6 @@ class Plugin extends AppPlugin {
     let line = null;
     try { line = await rec.createLineItem(null, null, "text"); } catch (e) {}
     if (!line) return;
-    // Re-render the card (body is no longer empty → the affordance drops away),
-    // then focus the freshly-rendered line for immediate keyboard typing.
-    setTimeout(() => { if (this._cards.has(lineGuid)) this._renderFreshCard(lineGuid, entry.recordGuid, true); }, 200);
     this._focusEmbeddedLine(lineGuid, line.guid, 0);
   }
 
@@ -3289,7 +3020,7 @@ class Plugin extends AppPlugin {
       if (!this._cards.has(lineGuid) && !this._queryEmbeds.has(lineGuid) && !this._lineEmbeds.has(lineGuid)) return false;
       const t = e.target;
       if (!(t instanceof Element)) return false;
-      if (t.closest("." + this._CARD_CLASS)) return false; // the card owns its clicks
+      if (this._pageEmbeds.has(lineGuid) || t.closest(".panel.refx-pemb")) return false; // the real page panel takes its own clicks
       const li = t.closest(".listitem");
       if (li && li !== node) return false; // a real body line — native caret placement works
       if (t !== node && !t.closest(".transclusion-container-div")) return false; // outside the body box
@@ -3350,129 +3081,12 @@ class Plugin extends AppPlugin {
     if (attempt < 14) setTimeout(() => this._focusEmbeddedLine(embedGuid, targetLineGuid, attempt + 1), 90);
   }
 
-  // Ensure a current card for this embed. If a HEALTHY card already exists, refresh
-  // it IN PLACE (no teardown → no flicker); only build a fresh node when none exists
-  // (or just a loading placeholder does). This is the single entry every keep-alive
-  // caller (observer, discovery, rehydrate) uses, so none of them flicker the card.
-  async _attachPropCard(lineGuid, recordGuid, silent) {
-    if (!this._cards.has(lineGuid)) return;
-    const escId = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-    const existing = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + escId + '"]');
-    if (existing && !existing.classList.contains("refx-propcard-loading")) { this._refreshCardInPlace(lineGuid, recordGuid); return; }
-    return this._renderFreshCard(lineGuid, recordGuid, silent, existing);
-  }
-
-  // Build a fresh card NODE: loading state → resolve the record (may not be loaded
-  // yet) → render. The ONLY path that creates/replaces the card node — everything
-  // else refreshes in place. Called for a genuinely-missing card or a structural
-  // change (add-content toggled, field set changed).
-  async _renderFreshCard(lineGuid, recordGuid, silent, existing) {
-    if (!this._cards.has(lineGuid)) return;
-    if (existing === undefined) { const escId = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid; existing = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + escId + '"]'); }
-    // On a silent refresh of an already-drawn card, skip the loading flash.
-    if (!silent || !existing) this._renderCardInto(lineGuid, this._el("div", this._CARD_CLASS + " refx-propcard-loading", "Loading…"));
-    let rec = this.data.getRecord(recordGuid);
-    for (let i = 0; i < 8 && !rec; i++) { await new Promise((r) => setTimeout(r, 60)); if (!this._cards.has(lineGuid)) return; rec = this.data.getRecord(recordGuid); }
-    if (!this._cards.has(lineGuid)) return;
-    if (!rec) { this._renderCardInto(lineGuid, this._el("div", this._CARD_CLASS + " refx-propcard-empty", "Record unavailable")); return; }
-    let fields = this._recCardFields(rec);
-    if (!fields.length) { await new Promise((r) => setTimeout(r, 150)); if (!this._cards.has(lineGuid)) return; fields = this._recCardFields(rec); }
-    // An empty record has no body line to type into — the native transclusion
-    // renders nothing editable — so the card offers an "add content" affordance.
-    if (!this._cards.has(lineGuid)) return;
-    this._renderCardInto(lineGuid, this._buildPropCard(rec, fields, lineGuid));
-  }
-
-  _renderCardInto(lineGuid, cardEl) {
-    const node = this._transclusionNode(lineGuid);
-    if (!node) return false;
-    cardEl.dataset.refxFor = lineGuid;
-    // The card is a plugin UI island injected into the transclusion. Marking it
-    // non-editable stops Thymer's editor from swallowing clicks on it as caret
-    // placement, so its own click handlers (edit a value) fire reliably.
-    cardEl.contentEditable = "false";
-    const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-    const existing = document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]');
-    const entry = this._cards.get(lineGuid);
-    if (existing && existing !== cardEl && node.contains(existing)) {
-      // MORPH IN PLACE: keep the existing card NODE (preserve its identity) and adopt
-      // the fresh content, instead of remove+insert. Anything holding the card node
-      // survives; only rows/value-cells are swapped, so the resume/paint tail below
-      // re-lands the nav cursor and _applyRowValue re-finds any in-flight rowEl.
-      existing.className = cardEl.className;
-      existing.replaceChildren(...cardEl.childNodes);
-      if (entry) entry.cardEl = existing; // cache for the observer's zero-flash re-insert
-    } else {
-      this._removeCardEl(lineGuid);
-      // ROOT-CAUSE FIX (2026-07-01, live-proven): Thymer REPLACES the inner
-      // `.transclusion-container-div` node on EVERY property write, so a card placed
-      // inside it was destroyed as collateral and re-injected with a loading flash
-      // (the flicker) + a one-step-stale value. The `.listitem-transclusion` node
-      // survives, so inject the card as its FIRST CHILD (a scoped flex-wrap CSS rule
-      // stacks it full-width above the body). Now editing never wipes the card.
-      node.insertBefore(cardEl, node.firstChild);
-      if (entry) entry.cardEl = cardEl; // cache for the observer's zero-flash re-insert
-    }
-    this._alignCardToBody(lineGuid, node);
-    this._wireEmbedBodyClick(node, lineGuid);
-    // The card is in the DOM now (paint synchronously). If an edit stashed a resume,
-    // re-establish the cursor on that cell; else if a nav cursor is active, re-land it.
-    if (this._cardNavResume && this._cardNavResume.lineGuid === lineGuid) this._consumeNavResume(lineGuid);
-    else if (this._cardNav && this._cardNav.lineGuid === lineGuid) this._paintCardNav();
-    return true;
-  }
-
-  // Line the card's edges up with the body box: the transclusion body container has
-  // its own left/right margins (e.g. 30px indent / ~10px right, varying per context),
-  // and a full-width card overhangs it. Mirror the container's computed margins onto
-  // the card so the two boxes fuse edge-to-edge (the width calc keeps the card on its
-  // own flex line — outer size still spans the row, so the wrap layout is unchanged).
-  _alignCardToBody(lineGuid, node) {
-    try {
-      node = node || this._transclusionNode(lineGuid);
-      if (!node) return;
-      const card = node.querySelector(":scope > ." + this._CARD_CLASS);
-      const cont = node.querySelector(".transclusion-container-div");
-      if (!card || !cont) return;
-      const cs = getComputedStyle(cont);
-      const ml = cs.marginLeft || "0px", mr = cs.marginRight || "0px";
-      card.style.marginLeft = ml;
-      card.style.marginRight = mr;
-      card.style.width = "calc(100% - " + ml + " - " + mr + ")";
-      card.style.flex = "0 0 auto";
-      // Fuse with the body box: the stylesheet gives the card the same VARS as
-      // .container-border, but custom themes/CSS can restyle the transclusion
-      // container specifically (Parham's does) — so copy its ACTUAL computed
-      // colours on top. Stale-on-theme-switch is handled by the theme observer
-      // (_ensureThemeObserver), which clears + re-copies on data-theme change.
-      if (cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)") card.style.backgroundColor = cs.backgroundColor;
-      if (cs.borderTopColor) card.style.borderColor = cs.borderTopColor;
-    } catch (e) {}
-  }
-
-  // Re-copy every card's fused colours when the THEME changes — the inline
-  // copies taken at render time otherwise go stale (light: darker gray card;
-  // switching back to dark: lighter gray card).
-  _ensureThemeObserver() {
-    if (this._themeObs || this._unloaded) return;
-    try {
-      const obs = new MutationObserver(() => {
-        setTimeout(() => {
-          if (this._unloaded) return;
-          for (const [lineGuid] of this._cards) {
-            try {
-              const node = this._transclusionNode(lineGuid);
-              const card = node && node.querySelector(":scope > ." + this._CARD_CLASS);
-              if (card) { card.style.backgroundColor = ""; card.style.borderColor = ""; }
-              this._alignCardToBody(lineGuid, node);
-            } catch (e) {}
-          }
-        }, 50); // let the new theme's styles apply before re-reading computed colours
-      });
-      obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-      this._themeObs = obs;
-      window.__refxThemeObs = obs;
-    } catch (e) {}
+  // The single entry every caller uses (expand, discovery, rehydrate, a refused collapse) to
+  // give a page embed its page panel. On the phone there is none: Thymer's own transclusion
+  // shows the body, and that is the whole of it there.
+  _attachPropCard(lineGuid, recordGuid) {
+    if (!this._cards.has(lineGuid) || !this._peOn()) return;
+    this._peAttach(lineGuid, recordGuid);
   }
 
   // The embed's rendered node. Primary = DOM query on the line's data-guid (the
@@ -3495,18 +3109,7 @@ class Plugin extends AppPlugin {
     return null;
   }
 
-  _removeCardEl(lineGuid) {
-    try {
-      const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-      document.querySelectorAll("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]').forEach((n) => n.remove());
-    } catch (e) {}
-  }
-
-  _removeAllCardEls() {
-    try { document.querySelectorAll("." + this._CARD_CLASS).forEach((n) => n.remove()); } catch (e) {}
-  }
-
-  // ---- observer (lazy, panel-scoped, hot-reload-guarded) ----
+  _removeCardEl(lineGuid) { this._peClose(lineGuid); }
 
   _ensureCardObserver() {
     if (this._cardObs || this._unloaded) return;
@@ -3517,35 +3120,21 @@ class Plugin extends AppPlugin {
     const target = document.body;
     const obs = new MutationObserver(() => {
       if (!this._cards.size && !this._queryEmbeds.size && !this._lineEmbeds.size) return;
-      // ZERO-FLASH keep-alive: MutationObserver callbacks are microtasks — they run
-      // BEFORE the browser paints the mutation. If a native re-render just dropped a
-      // card, re-inserting the CACHED node here (synchronously) means no painted
-      // frame ever lacks the card → no flicker, and the value it already shows stays
-      // continuously visible (instant). The old rAF-deferred rebuild painted a
-      // card-less frame first — that was the residual flash.
-      // PRESENCE CHECK: cached-node isConnected FIRST — it's O(1), whereas the
-      // compound querySelector walks the document per card per mutation batch
-      // (Thymer mutates line DOM on essentially every keystroke).
-      // The cached-node re-insert runs even while a POPUP editor is open
-      // (_cardEditing): a relation write re-renders the whole transclusion node
-      // and wiped the card behind the still-open picker (only the search box was
-      // left). Re-inserting the SAME node can't disturb the popup (it lives on
-      // document.body) and keeps every rowEl/valEl reference valid. Only the
-      // REBUILD path below must wait for the editor to close.
-      let needRebuild = false;
-      for (const [lineGuid, e] of this._cards) {
-        if (e.cardEl && e.cardEl.isConnected) continue;
-        if (!e.cardEl) {
-          const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-          if (document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]')) continue;
+      // MutationObserver callbacks are microtasks: they run BEFORE the browser paints, so whatever
+      // is put back here never shows a frame without it.
+      // PAGE PANELS: Thymer rebuilds a transclusion row on every change to it and drops the
+      // borrowed panel (it stays alive, detached), and it RECYCLES row elements for other lines
+      // (a panel was found inside an element that now carried the next row's guid). Put each one
+      // back into the row that is really its own, before the paint.
+      if (this._pageEmbeds.size) {
+        let moved = false;
+        for (const [g, pe] of this._pageEmbeds) {
+          if (!pe.ready || !pe.slot) continue;
+          const par = pe.slot.parentNode;
+          if (pe.slot.isConnected && par && par.getAttribute && par.getAttribute("data-guid") === g && par.classList.contains("refx-pemb-host")) continue;
+          this._pePlace(g); moved = true;
         }
-        const node = e.cardEl ? this._transclusionNode(lineGuid) : null;
-        if (node && e.cardEl) { try { node.insertBefore(e.cardEl, node.firstChild); this._alignCardToBody(lineGuid, node); this._wireEmbedBodyClick(node, lineGuid); } catch (err) { needRebuild = true; } }
-        else needRebuild = true;
-      }
-      if (needRebuild) {
-        if (this._cardEditing) { if (this._discoverPending == null) this._discoverPending = false; }
-        else if (!this._cardRaf) this._cardRaf = requestAnimationFrame(() => { this._cardRaf = 0; this._onCardMutation(); });
+        if (moved) this._peSweepHosts();
       }
       // Query-spawned embeds: keep each node parked under its result row. The
       // row node is REPLACED on every query re-render, and a host re-render can
@@ -3580,28 +3169,12 @@ class Plugin extends AppPlugin {
     window.__refxCardObs = obs;
   }
 
-  _onCardMutation() {
-    if (!this._cards.size || this._cardEditing || this._unloaded) return;
-    for (const [lineGuid, e] of this._cards) {
-      if (e.cardEl && e.cardEl.isConnected) continue; // O(1) fast path
-      const esc = (window.CSS && CSS.escape) ? CSS.escape(lineGuid) : lineGuid;
-      // silent=true: a keep-alive re-inject of a card that already existed must
-      // never show a "Loading…" flash. (Fallback only — the observer's synchronous
-      // cached-node re-insert above handles the common case pre-paint.)
-      if (!document.querySelector("." + this._CARD_CLASS + '[data-refx-for="' + esc + '"]')) this._attachPropCard(lineGuid, e.recordGuid, true);
-    }
-  }
-
   _teardownCardObserver() {
-    this._exitCardNav();
-    if (this._cardRaf) { try { cancelAnimationFrame(this._cardRaf); } catch (e) {} this._cardRaf = 0; }
     if (this._queryRaf) { try { cancelAnimationFrame(this._queryRaf); } catch (e) {} this._queryRaf = 0; }
     if (this._lineRaf) { try { cancelAnimationFrame(this._lineRaf); } catch (e) {} this._lineRaf = 0; }
     if (this._cardObs) { try { this._cardObs.disconnect(); } catch (e) {} }
     this._cardObs = null; this._cardObsTarget = null;
     if (window.__refxCardObs) { try { window.__refxCardObs.disconnect(); } catch (e) {} window.__refxCardObs = null; }
-    this._closeCardPopup();
-    this._removeAllCardEls();
   }
 
   // Disconnect observers + window listeners + remove orphan DOM left by a previous
@@ -3636,295 +3209,12 @@ class Plugin extends AppPlugin {
     try { if (window.__refxDiscoverTrigger) { document.removeEventListener("visibilitychange", window.__refxDiscoverTrigger, false); window.removeEventListener("focus", window.__refxDiscoverTrigger, false); } } catch (e) {}
     window.__refxDiscoverTrigger = null;
     try { document.querySelectorAll(".refx-nav-focus").forEach((el) => el.classList.remove("refx-nav-focus")); } catch (e) {}
-    // Orphan popup/backdrop DOM from a prior instance's open interaction.
-    try { document.querySelectorAll(".refx-cardpop, .refx-pop-backdrop, .refalias-pop, .refalias-backdrop, .refalias-catch").forEach((n) => n.remove()); } catch (e) {}
-    this._removeAllCardEls();
+    // Orphan popup/backdrop DOM from a prior instance's open interaction. The card-era classes
+    // (.refx-propcard, .refx-cardpop, .refx-pop-backdrop, .refx-nav-focus and the
+    // __refxThemeObs / __refxCardNav* / __refxPopupKey stashes above) belong to builds before
+    // 2026-11-02 that may still be the instance a reload replaces: keep sweeping them for a while.
+    try { document.querySelectorAll(".refx-propcard, .refx-cardpop, .refx-pop-backdrop, .refalias-pop, .refalias-backdrop, .refalias-catch").forEach((n) => n.remove()); } catch (e) {}
   }
-
-  // ---- inline property editing ----
-
-  // Self-heal a WEDGED editing flag. Chromium fires NO blur when a focused
-  // <input>/<textarea> is removed by a re-render, so if the card node was
-  // replaced mid-edit (e.g. a record.updated rebuild) the editor's commit never
-  // ran and `_cardEditing` stayed true — which silently BRICKS all card editing
-  // AND every expand/collapse (they gate on this flag). If the flag is set but
-  // no live editor (inline field or popup) exists in the DOM, it's orphaned:
-  // clear it. Cheap: only walks the DOM when the flag is actually set.
-  _healWedgedEditing() {
-    if (!this._cardEditing) return false;
-    try {
-      if (document.querySelector("." + this._CARD_CLASS + " input, ." + this._CARD_CLASS + " textarea, .refx-cardpop")) return false;
-    } catch (e) { return false; }
-    this._cardEditing = false;
-    this._activeEdit = null;
-    return true;
-  }
-
-  _editCardValue(rec, lineGuid, field, valEl, rowEl) {
-    if (field.kind === "file") { this._editFileValue(rec, lineGuid, field, valEl, rowEl); return; }
-    this._healWedgedEditing(); // recover if a prior editor was torn out without committing
-    // SWITCHING to another property while an inline text/number editor is open:
-    // the row's mousedown-preventDefault keeps the open <textarea>/<input> from
-    // blurring, so its blur-commit never fires and _cardEditing would wedge —
-    // you couldn't edit any other property. Commit the in-progress edit first
-    // (without stealing focus back to the line), then open the new one. A
-    // duplicate event for the SAME field (mousedown + click) is a no-op.
-    if (this._activeEdit) {
-      if (this._activeEdit.field === field.name) return;
-      try { this._activeEdit.commit(); } catch (e) {}
-    }
-    if (this._cardEditing) return; // a popup editor (choice/relation/date) is open
-    // Re-resolve the field FRESH at open: the click handlers bound in _fillPropRow
-    // capture a build-time snapshot, so after an earlier edit (or a remote change)
-    // the closure's `field.value` is stale — a blur-commit of the seeded input
-    // would silently revert a newer value, and pickers would mark the wrong
-    // current option.
-    try { const f = this._recCardFields(rec).find((x) => x.name === field.name); if (f) field = f; } catch (e) {}
-    if (field.kind === "choice") return this._editChoice(rec, lineGuid, field, valEl, rowEl);
-    if (field.kind === "relation") return this._editRelation(rec, lineGuid, field, valEl, rowEl);
-    if (field.kind === "date") return this._editDate(rec, lineGuid, field, valEl, rowEl);
-    this._cardEditing = true;
-    let done = false;
-    const isNum = field.kind === "number";
-    // Text fields edit in a WRAPPING, auto-growing <textarea> so long / multi-
-    // line values (Synopsis and the like) are fully visible and editable — the
-    // old single-line <input> hid everything past the first line. Numbers keep a
-    // numeric input.
-    const input = this._el(isNum ? "input" : "textarea", "refalias-input refx-propcard-input" + (isNum ? "" : " refx-propcard-textarea"));
-    if (isNum) input.type = "number"; else { input.rows = 1; input.wrap = "soft"; }
-    input.value = (field.value == null ? "" : String(field.value));
-    valEl.replaceWith(input);
-    const autosize = () => { if (isNum) return; try { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, Math.round(window.innerHeight * 0.4)) + "px"; } catch (e) {} };
-    setTimeout(() => { try { input.focus(); if (input.select) input.select(); autosize(); } catch (e) {} }, 0);
-    // commit: write + optimistic in-place row update + poll-confirm (no teardown).
-    // cancel: swap the editor back to a value span showing the original value, in
-    // place (no innerHTML clear). Both re-establish the nav cursor. `refocus`
-    // false skips returning focus to the line (used when we immediately open
-    // another editor — a switch).
-    const commit = (raw, refocus) => { if (done) return; done = true; this._activeEdit = null; this._commitClaim(lineGuid); this._cardEditing = false; this._writeCardProp(rec, field, raw); this._commitRefreshRow(rec, lineGuid, field, field.value, rowEl, raw); this._flushDeferredDiscover(); if (refocus !== false) this._refocusEditor(); };
-    const cancel = () => {
-      if (done) return; done = true; this._activeEdit = null; this._cardEditing = false;
-      let fresh = field; try { const f = this._recCardFields(rec).find((x) => x.name === field.name); if (f) fresh = f; } catch (e) {}
-      this._applyRowValue(rec, lineGuid, fresh, rowEl);
-      this._consumeNavResume(lineGuid);
-      this._flushDeferredDiscover();
-      this._refocusEditor();
-    };
-    // Track the open editor so teardown paths (collapse, navigation, switching to
-    // another property) can close it — removing a focused input fires NO blur in
-    // Chromium, which would leave _cardEditing wedged true and brick all editing.
-    this._activeEdit = { lineGuid, field: field.name, cancel, commit: () => commit(input.value, false) };
-    input.addEventListener("input", autosize);
-    input.addEventListener("keydown", (e) => {
-      e.stopPropagation();
-      // Enter commits (familiar quick-commit). In a textarea, Shift+Enter inserts
-      // a newline instead, for multi-line text.
-      if (e.key === "Enter" && !(e.shiftKey && !isNum)) { e.preventDefault(); commit(input.value); }
-      else if (e.key === "Escape") { e.preventDefault(); cancel(); }
-    });
-    input.addEventListener("blur", () => commit(input.value));
-  }
-
-  // Keyboard-first date editor REPLICATING Thymer's native date picker (studied live
-  // on a native record: same placeholder, month header with ‹ ○ › nav, weekday row,
-  // 6-week grid including prev/next-month days, and a bottom confirm bar showing the
-  // focused date). Type a natural-language date ("next friday", "aug 1", "monday")
-  // parsed by Thymer's own DateTime.parseDateTimeString, and/or arrow the grid. Works
-  // when the field is EMPTY (seeds to today). Commits via the same pick-ordering as
-  // the choice editor (pre-arm _commitInFlight → close → write → in-place refresh).
-  _editDate(rec, lineGuid, field, valEl, rowEl) {
-    const DT = (typeof DateTime !== "undefined" && DateTime && DateTime.parseDateTimeString) ? DateTime : null;
-    const pop = this._el("div", "refalias-pop refx-cardpop refx-datepop");
-    const input = this._el("input", "refalias-input");
-    input.placeholder = DT ? "Try: today, Aug 1, monday" : "YYYY-MM-DD";
-    input.value = field.value && /^\d{4}-\d{2}-\d{2}/.test(field.value) ? field.value : "";
-    // Header: month label + ‹ ○ › (prev / today / next), like the native picker.
-    const header = this._el("div", "refx-datepop-header");
-    const monthLabel = this._el("span", "refx-datepop-month");
-    const navBox = this._el("span", "refx-datepop-nav");
-    const mkNav = (icon, title, fn) => { const b = this._el("button", "refx-datepop-navbtn"); b.type = "button"; b.title = title; b.append(this._el("span", "ti " + icon)); b.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); fn(); }); return b; };
-    const weekdays = this._el("div", "refx-datepop-weekdays");
-    ["S","M","T","W","T","F","S"].forEach((w) => weekdays.append(this._el("div", "refx-datepop-dow", w)));
-    const grid = this._el("div", "refx-datepop-grid");
-    // Bottom confirm bar (native: the selected autocomplete row "📅 Wed Jul 1").
-    const confirm = this._el("div", "refx-datepop-confirm");
-    pop.append(input, header, weekdays, grid, confirm);
-
-    const iso = (y, m0, d) => y + "-" + String(m0 + 1).padStart(2, "0") + "-" + String(d).padStart(2, "0");
-    const today = this._todayParts();
-    // field.value is "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" (time preserved when stored).
-    let seed = (field.value && /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}:\d{2}))?/.exec(field.value));
-    let viewY = seed ? +seed[1] : today.y, viewM = seed ? (+seed[2] - 1) : today.m;
-    let cur = { y: viewY, m: viewM, d: seed ? +seed[3] : today.d }; // focused date (can be outside viewM)
-    let curTime = seed && seed[4] ? seed[4] : null; // "HH:MM" — typed or pre-existing time
-    const curIso = seed ? iso(+seed[1], +seed[2] - 1, +seed[3]) : null;
-
-    // typedDtv: the LAST successful parse of the input text, kept as the raw
-    // DateTimeValue. Committing it AS-IS is what preserves Thymer's granular date
-    // values — "week 28", "Q3 2026", "july 2025", "2027", "last year" all store
-    // and render exactly like native pills instead of collapsing to one day.
-    // Cleared whenever the user drives the GRID (that's an explicit day choice).
-    let typedDtv = null; // { v: DateTimeValue, formatted, machine: "YYYY-MM-DD[ HH:MM]" }
-    const pick = (isoStr) => {
-      typedDtv = null; // day-granularity commit (grid/clear)
-      const raw = isoStr ? (isoStr + (curTime ? " " + curTime : "")) : "";
-      this._commitClaim(lineGuid);
-      this._closeCardPopup();
-      this._writeCardProp(rec, field, raw);
-      this._commitRefreshRow(rec, lineGuid, field, field.value, rowEl, raw);
-    };
-    const pickTyped = (td) => {
-      this._commitClaim(lineGuid);
-      this._closeCardPopup();
-      this._writeCardProp(rec, field, { dtv: td.v });
-      this._commitRefreshRow(rec, lineGuid, field, field.value, rowEl, td.machine, td.formatted);
-    };
-    const MONTHS_FULL = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-    const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    const DOWS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-    const fmt = (y, m0, d) => { const dt = new Date(y, m0, d); return DOWS[dt.getDay()] + " " + MONTHS[m0] + " " + d + (y !== today.y ? " " + y : ""); };
-    header.append(monthLabel, navBox);
-    navBox.append(
-      mkNav("ti-chevron-left", "Previous month", () => { viewM--; if (viewM < 0) { viewM = 11; viewY--; } render(); }),
-      mkNav("ti-point", "Go to today", () => { viewY = today.y; viewM = today.m; cur = { ...today }; render(); }),
-      mkNav("ti-chevron-right", "Next month", () => { viewM++; if (viewM > 11) { viewM = 0; viewY++; } render(); })
-    );
-    const render = () => {
-      monthLabel.textContent = MONTHS_FULL[viewM] + " " + viewY;
-      grid.innerHTML = "";
-      // 6 fixed weeks incl. prev/next-month days, exactly like native.
-      const firstDow = new Date(viewY, viewM, 1).getDay();
-      const start = new Date(viewY, viewM, 1 - firstDow);
-      for (let i = 0; i < 42; i++) {
-        const dt = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
-        const y = dt.getFullYear(), m0 = dt.getMonth(), d = dt.getDate();
-        const di = iso(y, m0, d);
-        let cls = "refx-datepop-day " + (m0 === viewM ? "cur-month" : "adj-month");
-        if (y === cur.y && m0 === cur.m && d === cur.d) cls += " refx-datepop-focus";
-        if (di === curIso) cls += " refx-datepop-sel";
-        if (y === today.y && m0 === today.m && d === today.d) cls += " refx-datepop-today";
-        const cell = this._el("div", cls);
-        cell.append(this._el("span", "refx-datepop-day-inner", String(d)));
-        cell.dataset.iso = di;
-        cell.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); pick(di); });
-        grid.append(cell);
-      }
-      confirm.innerHTML = "";
-      // Typed granular values show their NATIVE formatted text ("Week 28",
-      // "Q3 2026"); grid-driven focus shows the day form.
-      const label = typedDtv ? typedDtv.formatted : (fmt(cur.y, cur.m, cur.d) + (curTime ? " " + curTime : ""));
-      confirm.append(this._el("span", "ti ti-calendar-event"), this._el("span", "refx-datepop-confirm-label", label));
-    };
-    // Parse the typed text into {year, month, day, time?}. GUARDS (the "17:00" bug):
-    // a TIME-ONLY parse returns a DateTime whose date parts are undefined — feeding
-    // those into the grid rendered "undefined undefined" + NaN cells. Date parts that
-    // aren't finite fall back to toDate(), then to the currently-focused date (so a
-    // bare time means "the focused day at that time", like native). Time is kept as
-    // "HH:MM" — native accepts "17:00 tomorrow", "monday 3pm" etc.
-    const parseTyped = () => {
-      const q = input.value.trim();
-      if (!q) return null;
-      if (!DT) { const m = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/.exec(q); return m ? { year: +m[1], month: +m[2] - 1, day: +m[3], time: m[4] ? String(m[4]).padStart(2, "0") + ":" + m[5] : null } : null; }
-      let dt = null; try { dt = DT.parseDateTimeString(q); } catch (e) {}
-      if (!dt) return null;
-      // Capture the RAW DateTimeValue — for granular inputs ("week 28", "Q3 2026",
-      // "july 2025", "2027", "last year") the parser returns a RANGE spanning the
-      // period ({d, r:{d}}); committing THAT value (plus the native pill label) is
-      // what stores exactly what the native picker stores.
-      let dtv = null; try { dtv = dt.value && dt.value(); } catch (e) {}
-      let p = null; try { p = dt.getParts(); } catch (e) {}
-      let time = null;
-      if (p && p.hours != null && isFinite(p.hours)) time = String(p.hours).padStart(2, "0") + ":" + String(p.minutes != null && isFinite(p.minutes) ? p.minutes : 0).padStart(2, "0");
-      const ok = p && isFinite(p.year) && isFinite(p.month) && isFinite(p.day);
-      if (!ok) {
-        let jd = null; try { jd = dt.toDate && dt.toDate(); } catch (e) {}
-        if (jd && !isNaN(jd.getTime())) p = { year: jd.getFullYear(), month: jd.getMonth(), day: jd.getDate() };
-        else if (time) { p = { year: cur.y, month: cur.m, day: cur.d }; dtv = null; } // time-only → keep the focused day (no raw pass-through)
-        else if (dtv && dtv.d && /^\d{8}$/.test(dtv.d)) p = { year: +dtv.d.slice(0, 4), month: +dtv.d.slice(4, 6) - 1, day: +dtv.d.slice(6, 8) }; // granular value: anchor the grid on its start day
-        else return null;
-      }
-      const machine = iso(p.year, p.month, p.day) + (time ? " " + time : "");
-      // Only pass the raw value through for RANGED (granular) parses — plain day
-      // parses commit via the ISO path (identical result, simpler pipeline). The
-      // pill label: the parser leaves `formatted` empty (the native widget fills it
-      // at store time), so synthesize the native text and include it in the value.
-      let formatted = null;
-      if (dtv && dtv.r && dtv.r.d) {
-        formatted = dtv.formatted || this._synthDateLabel(dtv.d, dtv.r.d, time);
-        if (formatted && !dtv.formatted) dtv = Object.assign({}, dtv, { formatted });
-      } else dtv = null;
-      return { year: p.year, month: p.month, day: p.day, time, dtv, formatted, machine };
-    };
-    let t = 0;
-    // Apply the current input text to cur/curTime immediately — Enter or a confirm-
-    // click landing INSIDE the 120ms parse debounce must not commit the pre-typing
-    // date ("aug 1⏎" at normal speed used to write the previously focused day).
-    const applyParse = (p) => {
-      cur = { y: p.year, m: p.month, d: p.day };
-      curTime = p.time || null;
-      typedDtv = (p.dtv && p.formatted) ? { v: p.dtv, formatted: p.formatted, machine: p.machine } : null;
-    };
-    const flushParse = () => {
-      if (t) { clearTimeout(t); t = 0; }
-      if (document.activeElement !== input || !input.value.trim()) return;
-      const p = parseTyped();
-      if (p && isFinite(p.year) && isFinite(p.month) && isFinite(p.day)) applyParse(p);
-    };
-    input.addEventListener("input", () => {
-      if (t) clearTimeout(t);
-      t = setTimeout(() => {
-        t = 0;
-        const p = parseTyped();
-        if (p && isFinite(p.year) && isFinite(p.month) && isFinite(p.day)) {
-          applyParse(p);
-          viewY = p.year; viewM = p.month;
-          render();
-        }
-        else if (!input.value.trim()) { curTime = null; typedDtv = null; render(); }
-        else { typedDtv = null; confirm.querySelector(".refx-datepop-confirm-label").textContent = "…"; }
-      }, 120);
-    });
-    confirm.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); flushParse(); if (typedDtv) pickTyped(typedDtv); else pick(iso(cur.y, cur.m, cur.d)); });
-
-    // One window-capture key handler for the whole popup (text input + grid). Passed
-    // to _openCardPopup as opts.onKey so its built-in row handler isn't installed.
-    const onKey = (e) => {
-      // Only while the popup owns focus (a palette stacked on top must get its own
-      // keys), and never convert MODIFIED chords (Cmd+Up etc.) into grid moves.
-      if (!pop.contains(document.activeElement)) return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); this._closeCardPopup(); return; }
-      if (e.key === "Enter") {
-        e.preventDefault(); e.stopImmediatePropagation();
-        flushParse();
-        const q = input.value.trim();
-        // Cleared-out input + Enter on a field that HAD a value = clear it;
-        // otherwise Enter commits what the confirm bar shows: the typed value
-        // (raw DateTimeValue, granularity preserved) or the grid-focused day.
-        if (document.activeElement === input && !q && curIso) { pick(""); return; }
-        if (typedDtv) { pickTyped(typedDtv); return; }
-        pick(iso(cur.y, cur.m, cur.d));
-        return;
-      }
-      if (e.key === "Backspace" && document.activeElement === input && !input.value && curIso) { e.preventDefault(); e.stopImmediatePropagation(); pick(""); return; } // clear existing date
-      // Movement keys drive the calendar grid; the view follows the focused date.
-      // Driving the grid is an explicit DAY choice — drop any typed granular value.
-      const step = (dd) => { e.preventDefault(); e.stopImmediatePropagation(); typedDtv = null; const dt = new Date(cur.y, cur.m, cur.d + dd); cur = { y: dt.getFullYear(), m: dt.getMonth(), d: dt.getDate() }; viewY = cur.y; viewM = cur.m; render(); };
-      if (e.key === "ArrowLeft") return step(-1);
-      if (e.key === "ArrowRight") return step(1);
-      if (e.key === "ArrowUp") return step(-7);
-      if (e.key === "ArrowDown") return step(7);
-      if (e.key === "PageUp") { e.preventDefault(); e.stopImmediatePropagation(); viewM--; if (viewM < 0) { viewM = 11; viewY--; } render(); return; }
-      if (e.key === "PageDown") { e.preventDefault(); e.stopImmediatePropagation(); viewM++; if (viewM > 11) { viewM = 0; viewY++; } render(); return; }
-      // other keys (typing) fall through to the focused input
-    };
-
-    render();
-    this._openCardPopup(pop, valEl, { onKey: onKey });
-    setTimeout(() => { try { input.focus(); } catch (e) {} }, 0);
-  }
-
-  _todayParts() { const d = new Date(); return { y: d.getFullYear(), m: d.getMonth(), d: d.getDate() }; }
 
   // Native-style display for a machine date value "YYYY-MM-DD[ HH:MM]" →
   // "Sun Jul 12" (+ year when not the current year) (+ " 17:00"). Used as the
@@ -3975,231 +3265,6 @@ class Plugin extends AppPlugin {
     return dayLabel(a) + " – " + dayLabel(b);
   }
 
-  // Searchable choice picker (mirrors Thymer's native property editor): a "Search
-  // option…" filter box above the options, current value highlighted, ↑/↓ + Enter
-  // to pick. Typing filters the list; (None) clears the value (listed last).
-  _editChoice(rec, lineGuid, field, valEl, rowEl) {
-    const pop = this._el("div", "refalias-pop refx-cardpop refx-choicepop");
-    const input = this._el("input", "refalias-input");
-    input.placeholder = "Search option…";
-    const list = this._el("div", "refalias-results");
-    const options = (field.choices || []).map((c) => ({ label: c.label, cls: "" }));
-    options.push({ label: "", display: "(None)", cls: "refx-cardpop-clear" });
-    const pick = (label) => { this._commitClaim(lineGuid); this._closeCardPopup(); this._writeCardProp(rec, field, label); this._commitRefreshRow(rec, lineGuid, field, field.value, rowEl, label); };
-    const render = (q) => {
-      list.innerHTML = "";
-      const ql = (q || "").trim().toLowerCase();
-      const matches = options.filter((o) => { const d = o.display || o.label; return !ql || (d && d.toLowerCase().includes(ql)); });
-      for (const o of matches) {
-        const row = this._el("div", "refalias-result" + (o.cls ? " " + o.cls : "") + (o.label === field.value ? " refalias-result-sel" : ""));
-        row.append(this._el("span", "refalias-result-text", o.display || o.label));
-        row.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); pick(o.label); });
-        list.append(row);
-      }
-      if (!matches.length) list.append(this._el("div", "refx-cardpop-empty", "No matching options"));
-    };
-    render("");
-    input.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { e.preventDefault(); this._closeCardPopup(); } });
-    input.addEventListener("input", () => { render(input.value); if (this._cardPopup && this._cardPopup.resync) this._cardPopup.resync(true); });
-    pop.append(input, list);
-    this._openCardPopup(pop, valEl);
-  }
-
-  // Relation picker with a BROWSE list (like Thymer's native record dropdown): when
-  // the field declares a target collection (PropertyField.filter_colguid — e.g.
-  // Lead→People, Area→Areas, Goal→Goals), the popup opens with that collection's
-  // records listed so ↑/↓ + Enter work immediately; typing filters the list. Fields
-  // without a target collection keep workspace-wide search-on-type.
-  // Relation picker with native anatomy (verified against the real one):
-  //   "Search option ..." field · CURRENT values first with an accent check
-  //   (click = remove) · then suggestions with their icons (the target collection
-  //   when the field declares one, else recently-edited records workspace-wide) ·
-  //   multi-value fields (schema `many`) stay open and toggle; single-value picks
-  //   replace and close · "(None)" only for single-value (multi clears by
-  //   unchecking).
-  _editRelation(rec, lineGuid, field, valEl, rowEl) {
-    const meta = this._fieldMeta && field.id ? this._fieldMeta[field.id] : null;
-    if (meta && meta.read_only) return this._toast("That property is read-only.");
-    const many = !!(meta && meta.many);
-    const pop = this._el("div", "refalias-pop refx-cardpop refx-relpop");
-    const input = this._el("input", "refalias-input");
-    input.placeholder = "Search option ...";
-    const list = this._el("div", "refalias-results");
-    pop.append(input, list);
-    let browse = null;   // [{r, name, lower, icon, guid}] target collection (filter_colguid)
-    let recent = null;   // same shape, recently-edited workspace-wide (no filter_colguid)
-    let closed = false;
-
-    const currentLinks = () => {
-      try {
-        return ((rec.prop(field.name).linkedRecords && rec.prop(field.name).linkedRecords()) || []).map((r) => {
-          let g = null; try { g = r._getRow && r._getRow().guid; } catch (e) {}
-          return { r, guid: g, name: (r.getName && r.getName()) || "Untitled", icon: this._iconForRecord(r) };
-        }).filter((x) => x.guid);
-      } catch (e) { return []; }
-    };
-    // Session-local OPTIMISTIC current values. linkedRecords() lags a write:
-    // re-reading it right after prop.set returned the OLD list, so a removed
-    // value stayed "checked" and the next add wrote the stale list back (the
-    // remove-then-can't-re-add / removed-value-comes-back bug). While the popup
-    // is open IT owns the truth: every render and every write derives from
-    // curList, never from a fresh linkedRecords() read.
-    let curList = currentLinks();
-    const writeGuids = (guids) => {
-      this._commitClaim(lineGuid);
-      let p = null; try { p = rec.prop(field.name); } catch (e) {}
-      if (!p) return;
-      try { p.set(many ? guids : (guids[0] || "")); } catch (e) { try { p.set(guids); } catch (e2) {} }
-    };
-    // Fresh pills for the optimistic row update (stale field.pills would show
-    // the previous chips until the write propagates).
-    const pillsOf = (list) => list.map((x) => ({ t: x.name, icon: x.icon || null, guid: x.guid }));
-    const refreshRow = (display, pillsNow) => { this._commitRefreshRow(rec, lineGuid, field, field.value, rowEl, display, "", pillsNow || null); };
-
-    const render = (q) => {
-      if (closed || !this._cardPopup || this._cardPopup.pop !== pop) return;
-      list.innerHTML = "";
-      const ql = (q || "").trim().toLowerCase();
-      const cur = curList;
-      const curGuids = new Set(cur.map((c) => c.guid));
-      // 1) current values, accent-checked; click (or the native-style ×) removes
-      // (multi) / clears (single)
-      for (const c of cur) {
-        if (ql && !c.name.toLowerCase().includes(ql)) continue;
-        const row = this._el("div", "refalias-result refx-opt-checked");
-        const chk = this._el("span", "refx-opt-chkbadge"); chk.append(this._el("span", "ti ti-check")); row.append(chk);
-        if (c.icon) row.append(this._el("span", "refx-opt-ico ti " + c.icon));
-        row.append(this._el("span", "refalias-result-text", c.name));
-        row.append(this._el("span", "refx-opt-x ti ti-x"));
-        row.addEventListener("mousedown", (e) => {
-          e.preventDefault(); e.stopPropagation();
-          curList = curList.filter((x) => x.guid !== c.guid);
-          writeGuids(curList.map((x) => x.guid));
-          refreshRow(curList.map((x) => x.name).join(", "), pillsOf(curList));
-          if (many) render(input.value); else { closed = true; this._closeCardPopup(); }
-        });
-        list.append(row);
-      }
-      // 2) suggestions (minus already-picked), each with its record icon. When the
-      // user is SEARCHING, rank by relevance like native (exact → prefix → word-
-      // start → contains, shorter names first within a tier) instead of leaving the
-      // list in its browse order (alphabetical / recency), which buried exact hits
-      // (e.g. "Psychology" sat below "Bark scale (psychoacoustic…)").
-      const src = browse || recent || [];
-      let matches = src.filter((ent) => !curGuids.has(ent.guid) && (!ql || ent.lower.includes(ql)));
-      if (ql) {
-        const rank = (lo) => lo === ql ? 0 : (lo.startsWith(ql) ? 1 : (lo.split(/[^a-z0-9]+/).some((w) => w && w.startsWith(ql)) ? 2 : 3));
-        matches = matches
-          .map((ent) => ({ ent, rk: rank(ent.lower) }))
-          .sort((a, b) => a.rk - b.rk || a.ent.lower.length - b.ent.lower.length || a.ent.name.localeCompare(b.ent.name))
-          .map((x) => x.ent);
-      }
-      matches = matches.slice(0, 40);
-      for (const ent of matches) {
-        const row = this._el("div", "refalias-result");
-        if (ent.icon) row.append(this._el("span", "refx-opt-ico ti " + ent.icon));
-        row.append(this._el("span", "refalias-result-text", ent.name));
-        row.addEventListener("mousedown", (e) => {
-          e.preventDefault(); e.stopPropagation();
-          if (many) {
-            curList = curList.concat([{ guid: ent.guid, name: ent.name, icon: ent.icon }]);
-            writeGuids(curList.map((x) => x.guid));
-            refreshRow(curList.map((x) => x.name).join(", "), pillsOf(curList));
-            input.value = ""; render("");
-          } else {
-            closed = true; this._closeCardPopup();
-            writeGuids([ent.guid]);
-            refreshRow(ent.name, pillsOf([ent]));
-          }
-        });
-        list.append(row);
-      }
-      // 2b) "+ Create «query»" (native anatomy: bottom row, target collection name
-      // right-aligned): only when the field declares a target collection (so we
-      // know WHERE to create) and no current value or suggestion already has that
-      // exact name. col.createRecord returns the new guid synchronously.
-      let createRow = null;
-      const qname = (q || "").trim();
-      if (qname && col && col.createRecord && !cur.some((c) => c.name.toLowerCase() === ql) && !src.some((ent) => ent.lower === ql)) {
-        createRow = this._el("div", "refalias-result refx-opt-create");
-        createRow.append(this._el("span", "refalias-result-text", "+ Create “" + qname + "”"));
-        let colName = ""; try { colName = (col.getName && col.getName()) || ""; } catch (e) {}
-        if (colName) createRow.append(this._el("span", "refx-opt-createcol", colName));
-        createRow.addEventListener("mousedown", (e) => {
-          e.preventDefault(); e.stopPropagation();
-          let guid = null;
-          try { guid = col.createRecord(qname); } catch (err) {}
-          if (!guid) { this._toast("Couldn't create “" + qname + "”."); return; }
-          // Make the new record known to this popup's browse list right away
-          // (getAllRecords already resolved; a re-render must see it as current).
-          const ent2 = { r: null, name: qname, lower: qname.toLowerCase(), icon: null, guid };
-          if (browse) { browse.push(ent2); browse.sort((a, b) => a.name.localeCompare(b.name)); }
-          if (many) {
-            curList = curList.concat([{ guid, name: qname, icon: null }]);
-            writeGuids(curList.map((x) => x.guid));
-            refreshRow(curList.map((x) => x.name).join(", "), pillsOf(curList));
-            input.value = ""; render("");
-          } else {
-            closed = true; this._closeCardPopup();
-            writeGuids([guid]);
-            refreshRow(qname, [{ t: qname, icon: null, guid }]);
-          }
-        });
-        list.append(createRow);
-      }
-      if (!cur.length && !matches.length && !createRow) list.append(this._el("div", "refx-cardpop-empty", "No matches"));
-      // 3) "(None)" clears — single-value only (multi clears by unchecking)
-      if (!many) {
-        const clr = this._el("div", "refalias-result refx-cardpop-clear");
-        clr.append(this._el("span", "refalias-result-text", "(None)"));
-        clr.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); closed = true; this._commitClaim(lineGuid); this._closeCardPopup(); this._clearRelation(rec, field); refreshRow(""); });
-        list.append(clr);
-      }
-      if (this._cardPopup && this._cardPopup.resync) this._cardPopup.resync(false);
-    };
-
-    input.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { e.preventDefault(); this._closeCardPopup(); } });
-    input.addEventListener("input", () => render(input.value));
-    this._openCardPopup(pop, valEl);
-    setTimeout(() => { try { input.focus(); } catch (e) {} }, 0);
-    render("");
-
-    const entify = (r) => {
-      // Per-record armour: ONE record with a throwing getName()/prop() must not
-      // kill the whole list (it silently did — the "empty suggestions" bug).
-      try {
-        const name = (r.getName && r.getName()) || "Untitled";
-        let g = null; try { g = r._getRow && r._getRow().guid; } catch (e) {}
-        let ic = null; try { ic = this._iconForRecord(r); } catch (e) {}
-        return { r, name, lower: name.toLowerCase(), icon: ic, guid: g };
-      } catch (e) { return { r, name: "", lower: "", icon: null, guid: null }; }
-    };
-    const col = meta && meta.filter_colguid && this._colByGuid ? this._colByGuid[meta.filter_colguid] : null;
-    if (col && col.getAllRecords) {
-      // Declared target collection → its records, alphabetical.
-      col.getAllRecords().then((recs) => {
-        if (closed || !this._cardPopup || this._cardPopup.pop !== pop) return;
-        browse = (recs || []).map(entify).filter((x) => x.guid).sort((a, b) => a.name.localeCompare(b.name));
-        render(input.value);
-      }).catch(() => {});
-    } else {
-      // No declared collection → recently edited records workspace-wide (what
-      // native suggests). u_at lives on the raw row — cheap to sort; only the
-      // top slice pays getName/icon resolution.
-      setTimeout(() => {
-        if (closed || !this._cardPopup || this._cardPopup.pop !== pop) return;
-        try {
-          const all = (this.data.getAllRecords && this.data.getAllRecords()) || [];
-          const rows = [];
-          for (const r of all) { try { const row = r._getRow && r._getRow(); if (row && row.guid) rows.push({ r, u: row.u_at || 0 }); } catch (e) {} }
-          rows.sort((a, b) => b.u - a.u);
-          recent = rows.slice(0, 300).map((x) => entify(x.r)).filter((x) => x.guid); // x.r, NOT x — the wrapper has no record API
-          render(input.value);
-        } catch (e) {}
-      }, 0);
-    }
-  }
-
   _writeCardProp(rec, field, raw) {
     let p = null; try { p = rec.prop(field.name); } catch (e) {}
     if (!p) return;
@@ -4244,94 +3309,6 @@ class Plugin extends AppPlugin {
         p.set(raw);
       }
     } catch (e) {}
-  }
-
-  // Write the GUID STRING, never the PluginRecord/{guid} object: p.set(object)
-  // stores the object, which the plugin's own values() fallback happens to render
-  // but the NATIVE property pane shows as "[object Object]" — silent data
-  // corruption on the record (caught live 2026-07-01 on Area/Goal).
-  _setRelation(rec, field, recObj) {
-    let p = null; try { p = rec.prop(field.name); } catch (e) {}
-    if (!p) return;
-    let guid = null;
-    try { guid = (recObj && recObj.getGuid && recObj.getGuid()) || (recObj && recObj.guid) || null; } catch (e) {}
-    if (!guid || typeof guid !== "string") return;
-    try { p.set(guid); } catch (e) {}
-  }
-
-  _clearRelation(rec, field) {
-    let p = null; try { p = rec.prop(field.name); } catch (e) {}
-    if (!p) return;
-    try { p.set(""); } catch (e) { try { p.set([]); } catch (e2) {} }
-  }
-
-  // opts.onKey: a custom window-capture keydown handler (the date grid supplies its
-  // own). When given, the built-in option-row handler is NOT installed, so the two
-  // never conflict (the built-in used stopImmediatePropagation and would swallow the
-  // grid's keys). opts.focusInput=false skips the auto-focus (grid manages focus).
-  _openCardPopup(pop, anchorEl, opts) {
-    opts = opts || {};
-    this._closeCardPopup();
-    this._cardEditing = true;
-    const backdrop = this._el("div", "refx-pop-backdrop");
-    document.body.append(backdrop, pop);
-    this._positionPopover(pop, [anchorEl]);
-    backdrop.addEventListener("mousedown", (e) => { e.preventDefault(); this._closeCardPopup(); });
-    let onKey, resync = null;
-    if (opts.onKey) {
-      onKey = opts.onKey;
-    } else {
-      // Keyboard nav over the option rows (choice + relation): ↑/↓ move, Enter
-      // picks, Esc cancels. Window-capture so it beats the card's own key handlers.
-      const rowsOf = () => [...pop.querySelectorAll(".refalias-result")];
-      let sel = -1;
-      const paint = () => { rowsOf().forEach((r, i) => r.classList.toggle("refalias-result-sel", i === sel)); };
-      resync = (preferFirst) => {
-        const rs = rowsOf();
-        if (!rs.length) { sel = -1; return; }
-        const cur = rs.findIndex((r) => r.classList.contains("refalias-result-sel"));
-        sel = preferFirst ? 0 : (cur >= 0 ? cur : 0);
-        paint();
-        if (rs[sel]) { try { rs[sel].scrollIntoView({ block: "nearest" }); } catch (e) {} }
-      };
-      onKey = (e) => {
-        // Only handle keys while the popup owns focus — a UI stacked on top (the
-        // command palette) steals focus, and swallowing its Enter/arrows here
-        // would drive OUR list invisibly behind it.
-        if (!pop.contains(document.activeElement)) return;
-        const rs = rowsOf();
-        if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); this._closeCardPopup(); return; }
-        // Bail (don't swallow) when there are no option rows, so a co-existing popup
-        // key handler could work — belt-and-suspenders alongside opts.onKey.
-        if (!rs.length) return;
-        if (e.key === "ArrowDown") { e.preventDefault(); e.stopImmediatePropagation(); sel = (sel + 1) % rs.length; paint(); rs[sel].scrollIntoView({ block: "nearest" }); return; }
-        if (e.key === "ArrowUp") { e.preventDefault(); e.stopImmediatePropagation(); sel = (sel - 1 + rs.length) % rs.length; paint(); rs[sel].scrollIntoView({ block: "nearest" }); return; }
-        if (e.key === "Enter") { if (sel >= 0 && rs[sel]) { e.preventDefault(); e.stopImmediatePropagation(); rs[sel].dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); } return; }
-      };
-    }
-    window.addEventListener("keydown", onKey, true);
-    window.__refxPopupKey = onKey; // hot-reload stash
-    this._cardPopup = { pop, backdrop, onKey, resync };
-    if (resync) resync(false);
-    if (opts.focusInput !== false) { const input = pop.querySelector("input"); setTimeout(() => { try { if (input) input.focus(); } catch (e) {} }, 0); }
-  }
-
-  _closeCardPopup() {
-    const cp = this._cardPopup;
-    this._cardPopup = null;
-    this._cardEditing = false;
-    if (cp) {
-      if (cp.onKey) { try { window.removeEventListener("keydown", cp.onKey, true); } catch (e) {} }
-      window.__refxPopupKey = null;
-      try { cp.pop.remove(); } catch (e) {}
-      try { cp.backdrop.remove(); } catch (e) {}
-      // A real popup (choice/relation) just closed — re-establish the nav cursor if
-      // an edit stashed one (pick or cancel). Guard on `cp` so the no-op close at
-      // the top of _openCardPopup (before the popup exists) doesn't consume it.
-      this._consumeNavResume();
-      this._flushDeferredDiscover();
-      this._refocusEditor();
-    }
   }
 
   // The popup's <input> takes DOM focus; when it closes, activeElement falls back
@@ -5267,152 +4244,35 @@ html.is-light .refalias-lp-text b { color: var(--color-primary-700, #2f8873); }
 }
 .refalias-primary:disabled { opacity: .5; cursor: default; }
 
-/* record property card (rendered above the body inside a record embed) */
-.refx-propcard {
-  margin: 2px 0 0; padding: 8px 10px;
-  /* Same vars as the native .container-border (bg/border/radius), so the card
-     tracks EVERY theme switch live — copying computed colours at render went
-     stale on theme change (light: darker gray; back to dark: lighter gray).
-     Top corners get the block radius; bottom is square, fused with the body. */
-  border-radius: var(--ed-radius-block, 6px) var(--ed-radius-block, 6px) 0 0;
-  background: var(--ed-container-bg-color, rgba(127,127,127,.08));
-  border: 1px solid var(--ed-container-border-color, rgba(127,127,127,.18));
-  border-bottom: none;
-  color: var(--text-color, #555958);
-  /* NO font-size/line-height here: rows and pills inherit through the native
-     .page-props-editor scope, so they match the real property pane exactly and
-     track the user's theme/typography settings. */
-  /* The card is injected as the first child of .listitem-transclusion (a flex row);
-     take the full width on its own line above the body (see _renderCardInto). */
-  order: -1; flex: 0 0 100%; box-sizing: border-box;
+/* PAGE EMBEDS: the real page panel inside our transclusion line (see "page embeds") */
+.refx-pe-park { position: fixed; left: 0; top: 0; width: 800px; height: 600px; clip-path: inset(100%); pointer-events: none; z-index: -1; }
+.refx-pe-park > .panel { position: relative !important; width: 100% !important; height: 100% !important; }
+.panels-grid.refx-pe-mounting > .panel:not([data-refx-keep]) { position: absolute !important; left: -100000px !important; top: 0 !important; width: 900px !important; height: 600px !important; opacity: 0 !important; pointer-events: none !important; }
+.listitem-transclusion.refx-pemb-host { flex-wrap: wrap; }
+/* Thymer's own body of these rows is hidden by guid (stylesheet refx-pe-hide), see _peHideSync */
+.panel.refx-pemb {
+  --layout-margin-size: 0px; position: relative !important; display: block !important;
+  height: auto !important; min-height: 0 !important; flex: none !important;
+  margin: 0 0 0 30px !important; width: calc(100% - 30px) !important;
+  background: transparent !important; background-image: none !important; overflow: visible !important;
+  border: 0 !important; box-shadow: none !important; padding: 0 !important;
 }
-/* Only transclusions that carry our card wrap, so the card stacks above the body
-   instead of squeezing into the flex row. Scoped via :has() so no other rows change.
-   The body container fuses with the card into ONE box (card = top half): square off
-   its top corners, drop the doubled top edge and any gap between the two. */
-.listitem-transclusion:has(> .refx-propcard) { flex-wrap: wrap; row-gap: 0; }
-.listitem-transclusion:has(> .refx-propcard) > .transclusion-container-div {
-  margin-top: 0 !important;
-  border-top-left-radius: 0 !important;
-  border-top-right-radius: 0 !important;
-  border-top: 1px solid var(--ed-container-border-color, rgba(127,127,127,.14)) !important;
+.panel.refx-pemb::before, .panel.refx-pemb::after { display: none !important; }
+.panel.refx-pemb .panel-scroller-y { overflow: visible !important; height: auto !important; padding: 0 !important; }
+.panel.refx-pemb .panel-body, .panel.refx-pemb .layout-margin, .panel.refx-pemb .editor-panel { height: auto !important; padding: 0 !important; margin: 0 !important; min-height: 0 !important; }
+.panel.refx-pemb .content-container { margin: 0 !important; max-width: none !important; padding: 0 !important; }
+.panel.refx-pemb .panel-bar, .panel.refx-pemb .id--versions-area, .panel.refx-pemb .backrefs-footer, .panel.refx-pemb .vscrollbar { display: none !important; }
+.panel.refx-pemb[data-mode="box"] {
+  border: 1px solid color-mix(in srgb, var(--text-color) 22%, transparent) !important;
+  border-radius: var(--ed-radius-block, 6px) !important; padding: 6px 14px 10px !important;
+  margin-top: 6px !important; margin-bottom: 6px !important; box-sizing: border-box !important;
 }
-.refx-propcard-title { font-weight: 600; font-size: 13px; margin-bottom: 2px; opacity: .92; }
-/* Rows render through Thymer's own .page-props-row/.page-props-cell CSS (native
-   look, theme-following). Only additions on top of native: */
-.refx-native-props { pointer-events: auto; }
-.refx-native-props .page-props-row { cursor: default; }
-/* native puts this gap via its container scope; replicate inside the card */
-.refx-native-props .page-prop-type { display: flex; align-items: center; gap: 9px; }
-/* type icon: no extra dimming — native color comes via .page-prop-type itself */
-.refx-native-props .page-prop-val { display: flex; align-items: center; }
-.refx-native-props .page-prop-val { cursor: pointer; min-height: 20px; }
-.refx-propcard-value { min-width: 24px; min-height: 16px; display: inline-flex; align-items: center; border-radius: 4px; }
-.refx-propcard-value.refx-propcard-empty { min-width: 0; } /* empty renders blank → pencil sits at the column start, like native */
-.refx-propcard-value .prop-multi-values { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }
-/* native hover pencil as the edit affordance */
-.refx-propcard-pencil { margin-left: 4px; font-size: 12px; opacity: 0; transition: opacity .12s; }
-.refx-native-props .page-props-row:hover .refx-propcard-pencil { opacity: .45; }
-.refx-propcard-empty { opacity: .45; }
-/* "Properties · All ⌄" header + chooser popup (structured like native's) */
+
+/* shortcuts dialog: one capture row per shortcut */
 .refalias-capturing { border-color: var(--input-border-focus, rgba(127,127,127,.6)) !important; box-shadow: 0 0 0 2px rgba(127,127,127,.18); }
 .refalias-scrow { display: flex; align-items: center; gap: 12px; }
 .refalias-sclabel { flex: 1; font-size: 12.5px; }
 .refalias-scrow .refalias-capture { width: 150px; flex: none; text-align: center; padding: 8px 10px; }
-.refx-props-header { display: flex; align-items: center; gap: 6px; font-size: 12.5px; opacity: .55; margin: 8px 0 5px; }
-.refx-props-mode {
-  cursor: pointer; display: inline-flex; align-items: center; gap: 3px;
-  background: rgba(127,127,127,.14); border-radius: 5px; padding: 1px 4px 1px 7px;
-}
-.refx-props-mode:hover { background: rgba(127,127,127,.22); }
-.refx-props-mode .ti-selector { font-size: 11px; opacity: .8; }
-.refx-propchooser { width: 250px; }
-.refx-chk { width: 16px; display: inline-flex; justify-content: center; opacity: .9; font-size: 12px; }
-.refx-chooser-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.refx-chooser-sep { height: 1px; background: rgba(127,127,127,.16); margin: 5px 4px; }
-.refx-propcard-loading { opacity: .55; }
-.refx-propcard-input { padding: 4px 6px !important; font-size: 12px !important; }
-/* keyboard nav cursor (class-based, like Thymer's native property nav) */
-.refx-propcard-value.refx-nav-focus, .refx-propcard-addbody.refx-nav-focus {
-  outline: 2px solid var(--ed-button-primary-bg, #479797); outline-offset: 1px;
-  background: rgba(127,127,127,.12); border-radius: 4px;
-}
-.refx-propcard-addbody {
-  margin-top: 7px; font-size: 12px; opacity: .7; cursor: pointer;
-  padding: 3px 5px; border-radius: 6px; display: inline-block;
-  border: 1px dashed rgba(127,127,127,.35);
-}
-.refx-propcard-addbody:hover {
-  background: rgba(127,127,127,.14); opacity: 1; border-style: solid;
-}
-
-/* inline edit popups (choice / relation) — styled like Thymer's native inline
-   palette: flat search field with a divider, compact rows, accent selection */
-.refx-pop-backdrop { position: fixed; inset: 0; z-index: 2147483000; background: transparent; }
-.refx-cardpop {
-  width: 320px; max-width: calc(100vw - 24px); padding: 0; gap: 0;
-  background: var(--cmdpal-bg-color, #232327);
-  border: 1px solid rgba(127,127,127,.22);
-  /* native picker radius: .cmdpal--inline uses var(--radius-larger) */
-  border-radius: var(--radius-larger, 5px); overflow: hidden;
-}
-/* an empty embed body is a near-zero-height strip that's hard to click into —
-   give OUR embeds (the ones carrying a property card) a comfortable click
-   target; the click handler on the node turns it into caret focus / first line.
-   Height = ONE text line (1lh) + the container's paddings/margins/borders
-   (38px measured live), so creating the first line on click changes NOTHING
-   visually (no jump). */
-.listitem-transclusion:has(> .refx-propcard) .transclusion-container-div { min-height: calc(1lh + 38px); cursor: text; }
-/* the ↗ on record chips (native: padded, slightly raised, opens the record) */
-.refx-chip-arrow { padding: 3px; margin-left: 2px; cursor: pointer; opacity: .85; }
-.refx-chip-arrow:hover { opacity: 1; }
-.refx-cardpop .refalias-input {
-  background: transparent !important; border: none !important;
-  border-bottom: 1px solid rgba(127,127,127,.16) !important;
-  border-radius: 0 !important; padding: 10px 12px !important;
-  margin-bottom: 0 !important; font-size: 13px !important;
-}
-.refx-cardpop .refalias-results { max-height: 280px; padding: 5px; }
-/* the base .refalias-result is a COLUMN flex (from the [[ picker's two-line rows);
-   option rows here are native-style single lines → force row + left alignment */
-.refx-cardpop .refalias-result {
-  display: flex; flex-direction: row; align-items: center; justify-content: flex-start;
-  /* native option-row radius: .autocomplete--option uses var(--radius-normal) */
-  text-align: left; gap: 7px; padding: 6px 9px; border-radius: var(--radius-normal, 4px); font-size: 13px;
-}
-.refx-cardpop .refalias-result-sel { background: var(--ed-button-primary-bg, #479797); color: #fff; }
-/* inline text/number editor inside a card row: flat + native-like, not a pill */
-.refx-propcard .refalias-input.refx-propcard-input {
-  border-radius: 4px !important; background: transparent !important;
-  border: 1px solid var(--input-border-focus, var(--ed-button-primary-bg, #479797)) !important;
-  padding: 1px 6px !important; font-size: inherit !important; line-height: inherit !important;
-  flex: 1 1 auto; min-width: 0; width: auto;
-}
-/* text fields grow with content and wrap, so long/multi-line text is editable */
-.refx-propcard .refalias-input.refx-propcard-textarea {
-  resize: none; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere;
-  font-family: inherit; display: block; width: 100%;
-}
-.refx-cardpop-clear { opacity: .6; }
-/* SQUARE slot (was width-only, rendered 17x13): a fill-the-box icon like
-   Thymer's blinking-dot collection icon stretched into an oval; a fixed square
-   keeps every icon round. align-items/justify centre a normal glyph inside it. */
-.refx-opt-ico { width: 17px; height: 17px; flex: 0 0 17px; align-self: center; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; opacity: .85; }
-/* current values in the relation picker: green round check badge (built, not a
-   font glyph — ti-circle-check-filled is MISSING from this icon-font build) */
-.refx-opt-checked .refalias-result-text { opacity: .75; }
-.refx-opt-chkbadge {
-  width: 17px; height: 17px; flex: none; border-radius: 50%;
-  background: var(--ed-button-primary-bg, #479797); color: #fff;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.refx-opt-chkbadge .ti { font-size: 11px; }
-.refx-cardpop-empty { opacity: .5; font-style: italic; padding: 7px 10px; font-size: 12px; }
-/* long plain-text values (Synopsis etc) wrap over lines like the native pane —
-   they were clipped to one line in the card */
-.refx-propcard .page-prop-val { white-space: normal; }
-.refx-propcard .page-prop-val .prop-status-0p { white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; }
-.refx-propcard .refx-propcard-value { flex-wrap: wrap; }
 /* live-search AND standalone line-ref embeds keep a writing strip at the bottom:
    clicking it appends a new indented child under the transcluded line. ZERO-JUMP:
    the strip reserves exactly one child line's worth of space (1lh + line margins),
@@ -5424,50 +4284,6 @@ html.is-light .refalias-lp-text b { color: var(--color-primary-700, #2f8873); }
 .listitem-transclusion.refx-lineembed .transclusion-container-div { padding-bottom: calc(1lh + 24px); cursor: text; }
 .listitem-transclusion.refx-qembed .transclusion-container-div:has(.listitem ~ .listitem),
 .listitem-transclusion.refx-lineembed .transclusion-container-div:has(.listitem ~ .listitem) { padding-bottom: 12px; }
-/* file/image property values */
-.refx-propcard-img { width: 135px; max-width: 100%; height: auto; border-radius: 4px; display: block; cursor: pointer; }
-.refx-file-ico { margin-right: 5px; font-size: 12px; opacity: .8; }
-.refx-imgmenu { width: 200px; }
-.refx-lightbox {
-  position: fixed; inset: 0; z-index: 2147483200; background: rgba(0,0,0,.75);
-  display: flex; align-items: center; justify-content: center; cursor: zoom-out;
-}
-.refx-lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 6px; box-shadow: 0 18px 60px rgba(0,0,0,.5); }
-/* URL values open on click, like native */
-.refx-url-value { cursor: pointer; }
-.refx-url-value:hover { text-decoration: underline; }
-/* "+ Create «query»" row: target collection right-aligned */
-.refx-opt-create .refalias-result-text { flex: 1 1 auto; }
-.refx-opt-createcol { flex: none; margin-left: auto; font-size: 11px; opacity: .55; }
-/* native-style remove affordance on checked rows (whole row still toggles) */
-.refx-opt-x { flex: none; margin-left: auto; font-size: 12px; opacity: 0; }
-.refx-opt-checked:hover .refx-opt-x, .refx-opt-checked.refalias-result-sel .refx-opt-x { opacity: .8; }
-.refx-datepop { padding: 8px; }
-/* keyboard-first date picker — replicates the native Thymer picker's anatomy:
-   NL input, month header with ‹ ○ › nav, weekday row, 6-week grid with muted
-   adjacent-month days, blue focused day, bottom confirm bar with the date. */
-.refx-datepop { width: 264px; }
-.refx-datepop-header { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 4px; }
-.refx-datepop-month { font-weight: 600; font-size: 13px; }
-.refx-datepop-nav { display: flex; gap: 2px; }
-.refx-datepop-navbtn { background: none; border: none; padding: 1px 4px; border-radius: 4px; cursor: pointer; color: inherit; opacity: .65; font-size: 12px; line-height: 1; }
-.refx-datepop-navbtn:hover { background: rgba(127,127,127,.15); opacity: 1; }
-.refx-datepop-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); margin-bottom: 1px; }
-.refx-datepop-dow { text-align: center; font-size: 10.5px; opacity: .45; padding: 2px 0; }
-.refx-datepop-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
-.refx-datepop-day { text-align: center; font-size: 12.5px; padding: 3px 0; border-radius: 4px; cursor: pointer; }
-.refx-datepop-day:hover { background: rgba(127,127,127,.14); }
-.refx-datepop-day.adj-month { opacity: .38; }
-.refx-datepop-today .refx-datepop-day-inner { box-shadow: inset 0 0 0 1px var(--button-primary-bg-color, #2d72d2); border-radius: 3px; padding: 1px 4px; }
-.refx-datepop-sel { background: rgba(127,127,127,.18); }
-.refx-datepop-day.refx-datepop-focus { background: var(--button-primary-bg-color, #2d72d2); color: var(--button-primary-fg-color, #fff); font-weight: 700; opacity: 1; }
-.refx-datepop-day.refx-datepop-focus .refx-datepop-day-inner { box-shadow: none; }
-.refx-datepop-confirm {
-  display: flex; align-items: center; gap: 7px; margin-top: 7px; padding: 5px 8px;
-  border-radius: 4px; cursor: pointer; font-size: 12.5px;
-  background: var(--button-primary-bg-color, #2d72d2); color: var(--button-primary-fg-color, #fff);
-}
-.refx-datepop-confirm .ti { font-size: 13px; }
 /* keyboard property-editor modal */
 .refx-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .refx-modal-label { flex: 0 0 34%; max-width: 34%; font-size: 12px; opacity: .7; }

@@ -1,2 +1,6 @@
 .DS_Store
 HANDOVER.md
+SCRATCH.md
+tools/server-config.json
+proto/
+tools/
