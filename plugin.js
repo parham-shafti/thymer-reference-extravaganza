@@ -341,12 +341,12 @@ class Plugin extends AppPlugin {
   _discoverTrigger = () => { if (!document.hidden) this._scheduleDiscover(true); };
 
   onLoad() {
-    try { window.__REFX_VERSION = "3.5.0-dev"; } catch (e) {} // live-version tell for debugging
+    try { window.__REFX_VERSION = "3.5.0"; } catch (e) {} // live-version tell for debugging
     // Build tag, bumped on every dev deploy: the app can serve a STALE plugin
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0-dev.5"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.

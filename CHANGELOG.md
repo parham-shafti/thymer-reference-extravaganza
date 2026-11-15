@@ -1,8 +1,19 @@
 # Changelog
 
-## v3.4.2 — 2026-09-21
+## v3.5.0 - 2026-11-15
 
-- **Fixed: Cmd+Down/Up acted on the wrong panel.** With a custom view focused in one half of a split (a calendar list, say) and an editor in the other, Cmd+Down expanded a reference under the editor's old caret and swallowed the key, so the focused view never received it. The shortcut now only acts when its caret is in the focused panel.
+**New: an expanded page reference shows the real page**
+- Expanding a page reference now shows Thymer's own page right there: its properties and its body, both editable exactly as on the page itself. No more separate property card.
+- A line that is only the reference unfolds in place without a frame; a reference inside a sentence opens in a framed box.
+- **All from the keyboard.** From the reference line, Down steps into the page's properties; Up and Down walk them and Enter edits one, as on a page; Down past the last property goes on into the body, and back out again.
+- Desktop only. On the phone Thymer shows one panel at a time, so an expanded page reference shows Thymer's own transclusion there (the body). Up to six pages open as the real page at once; beyond that you get the transclusion until one is collapsed.
+
+**Removed**
+- The "Edit embedded record (properties)" command and the property card's chooser: the real page edits its properties natively.
+
+**Fixed**
+- **Set alias works again after a Thymer update**, and so do convert, expand and collapse, line descriptions and `[[` links. Thymer changed how a line knows which page it is on, and every command that starts from the line under the cursor said "Couldn't find the current page."
+- Cmd+Down and Cmd+Up only act in the panel you are in. In a split view they could expand a reference in the other panel.
 
 ## v3.4.1 — 2026-09-19
 
