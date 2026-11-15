@@ -89,6 +89,15 @@ function refxVoPoke(R) {
 	if (h && typeof h.poke === 'function') { try { h.poke(); } catch (e) {} }
 }
 
+/* A line's page guid. Thymer stopped putting `rguid` on line state in itemsByGuid (2026-11-14):
+ * walk `.parent` to the root `document`, whose guid is the record guid (journal days too). */
+function refxRguid(st) {
+	if (!st) return null;
+	if (st.rguid) return st.rguid;
+	let n = st;
+	for (let i = 0; n.parent && i < 500; i++) n = n.parent;
+	return n !== st && n.type === 'document' ? n.guid : null;
+}
 class Plugin extends AppPlugin {
   // Instance state as class fields (Thymer may call onUnload on an instance
   // whose onLoad never ran — never rely on onLoad to initialise these).
@@ -337,7 +346,7 @@ class Plugin extends AppPlugin {
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0-dev.4"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0-dev.5"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.
@@ -569,7 +578,7 @@ class Plugin extends AppPlugin {
       this._descSwallowUntil = now + 700;
       e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
       const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[hit.guid];
-      this._openDescModal({ lineGuid: hit.guid, pageGuid: st && st.rguid, lineNode: hit.li, anchorNode: null });
+      this._openDescModal({ lineGuid: hit.guid, pageGuid: refxRguid(st), lineNode: hit.li, anchorNode: null });
       return;
     }
     this._descLastDown = { guid: hit.guid, t: now };
@@ -631,7 +640,7 @@ class Plugin extends AppPlugin {
     const text = String(raw == null ? "" : raw).trim();
     // _pageRecord, not getRecord: an unmaterialized future journal day has a
     // synthetic page guid that getRecord cannot resolve.
-    const rec = await this._pageRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid, hit.lineGuid);
     if (!rec) return this._toast("Couldn't find the current page.");
     let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
     const line = this._findLineDeep(items, hit.lineGuid);
@@ -693,7 +702,7 @@ class Plugin extends AppPlugin {
           // c.node is the exact rendered row the chip sat on, so the popover
           // anchors under THAT copy of the line (a transclusion renders the
           // same guid twice). Falls back to centred when the row has gone.
-          this._openDescModal({ lineGuid: c.guid, pageGuid: st.rguid, lineNode: c.node || null, anchorNode: null });
+          this._openDescModal({ lineGuid: c.guid, pageGuid: refxRguid(st), lineNode: c.node || null, anchorNode: null });
         },
       }],
     };
@@ -1251,19 +1260,19 @@ class Plugin extends AppPlugin {
     // convert, expand) reads/writes the true source; keep the query context
     // (the query block's line + host page) so expand knows where to place the
     // embed — query results can't render children (verified live).
-    let lineGuid = st.guid, pageGuid = st.rguid, queryLineGuid = null, queryHostGuid = null;
+    let lineGuid = st.guid, pageGuid = refxRguid(st), queryLineGuid = null, queryHostGuid = null;
     if (st.is_virtual && st.props && st.props.itemref) {
       const realSt = ((window.g_universe && window.g_universe.itemsByGuid) || {})[st.props.itemref];
       if (realSt) {
         lineGuid = st.props.itemref;
-        pageGuid = realSt.rguid || pageGuid;
+        pageGuid = refxRguid(realSt) || null;
         try {
           const node = best.pos.list_item.$node;
           const qc = node && node.closest && node.closest(".query-container-div");
           const qli = qc && qc.closest(".listitem:not(.listitem-transclusion)");
           const qg = qli && qli.getAttribute && qli.getAttribute("data-guid");
           const qst = qg && window.g_universe.itemsByGuid[qg];
-          if (qst && qst.type === "query") { queryLineGuid = qg; queryHostGuid = qst.rguid || null; }
+          if (qst && qst.type === "query") { queryLineGuid = qg; queryHostGuid = refxRguid(qst); }
         } catch (e) {}
       }
     }
@@ -1294,7 +1303,28 @@ class Plugin extends AppPlugin {
   // getJournalRecord() is the way in. The user ref MUST carry the USER guid —
   // passing the collection guid silently creates a duplicate journal page.
   // Same fix as reschedule's journalRecord().
-  async _pageRecord(pageGuid) {
+  // A line loaded WITHOUT its page (in an embed, or a live-search hit from a closed page)
+  // has no parent chain since Thymer dropped `rguid` from line state (2026-11-14). The
+  // search knows its page: look the line up by its own words and match the guid exactly.
+  async _pageOfLine(lineGuid) {
+    this._pgOf = this._pgOf || new Map();
+    if (this._pgOf.has(lineGuid)) return this._pgOf.get(lineGuid);
+    const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[lineGuid];
+    const text = st ? this._segmentsFromState(st).map((x) => (typeof x.text === "string" ? x.text : "")).join(" ") : "";
+    const words = text.split(/\s+/).map((w) => w.replace(/[^\p{L}\p{N}]/gu, "")).filter((w) => w.length >= 3).sort((a, b) => b.length - a.length);
+    for (const q of words.slice(0, 3)) {
+      let r = null;
+      try { r = await this.data.searchByQuery(q, 500); } catch (e) { r = null; }
+      const li = ((r && r.lines) || []).find((l) => l && l.guid === lineGuid);
+      const rec = li && (li.record || (li.getRecord && li.getRecord()));
+      const pg = rec && (rec.guid || (rec._getRow && rec._getRow().guid));
+      if (pg) { this._pgOf.set(lineGuid, pg); return pg; }
+    }
+    return null;
+  }
+
+  async _pageRecord(pageGuid, lineGuid) {
+    if (!pageGuid && lineGuid) pageGuid = await this._pageOfLine(lineGuid);
     const rec = this.data.getRecord(pageGuid);
     if (rec) return rec;
     const m = /^S-([A-Z0-9]+)-.+-(\d{8})$/.exec(pageGuid || "");
@@ -1326,7 +1356,7 @@ class Plugin extends AppPlugin {
   // Resolve the targeted reference segment via the stable Data API.
   // Returns a result object, or an error string for the toaster.
   async _resolveRef(hit) {
-    const rec = await this._pageRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid, hit.lineGuid);
     if (!rec) return "Couldn't find the current page.";
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, hit.lineGuid);
@@ -1471,7 +1501,7 @@ class Plugin extends AppPlugin {
   // Recreate the caret's line as `newType`, run `apply(newLine)` to fill it, then
   // delete the original. Preserves parent + position, including for nested lines.
   async _replaceLine(hit, newType, apply, okMsg) {
-    const rec = await this._pageRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid, hit.lineGuid);
     if (!rec) return this._toast("Couldn't find the current page.");
     let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
     const found = this._findWithParent(items, hit.lineGuid, null);
@@ -1537,7 +1567,7 @@ class Plugin extends AppPlugin {
     if (this._expandInFlight.has(key)) return; // debounce double-create on fast keys
     this._expandInFlight.add(key);
     try {
-      const rec = await this._pageRecord(hit.pageGuid);
+      const rec = await this._pageRecord(hit.pageGuid, hit.lineGuid);
       if (!rec) return this._toast("Couldn't find the current page.");
       let items; try { items = await rec.getLineItems(); } catch (e) { items = []; }
       // DEEP lookup — a plain items.find() only saw top-level lines, so
@@ -1732,7 +1762,7 @@ class Plugin extends AppPlugin {
       }
       return;
     }
-    const rec = await this._pageRecord(hit.pageGuid);
+    const rec = await this._pageRecord(hit.pageGuid, hit.lineGuid);
     let items = null;
     if (rec) { try { items = await rec.getLineItems(); } catch (e) {} }
     const ref = this._selectedRef(hit);
@@ -2739,8 +2769,7 @@ class Plugin extends AppPlugin {
   async _addChildToLineEmbed(embedGuid, targetGuid) {
     try {
       const st = ((window.g_universe && window.g_universe.itemsByGuid) || {})[targetGuid];
-      const rg = st && st.rguid;
-      const rec = rg && this.data.getRecord(rg);
+      const rec = await this._pageRecord(refxRguid(st), targetGuid);
       if (!rec) return;
       const items = await rec.getLineItems();
       const target = this._findLineDeep(items, targetGuid);
@@ -2985,7 +3014,7 @@ class Plugin extends AppPlugin {
     const st = best.pos.list_item.state;
     return {
       lineGuid: st.guid,
-      pageGuid: st.rguid,
+      pageGuid: refxRguid(st),
       offset: best.pos.grapheme_offset,
       state: st,
       caretEl: best.caret && best.caret.$caret,
@@ -3088,7 +3117,7 @@ class Plugin extends AppPlugin {
     if (!link) return;
     const lineGuid = link.lineGuid, pageGuid = link.pageGuid, query = link.query;
     this._exitLinkMode();
-    const rec = await this._pageRecord(pageGuid);
+    const rec = await this._pageRecord(pageGuid, lineGuid);
     if (!rec) return;
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, lineGuid);
@@ -3165,7 +3194,8 @@ class Plugin extends AppPlugin {
         if (!it || it.is_deleted || it.is_trashed || it.type === "document") continue;
         if (!it.text_segments || !it.text_segments.length) continue;
         consider(it.guid || guid, this._segmentsFromState(it), () => {
-          const r = it.rguid && this.data.getRecord(it.rguid);
+          const pg = refxRguid(it);
+          const r = pg && this.data.getRecord(pg);
           return r && r.getName && r.getName();
         }, true);
         if (out.length >= 40) break;
@@ -3326,7 +3356,7 @@ class Plugin extends AppPlugin {
     if (!link) return;
     const lineGuid = link.lineGuid, pageGuid = link.pageGuid, query = link.query;
     this._exitLinkMode();
-    const rec = await this._pageRecord(pageGuid);
+    const rec = await this._pageRecord(pageGuid, lineGuid);
     if (!rec) return;
     const items = await rec.getLineItems();
     const li = this._findLineDeep(items, lineGuid);
