@@ -95,7 +95,6 @@ class Plugin extends AppPlugin {
   _cmd = null;
   _shortcutCmd = null;
   _collapseAllCmd = null;
-  _editRecordCmd = null;
   _modal = null;
   _link = null;
   _linePreviewEl = null;
@@ -141,10 +140,6 @@ class Plugin extends AppPlugin {
   _recUpdHandler = null;
   _discoverT = 0; // debounce timer for re-discovering embeds (focus / remote edits)
   _discoverRefresh = false; // latched: the pending discovery should also refresh present cards
-  _fieldTypes = null; // lazy {fieldId -> PROP_TYPE} from all collections' config fields (schema-based kind detection)
-  _fieldMeta = null;  // fieldId -> {type, filter_colguid} (relation target collection)
-  _colByGuid = null;  // collection guid -> PluginCollectionAPI
-  _fieldTypesRebuildT = 0; // debounced schema-map self-heal when an unknown declared field is seen
   _rehydrateT = 0; // the load-time retry timer (cleared on unload so a late retry can't resurrect a dead instance)
   _unloaded = false;
   _isMac = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "");
@@ -195,8 +190,6 @@ class Plugin extends AppPlugin {
   _descLastDown = null;    // first press of a possible double-click on a description
   _descSwallowUntil = 0;   // eat the rest of that pointer sequence
   _DESC_NATIVE_KEY = "refx-desc-native";
-  _CARD_SKIP = new Set(["Created", "Modified", "Banner", "Icon", "Scene", "Canvas Text", "Assets", "Assets 2", "Assets 3", "Assets 4", "Scene Rev", "Scene Schema", "Source Note", "Chunks", "Manifest"]);
-
   // vast majority of keystrokes (plain typing) before doing anything else.
   _handleKeydown = (e) => {
     if (this._modal) return;            // a dialog is open — don't re-trigger
@@ -343,7 +336,7 @@ class Plugin extends AppPlugin {
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0-dev.1"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0-dev.2"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.
@@ -358,7 +351,8 @@ class Plugin extends AppPlugin {
       if (v && isFinite(v.above) && isFinite(v.below)) this._descNative = v;
     } catch (e) {}
     this._rebuildDescCSS(); // line descriptions: paint before the first frame
-    this._buildFieldTypes(); // async; schema-based property typing (empty fields)
+    // The property card (gone 2026-11-02) kept its view choice per device here; nothing reads it now.
+    try { localStorage.removeItem("refx-card-prefs"); } catch (e) {}
 
     this._cmd = this.ui.addCommandPaletteCommand({
       label: "Set alias for reference",
@@ -374,13 +368,6 @@ class Plugin extends AppPlugin {
       label: "Collapse all embeds (this page)",
       icon: "ti-arrows-minimize",
       onSelected: () => { this._collapseAllOnPage(); },
-    });
-    // Fully keyboard path: cursor on a record reference (or inside a record
-    // embed), run this, edit the record's properties in a normal modal.
-    this._editRecordCmd = this.ui.addCommandPaletteCommand({
-      label: "Edit embedded record (properties)",
-      icon: "ti-pencil",
-      onSelected: () => { this._onEditEmbedCommand(); },
     });
     this._convertCmd = this.ui.addCommandPaletteCommand({
       label: "Convert reference ↔ embedded line",
@@ -493,10 +480,9 @@ class Plugin extends AppPlugin {
     if (this._cmd && this._cmd.remove) this._cmd.remove();
     if (this._shortcutCmd && this._shortcutCmd.remove) this._shortcutCmd.remove();
     if (this._collapseAllCmd && this._collapseAllCmd.remove) this._collapseAllCmd.remove();
-    if (this._editRecordCmd && this._editRecordCmd.remove) this._editRecordCmd.remove();
     if (this._convertCmd && this._convertCmd.remove) this._convertCmd.remove();
     if (this._descCmd && this._descCmd.remove) this._descCmd.remove();
-    this._cmd = this._shortcutCmd = this._collapseAllCmd = this._editRecordCmd = this._convertCmd = this._descCmd = null;
+    this._cmd = this._shortcutCmd = this._collapseAllCmd = this._convertCmd = this._descCmd = null;
     this._closeModal();
     const st = document.getElementById(this._STYLE_ID);
     if (st) st.remove();
@@ -1880,19 +1866,6 @@ class Plugin extends AppPlugin {
     try { return !!(hit.lineNode && hit.lineNode.classList && hit.lineNode.classList.contains("listitem-transclusion") && this._cards.has(hit.lineGuid)); } catch (e) { return false; }
   }
 
-  // Cheap synchronous test: could Cmd+Up here collapse an embed? (caret on/under
-  // one of our embed lines, inside our card, or inside any transclusion render).
-  _mightBeInEmbed(hit) {
-    try {
-      const n = hit.lineNode || hit.anchorNode;
-      if (!n || !n.closest) return false;
-      if (n.closest(".panel.refx-pemb")) return true;
-      const li = n.closest(".listitem");
-      if (li) { const g = li.getAttribute && li.getAttribute("data-guid"); if (g && this._cards.has(g)) return true; }
-      return !!n.closest(".listitem-transclusion, .lineitem-transcludes, [data-itemref]");
-    } catch (e) { return false; }
-  }
-
   // Refuse to embed a block into itself, an ancestor, OR a target whose own
   // subtree already embeds us (a mutual A⇄B embed is durable synced state that
   // recurses on render — the same "would loop forever" class as the linear case).
@@ -2494,103 +2467,6 @@ class Plugin extends AppPlugin {
     return this._hitTestCaret(li.querySelector(".lineitem-text") || li);
   }
 
-  // Keyboard-first property editing. Injected card values can't hold focus inside
-  // Thymer's editor, so this opens a normal (focus-owning) modal instead.
-  _onEditEmbedCommand() {
-    const hit = this._detect();
-    if (!hit) return this._toast("Put the cursor on a record reference or inside a record embed.");
-    let recordGuid = null;
-    const ref = this._selectedRef(hit);
-    if (ref && !ref.isText) recordGuid = ref.targetGuid;
-    if (!recordGuid && this._mightBeInEmbed(hit) && hit.pageGuid && this.data.getRecord(hit.pageGuid)) recordGuid = hit.pageGuid;
-    if (!recordGuid) return this._toast("Put the cursor on a record reference or inside a record embed.");
-    const rec = this.data.getRecord(recordGuid);
-    if (!rec) return this._toast("Couldn't load that record.");
-    this._openRecordEditorModal(rec, recordGuid);
-  }
-
-  async _openRecordEditorModal(rec, recordGuid) {
-    const fields = this._recCardFields(rec);
-    let bodyEmpty = false;
-    try { const items = await rec.getLineItems(); bodyEmpty = !items || items.length === 0; } catch (e) {}
-    const controls = [];
-    this._openModal({
-      title: "Edit " + ((rec.getName && rec.getName()) || "record"),
-      saveLabel: "Save",
-      // _openModal removes the modal DOM before calling onSave, so read the
-      // values in value() (called first) and apply them from that snapshot.
-      onSave: (vals) => {
-        for (const item of (vals || [])) {
-          if (!item || item.v === null || item.v === undefined) continue;
-          if (String(item.v) !== String(item.field.value == null ? "" : item.field.value)) this._writeCardProp(rec, item.field, item.v);
-        }
-      },
-      render: (body) => {
-        if (!fields.length) body.append(this._el("div", "refalias-sub", "This record has no editable properties."));
-        for (const f of fields) {
-          const row = this._el("div", "refx-modal-row");
-          row.append(this._el("div", "refx-modal-label", f.name));
-          let ctl, read = null;
-          if (f.kind === "relation") {
-            ctl = this._el("input", "refalias-input"); ctl.type = "text";
-            ctl.value = f.value == null ? "" : String(f.value); ctl.disabled = true;
-            ctl.title = "Edit relations in the page itself";
-          } else if (f.kind === "choice") {
-            ctl = this._el("select", "refalias-input");
-            const blank = this._el("option", null, "—"); blank.value = ""; ctl.append(blank);
-            for (const c of (f.choices || [])) { const o = this._el("option", null, c.label); o.value = c.label; if (c.label === f.value) o.selected = true; ctl.append(o); }
-            read = () => ctl.value;
-          } else if (f.kind === "date") {
-            // <input type=date> SANITIZES any non-conforming value to "" — a stored
-            // "YYYY-MM-DD HH:MM" would seed as blank and a no-op Save would then
-            // silently CLEAR the property. Seed the date part only, carry the time
-            // suffix through, and compare against the date-only seed on save.
-            ctl = this._el("input", "refalias-input");
-            ctl.type = "date";
-            const raw = f.value == null ? "" : String(f.value);
-            const dateOnly = raw.slice(0, 10);
-            const timeSuffix = (/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})/.exec(raw) || [])[1] || "";
-            ctl.value = /^\d{4}-\d{2}-\d{2}$/.test(dateOnly) ? dateOnly : "";
-            read = () => (ctl.value ? ctl.value + timeSuffix : "");
-            controls.push({ field: Object.assign({}, f, { value: raw }), read });
-            row.append(ctl);
-            body.append(row);
-            continue;
-          } else {
-            ctl = this._el("input", "refalias-input");
-            ctl.type = f.kind === "number" ? "number" : "text";
-            ctl.value = f.value == null ? "" : String(f.value);
-            read = () => ctl.value;
-          }
-          controls.push({ field: f, read });
-          row.append(ctl);
-          body.append(row);
-        }
-        if (bodyEmpty) {
-          const addRow = this._el("div", "refx-modal-row");
-          const btn = this._el("button", "refalias-btn", "＋ Add a body line");
-          btn.type = "button";
-          btn.addEventListener("click", async () => {
-            btn.disabled = true; btn.textContent = "Added — close and edit it inline";
-            try { await rec.createLineItem(null, null, "text"); } catch (e) {}
-          });
-          addRow.append(btn);
-          body.append(addRow);
-        }
-        return { value: () => controls.map((c) => ({ field: c.field, v: c.read ? c.read() : null })), focusEl: body.querySelector("input:not([disabled]), select, button") };
-      },
-    });
-  }
-
-  // ------------------------------------------------ record property cards (editable)
-  //
-  // Native transclusions are body-only — they never show a record's properties.
-  // For each of OUR record embeds we inject a small editable card above the body
-  // (record title + property name/value rows). Cards are a decorator: rebuilt on
-  // load/navigation (embeds persist across reload) and re-injected by a lazily
-  // created, panel-scoped, hot-reload-guarded MutationObserver when a native
-  // re-render wipes them. Zero cost when no embeds are open.
-
   async _onNavigated() {
     if (this._unloaded) return;
     this._scheduleDescCSS(); // a new page's lines just entered the model
@@ -2739,214 +2615,6 @@ class Plugin extends AppPlugin {
     }).catch(() => {});
   }
 
-  // Build {fieldId -> PROP_TYPE} from every collection's config schema. ASYNC —
-  // data.getAllCollections() returns a Promise (a sync call silently yields nothing;
-  // that's why empty dates kept opening a text editor). Kicked off in onLoad, ready
-  // long before any card is edited. Also indexes by label as a fallback, but only
-  // labels whose type is unambiguous across all collections.
-  async _buildFieldTypes() {
-    const map = {}, byLabel = {}, conflicted = new Set();
-    const meta = {}, colByGuid = {};
-    try {
-      const cols = await (this.data.getAllCollections && this.data.getAllCollections());
-      for (const col of cols || []) {
-        let cfg = null; try { cfg = col.getConfiguration && col.getConfiguration(); } catch (e) {}
-        try { const g = col.getGuid && col.getGuid(); if (g) colByGuid[g] = col; } catch (e) {}
-        for (const f of (cfg && cfg.fields) || []) {
-          if (!f) continue;
-          if (f.id != null) { map[f.id] = f.type; meta[f.id] = { type: f.type, filter_colguid: f.filter_colguid || null, many: !!f.many, read_only: !!f.read_only, icon: f.icon || null, active: f.active !== false }; }
-          if (f.label) {
-            const lk = "label:" + String(f.label).toLowerCase();
-            if (lk in byLabel && byLabel[lk] !== f.type) conflicted.add(lk);
-            else byLabel[lk] = f.type;
-          }
-        }
-      }
-    } catch (e) {}
-    for (const lk of conflicted) delete byLabel[lk];
-    Object.assign(map, byLabel);
-    this._fieldTypes = map;
-    this._fieldMeta = meta;      // fieldId -> {type, filter_colguid} (relation browse list)
-    this._colByGuid = colByGuid; // collection guid -> PluginCollectionAPI handle
-  }
-
-  // The declared type of a property, from the schema map (see _buildFieldTypes).
-  // Works for EMPTY fields, which value-probing can't type. PluginProperty.guid is
-  // the field id; falls back to the (unambiguous) label. Null → caller probes.
-  _fieldTypeFor(p) {
-    const m = this._fieldTypes;
-    if (!m || !p) return null;
-    if (p.guid != null && m[p.guid]) return m[p.guid];
-    // Unknown-but-declared field (has a guid the map doesn't know) → a collection
-    // or field was created after load. Self-heal with a debounced background
-    // rebuild so it types correctly one interaction later; probe fallback covers
-    // this one.
-    if (p.guid != null && String(p.guid).length > 10 && !this._fieldTypesRebuildT) {
-      this._fieldTypesRebuildT = setTimeout(() => { this._fieldTypesRebuildT = 0; if (!this._unloaded) this._buildFieldTypes(); }, 2000);
-    }
-    if (p.name) return m["label:" + String(p.name).toLowerCase()] || null;
-    return null;
-  }
-
-  // Read a record's editable properties (ported from the canvas note-card
-  // extractor): schema-typed when the field is declared (works for EMPTY fields),
-  // value-probing as fallback; format for display, cap at 8. Each probe is
-  // isolated — property reads throw on unresolved records.
-  _recCardFields(rec) {
-    const out = [];
-    const prefs = this._cardPrefs();
-    let props = [];
-    try { props = (rec.getAllProperties && rec.getAllProperties()) || []; } catch (e) {}
-    for (const p of props) {
-      const name = p && p.name;
-      if (!name || this._CARD_SKIP.has(name)) continue;
-      if (!this._isUserField(p)) continue; // mirror native: no system/deleted fields
-      if (prefs.mode === "custom" && prefs.hidden.has(name)) continue; // checklist applies ONLY in Custom
-      let kind = "text", choices = null, value = "", display = "", fileValue = null;
-      const ft = this._fieldTypeFor(p);
-      if (ft === "choice") { kind = "choice"; try { choices = ((p.choices && p.choices()) || []).map((c) => ({ id: c.id, label: c.label, color: c.color, icon: c.icon || null })); } catch (e) { choices = []; } }
-      else if (ft === "file" || ft === "image" || ft === "banner") kind = "file";
-      else if (ft === "datetime") kind = "date";
-      else if (ft === "record") kind = "relation";
-      else if (ft === "number") kind = "number";
-      else if (ft === "text" || ft === "url") kind = "text";
-      else {
-        // Unknown/undeclared (system props) → probe by value, as before.
-        try { const ch = p.choices && p.choices(); if (ch && ch.length) { kind = "choice"; choices = ch.map((c) => ({ id: c.id, label: c.label, color: c.color, icon: c.icon || null })); } } catch (e) {}
-        if (kind === "text") { try { const d = p.date && p.date(); if (d instanceof Date) kind = "date"; } catch (e) {} }
-        if (kind === "text") { try { const lr = p.linkedRecords && p.linkedRecords(); if (lr && lr.length) kind = "relation"; } catch (e) {} }
-        if (kind === "text") {
-          // p.number() COERCES a leading-digit text value ("26-002-BHP" → 26), which
-          // wrongly types a text field (a code/ID/title) as a number and shows the
-          // truncated digits. Only treat as a number when the text form is empty or
-          // a clean numeric string. (Confirmed: Title "26-002-BHP" displayed as 26.)
-          try {
-            const n = p.number && p.number();
-            if (typeof n === "number") {
-              let tv = null; try { tv = p.text && p.text(); } catch (e) {}
-              if (tv == null || tv === "" || (typeof tv === "string" && /^\s*-?\d+(?:\.\d+)?\s*$/.test(tv))) kind = "number";
-            }
-          } catch (e) {}
-        }
-      }
-      try {
-        if (kind === "choice") value = (p.choiceLabel && p.choiceLabel()) || "";
-        else if (kind === "date") {
-          const d = p.date();
-          if (d) {
-            value = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-            // Read the RAW stored value for the pill text — p.datetime().value()
-            // RECONSTRUCTS the value and drops `formatted`, which is exactly where
-            // granular pills ("Week 28", "Q3 2026") live. p.values()[0] is the
-            // stored object verbatim: {d, r?, t?, formatted?}.
-            let fmt = "", hasTime = false, rawv = null;
-            try { const vs = p.values && p.values(); rawv = vs && vs[0]; } catch (e) {}
-            if (rawv && typeof rawv === "object") {
-              fmt = rawv.formatted || "";
-              hasTime = !!(rawv.t && rawv.t.t);
-              // Granular/ranged value without a stored label → synthesize native text.
-              if (!fmt && rawv.r && rawv.r.d) fmt = this._synthDateLabel(rawv.d, rawv.r.d, null) || "";
-            }
-            if (hasTime) value += " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
-            display = fmt || this._fmtDateDisplay(value) || value;
-          } else value = "";
-        }
-        else if (kind === "number") { const n = p.number && p.number(); value = (n == null ? "" : n); }
-        else if (kind === "file") {
-          let fv = null; try { const vs = p.values && p.values(); fv = vs && vs[0]; } catch (e2) {}
-          if (fv && typeof fv === "object") { value = fv.name || "file"; fileValue = fv; }
-          else value = "";
-        }
-        else if (kind === "relation") {
-          var relRecs = (p.linkedRecords && p.linkedRecords()) || [];
-          var relParts = relRecs.map((r) => (r && r.getName && r.getName()) || "").filter(Boolean);
-          var relIcons = relRecs.map((r) => this._iconForRecord(r));
-          var relGuids = relRecs.map((r) => { try { return (r._getRow && r._getRow().guid) || null; } catch (e2) { return null; } });
-          value = relParts.join(", ");
-          // linkedRecords() returns [] for stored-but-unresolved relations AND for
-          // legacy plain-text values in a record prop (e.g. Lead = "Svy"). Fall back
-          // to the RAW values() and normalize: guid → record name, text → as-is.
-          if (!value) {
-            let raw = null; try { raw = p.values && p.values(); } catch (e2) {}
-            const parts = [], icons2 = [], guids2 = [];
-            for (let v of raw || []) {
-              if (typeof v === "string" && v.trim().charAt(0) === "[") { try { v = JSON.parse(v); } catch (e2) {} }
-              for (const x of (Array.isArray(v) ? v : [v])) {
-                if (typeof x === "string" && x) {
-                  const r2 = /^[0-9A-Z]{20,}$/.test(x) ? this.data.getRecord(x) : null;
-                  if (r2 && r2.getName && r2.getName()) { parts.push(r2.getName()); icons2.push(this._iconForRecord(r2)); guids2.push(x); }
-                  else { parts.push(x); icons2.push(null); guids2.push(null); }
-                } else if (x && typeof x === "object") {
-                  const g = x.guid || (x.getGuid && x.getGuid());
-                  const r2 = g ? this.data.getRecord(g) : null;
-                  if (r2 && r2.getName && r2.getName()) { parts.push(r2.getName()); icons2.push(this._iconForRecord(r2)); guids2.push(g); }
-                }
-              }
-            }
-            relParts = parts.filter(Boolean);
-            relIcons = icons2;
-            relGuids = guids2;
-            value = relParts.join(", ");
-          }
-        }
-        else value = (p.text && p.text()) || "";
-      } catch (e) {}
-      // Per-value {text, icon} for relation/choice pills (native renders one pill
-      // per value with the target's collection icon; splitting the joined display
-      // on ", " would break names containing commas).
-      let pills = null;
-      if (kind === "relation" && typeof relParts !== "undefined" && relParts && relParts.length) {
-        pills = relParts.map((t, i) => ({ t, icon: (typeof relIcons !== "undefined" && relIcons && relIcons[i]) || null, guid: (typeof relGuids !== "undefined" && relGuids && relGuids[i]) || null }));
-      } else if (kind === "choice" && value) {
-        // Carry the chosen option's palette color + icon so the pill renders like
-        // native (colored enum pill) instead of always-zinc.
-        const co = (choices || []).find((c) => c.label === value) || null;
-        let cic = (co && co.icon) || null;
-        if (cic && String(cic).indexOf("ti-") !== 0) cic = "ti-" + cic;
-        pills = [{ t: String(value), icon: cic, guid: null, color: co ? co.color : null }];
-      }
-      out.push({ name, id: p.guid || null, kind, value, display: display || "", choices, pills, file: fileValue || null });
-      if (out.length >= 32) break; // sanity cap — stop PROBING too, not just slicing
-    }
-    let res = out.filter((p) => p && p.name);
-    if (prefs.mode === "filled") res = res.filter((f) => !(f.value === "" || f.value == null));
-    return res.slice(0, 32);
-  }
-
-  // Mirror the native property pane's field set: USER-DEFINED collection fields
-  // have generated ids ("F" + uppercase alphanumerics, e.g. F35H0RTXPMHK1ZM);
-  // system fields carry lowercase ids (title, collection, banner, icon,
-  // updated_at, …) and never render in the native pane. Deleted fields get
-  // relabeled "Deleted (…)" — hide those too, exactly like native.
-  _isUserField(p) {
-    const id = String((p && p.guid) || "");
-    if (!/^F[0-9A-Z]{8,}$/.test(id)) return false;
-    const name = String((p && p.name) || "");
-    if (/^Deleted\s*\(/.test(name)) return false;
-    // Native's property pane hides ARCHIVED fields (schema `active:false`) — e.g. a
-    // retired "Seeds" field still kept in the collection config. getAllProperties()
-    // returns them anyway (sometimes duplicated by label), so mirror native and drop
-    // them. Fail-open when the schema map isn't built yet (self-heals next render).
-    const meta = this._fieldMeta && id ? this._fieldMeta[id] : null;
-    if (meta && meta.active === false) return false;
-    return true;
-  }
-
-  // ---- Properties chooser (like the native "Properties · All ⌄" row) ----
-
-  _cardPrefs() {
-    // localStorage, NOT plugin config: saveConfiguration makes Thymer RELOAD the
-    // whole plugin (verified live — that reload tore down every card and was THE
-    // view-change jump). Per-client persistence is fine for a view preference.
-    // Modes: "all" = every user field, ALWAYS · "filled" = non-empty, ALWAYS ·
-    // "custom" = the user's own checklist (the only mode where `hidden` applies —
-    // a hidden set leaking into All meant "All" lied).
-    let c = {};
-    try { c = JSON.parse(localStorage.getItem("refx-card-prefs") || "{}") || {}; } catch (e) {}
-    const mode = (c.mode === "filled" || c.mode === "custom") ? c.mode : "all";
-    return { mode, hidden: new Set(Array.isArray(c.hidden) ? c.hidden : []) };
-  }
-
   // Place Thymer's (model-based, not DOM-selection) caret by hit-testing a click on
   // a line's text span, exactly as a real click there would. Returns true if fired.
   _hitTestCaret(t) {
@@ -2966,25 +2634,6 @@ class Plugin extends AppPlugin {
       return true;
     } catch (e) { return false; }
   }
-
-  // The icon shown in a native record pill = the record's OWN icon (the "Icon"
-  // system property, e.g. ti-check on a Done status record — verified live);
-  // fall back to its collection's icon when the record has none set.
-  _iconForRecord(rec) {
-    let ic = null;
-    try { const ip = rec && rec.prop && rec.prop("Icon"); const t = ip && ip.text && ip.text(); if (t && typeof t === "string") ic = t.trim(); } catch (e) {}
-    if (!ic) {
-      try {
-        const row = rec && rec._getRow && rec._getRow();
-        const pg = row && row.pguid;
-        const col = pg && this._colByGuid && this._colByGuid[pg];
-        if (col) { const cfg = col.getConfiguration && col.getConfiguration(); ic = (cfg && cfg.icon) || null; }
-      } catch (e) {}
-    }
-    if (!ic) return null;
-    return String(ic).indexOf("ti-") === 0 ? ic : "ti-" + ic;
-  }
-
 
   // Give an empty record a first body line to type into, then focus it. The
   // transclusion mirrors the target's body, so the new line renders in the embed.
@@ -3218,8 +2867,7 @@ class Plugin extends AppPlugin {
 
   // Native-style display for a machine date value "YYYY-MM-DD[ HH:MM]" →
   // "Sun Jul 12" (+ year when not the current year) (+ " 17:00"). Used as the
-  // fallback whenever a stored `formatted` isn't available yet (optimistic paints,
-  // pre-propagation reads) so the card NEVER shows raw ISO next to native pills.
+  // fallback whenever a date segment has no stored `formatted` (see _dateSegmentText).
   _fmtDateDisplay(v) {
     const m = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}:\d{2}))?$/.exec(String(v == null ? "" : v));
     if (!m) return null;
@@ -3263,52 +2911,6 @@ class Plugin extends AppPlugin {
       return "Week " + wk + (da.getFullYear() !== thisYear ? " " + da.getFullYear() : "");
     }
     return dayLabel(a) + " – " + dayLabel(b);
-  }
-
-  _writeCardProp(rec, field, raw) {
-    let p = null; try { p = rec.prop(field.name); } catch (e) {}
-    if (!p) return;
-    try {
-      if (field.kind === "file") return; // never overwrite a file value with text
-      if (field.kind === "choice") {
-        if (raw === "" || raw == null) { try { p.set(""); } catch (e) { try { p.set([]); } catch (e2) {} } }
-        else p.setChoice(raw);
-      } else if (field.kind === "date") {
-        // raw = "YYYY-MM-DD"/"YYYY-MM-DD HH:MM" string, OR {dtv: DateTimeValue} —
-        // the picker passes the PARSED value straight through for typed text so
-        // Thymer's granular dates ("Week 28", "Q3 2026", "July 2025", "Year 2027",
-        // ranges) store exactly as native would. Preferred string write: Thymer's
-        // own DateTime.parseDateTimeString(raw).value() (rule-42 family). Fallback:
-        // a LOCAL Date (noon when no time — never `new Date("YYYY-MM-DD")`, which
-        // is UTC-midnight and lands on the previous day in western timezones).
-        if (raw && typeof raw === "object" && raw.dtv) {
-          try { p.set(raw.dtv); } catch (e) {}
-        } else if (raw) {
-          const s = String(raw);
-          const DT = (typeof DateTime !== "undefined" && DateTime && DateTime.parseDateTimeString) ? DateTime : null;
-          let wrote = false;
-          if (DT) { try { const v = DT.parseDateTimeString(s); if (v && v.value) { p.set(v.value()); wrote = true; } } catch (e) {} }
-          if (!wrote) {
-            let dt = null; const m = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/.exec(s);
-            if (m) dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), m[4] != null ? Number(m[4]) : 12, m[5] != null ? Number(m[5]) : 0, 0);
-            else dt = new Date(s);
-            try { p.setFromDate(dt); } catch (e) { try { p.set(s); } catch (e2) {} }
-          }
-        } else {
-          // Clearing a datetime is UNRELIABLE via p.set("") alone (verified live:
-          // the write silently no-ops server-side while the local read looks
-          // cleared). Belt-and-suspenders: try all known clear paths — each is a
-          // harmless no-op once the prop is actually empty.
-          try { p.set(""); } catch (e) {}
-          try { p.setFromDate([]); } catch (e) {}
-          try { const n = (p.count && p.count()) || 0; for (let i = n - 1; i >= 0; i--) { try { p.removeValueAt(i); } catch (e2) {} } } catch (e) {}
-        }
-      } else if (field.kind === "number") {
-        p.set(raw === "" || raw == null ? "" : Number(raw));
-      } else {
-        p.set(raw);
-      }
-    } catch (e) {}
   }
 
   // The popup's <input> takes DOM focus; when it closes, activeElement falls back
@@ -4129,8 +3731,6 @@ class Plugin extends AppPlugin {
 }
 .refalias-x:hover { background: rgba(127,127,127,.18); opacity: 1; }
 .refalias-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
-.refalias-sub { font-size: 12px; opacity: .6; }
-.refalias-sub b { font-weight: 600; opacity: .95; }
 .refalias-input, .refalias-capture {
   width: 100%; box-sizing: border-box;
   padding: 11px 12px; border-radius: 4px;
@@ -4284,10 +3884,6 @@ html.is-light .refalias-lp-text b { color: var(--color-primary-700, #2f8873); }
 .listitem-transclusion.refx-lineembed .transclusion-container-div { padding-bottom: calc(1lh + 24px); cursor: text; }
 .listitem-transclusion.refx-qembed .transclusion-container-div:has(.listitem ~ .listitem),
 .listitem-transclusion.refx-lineembed .transclusion-container-div:has(.listitem ~ .listitem) { padding-bottom: 12px; }
-/* keyboard property-editor modal */
-.refx-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.refx-modal-label { flex: 0 0 34%; max-width: 34%; font-size: 12px; opacity: .7; }
-.refx-modal-row .refalias-input { flex: 1 1 auto; min-width: 0; }
 `;
   }
 }
