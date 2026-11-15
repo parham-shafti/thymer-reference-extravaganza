@@ -336,7 +336,7 @@ class Plugin extends AppPlugin {
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0-dev.2"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0-dev.3"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.
@@ -2304,6 +2304,8 @@ class Plugin extends AppPlugin {
     const fc = window.g_focusedComponent;
     const fcEmbed = fc && fc.node && fc.node.closest && fc.node.closest(".panel.refx-pemb");
     if (fcEmbed) {
+      // Thymer moves its own focus after this handler; keep the row it lands on in view
+      if (!(fc.focusState && fc.focusState.isEditing)) setTimeout(() => this._peShowFocusedRow(fc), 0);
       if (ev.key !== "ArrowUp" || !fc.focusState || fc.focusState.isEditing) return;
       const t = this._pePropTargets(fc);
       if (!t.length || fc.focusState.fieldId !== t[0]) return;
@@ -2368,8 +2370,19 @@ class Plugin extends AppPlugin {
     if (!pe) return false;
     try { if (this.ui.setActivePanel) this.ui.setActivePanel(e.panel); } catch (err) {}
     try { if (last) pe.focusLastRow(); else pe.focusFirstRow(); } catch (err) { return false; }
-    try { e.slot.scrollIntoView({ block: "nearest" }); } catch (err) {}
+    this._peShowFocusedRow(pe);
     return true;
+  }
+  // Keep the property row that has the keyboard on screen, and move the page NO more than that.
+  // Never scroll the whole panel into view: it is usually taller than the window, and "nearest"
+  // then lines up its BOTTOM edge, throwing the page up past the very row just focused (his
+  // recording 2026-11-02 22:37: ~250 px on the first Down, the first property out of sight).
+  _peShowFocusedRow(pe) {
+    try {
+      const id = pe && pe.focusState && pe.focusState.fieldId;
+      const row = id && pe.node && pe.node.querySelector('[data-field-id="' + this._escCssAttr(id) + '"]');
+      if (row) row.scrollIntoView({ block: "nearest" });
+    } catch (e) {}
   }
   _pePosClass() {
     for (const lv of (window.g_universe && window.g_universe.listviews) || []) { try { const p = lv.selection._caret.pos; if (p) return p.constructor; } catch (e) {} }
