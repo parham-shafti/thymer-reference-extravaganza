@@ -130,6 +130,7 @@ class Plugin extends AppPlugin {
   _peWatchT = 0;
   _peCreating = null; // the last attach in flight (they are chained, see _peAttach)
   _pePool = [];       // idle borrowed panels {panel, slot}, parked, reused by the next expand
+  _peGridObs = null;  // keeps the grid's track count honest while we hold borrowed panels
   _peHide = new Map(); // embed lineGuid -> 0 (open/opening) or the time its hiding may end (closing)
   _peHideT = 0;
   _PE_POOL = 3;
@@ -336,7 +337,7 @@ class Plugin extends AppPlugin {
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0-dev.3"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.0-dev.4"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.
@@ -1975,8 +1976,9 @@ class Plugin extends AppPlugin {
   _peNormaliseGrid() {
     try {
       const g = document.querySelector(".panels-grid");
-      if (!g) return;
-      const n = [...g.children].filter((c) => c.classList && c.classList.contains("panel")).length;
+      if (!g || g.classList.contains("refx-pe-mounting")) return; // the mount guard holds the columns then
+      // only panels IN the flow count: one being closed or mounted is taken out by CSS
+      const n = [...g.children].filter((c) => c.classList && c.classList.contains("panel") && !/^(absolute|fixed)$/.test(getComputedStyle(c).position)).length;
       const cur = g.style.gridTemplateColumns || "";
       if (!n || !cur) return;
       if (cur.split("var(--panel-sizer-width)").length !== n) {
@@ -2063,7 +2065,7 @@ class Plugin extends AppPlugin {
       if (id && this._peClaims().has(id)) { await new Promise((r) => setTimeout(r, 220)); continue; }
       panel = got;
     }
-    if (panel) { e.panel = panel; this._peClaims().add(this._pePid(panel)); this._peGuardTargeting(panel); }
+    if (panel) { e.panel = panel; this._peClaims().add(this._pePid(panel)); this._peGuardTargeting(panel); this._peGridWatch(true); }
     if (!panel || !mine()) { if (unmount) unmount(); if (panel) e.slot = slot; drop(); this._peGridRestore(cols); return false; }
     for (let i = 0; i < 40 && !slot; i++) {
       try { const el = panel.getElement(); slot = el && el.closest ? el.closest(".panel") : null; } catch (err) {}
@@ -2236,6 +2238,7 @@ class Plugin extends AppPlugin {
     for (const [g, e] of [...this._pageEmbeds]) { this._pageEmbeds.delete(g); this._peDispose(e, true); }
     for (const idle of this._pePool.splice(0)) this._peDispose(idle, true);
     this._peStopWatch();
+    this._peGridWatch(false);
     try { document.querySelectorAll(".refx-pemb-host").forEach((n) => n.classList.remove("refx-pemb-host")); } catch (e) {}
     try { document.querySelectorAll(".refx-pe-park").forEach((n) => n.remove()); } catch (e) {}
     this._pePark = null;
@@ -2258,12 +2261,32 @@ class Plugin extends AppPlugin {
     } catch (e) {}
   }
 
+  // THYMER COUNTS OUR BORROWED PANELS when it lays out the grid, though they are not in it: with
+  // a pooled panel parked, opening a page beside his gave THREE columns, the third empty, and
+  // closing it left his page at half width (his recording 2026-11-02 22:57). So while we hold any
+  // borrowed panel (an open embed or one in the pool), every change to the grid is checked at
+  // once, before the paint, and a track count that does not match the panels really there is
+  // corrected. A matching count is left alone, so widths he drags are kept.
+  _peGridWatch(on) {
+    const g = on ? document.querySelector(".panels-grid") : null;
+    if (this._peGridObs && this._peGridObs.__target === g) return;
+    if (this._peGridObs) { try { this._peGridObs.disconnect(); } catch (e) {} this._peGridObs = null; window.__refxGridObs = null; }
+    if (!g || this._unloaded) return;
+    const obs = new MutationObserver(() => this._peNormaliseGrid());
+    try { obs.observe(g, { attributes: true, attributeFilter: ["style", "class"], childList: true }); } catch (e) { return; }
+    obs.__target = g;
+    this._peGridObs = obs;
+    window.__refxGridObs = obs; // hot-reload stash (_killStaleObservers)
+    this._peNormaliseGrid();
+  }
+
   _peEnsureWatch() { if (!this._peWatchT && !this._unloaded) this._peWatchT = setInterval(() => this._peTick(), 250); }
   _peStopWatch() { if (this._peWatchT) { clearInterval(this._peWatchT); this._peWatchT = 0; } }
   // Every 250 ms while a page panel is open: drop one the app closed, and send a link followed
   // INSIDE the panel to the page it sits on (the panel itself goes back to its page).
   _peTick() {
     if (this._unloaded || !this._pageEmbeds.size) { this._peStopWatch(); return; }
+    this._peGridWatch(true);
     this._peNormaliseGrid();
     let ids = null; try { ids = new Set((this.ui.getPanels() || []).map((p) => this._pePid(p))); } catch (e) {}
     for (const [g, e] of [...this._pageEmbeds]) {
@@ -2849,6 +2872,8 @@ class Plugin extends AppPlugin {
     window.__refxThemeObs = null;
     try { if (window.__refxDescObs && window.__refxDescObs.disconnect) window.__refxDescObs.disconnect(); } catch (e) {}
     window.__refxDescObs = null;
+    try { if (window.__refxGridObs && window.__refxGridObs.disconnect) window.__refxGridObs.disconnect(); } catch (e) {}
+    window.__refxGridObs = null;
     // The prior instance's ALWAYS-ON capture listeners (its arrow-field refs are
     // unreachable — only the window stash can remove them).
     try { for (const h of window.__refxKeyHandlers || []) window.removeEventListener("keydown", h, true); } catch (e) {}
