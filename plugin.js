@@ -312,6 +312,15 @@ class Plugin extends AppPlugin {
     if (this._cardEditing) return; // never collapse/expand under an open editor
     const hit = this._detect();
     if (!hit) return;
+    // THE KEYBOARD BELONGS TO THE FOCUSED PANEL. _detect() falls back to any
+    // listview still carrying a caret, and a caret goes stale in a panel you
+    // have clicked away from. With a custom view focused in the other half of
+    // a split (Timeline's calendar list, 2026-09-21), Cmd+Down expanded a ref
+    // under the journal's OLD caret and swallowed the key, so the view that
+    // owned the keyboard never got its own Cmd+Down. With no focused panel, or
+    // the caret in the focused one, nothing changes.
+    const fp = document.querySelector(".panel.focused-panel");
+    if (fp && hit.panel && hit.panel !== fp) return;
     if (isUp) {
       // Collapse ONLY from the reference's own line (with its embed open) or from
       // our embed line itself. INSIDE the embed body Cmd+Up must fall through to
@@ -1305,13 +1314,13 @@ class Plugin extends AppPlugin {
       try {
         const pos = lv.selection && lv.selection._caret && lv.selection._caret.pos;
         if (!pos || !pos.list_item || !pos.list_item.state) continue;
-        let rank = 0;
+        let rank = 0, pnl = null;
         try {
-          const pnl = lv.$container && lv.$container.closest && lv.$container.closest(".panel");
+          pnl = lv.$container && lv.$container.closest && lv.$container.closest(".panel");
           if (pnl && (pnl.classList.contains("has-focus") || pnl.classList.contains("is-target") || pnl.classList.contains("focused-panel"))) rank = 1;
         } catch (e) {}
         if (lv.hasFocus && lv.hasFocus()) rank = 2;
-        if (rank > bestRank) { best = { pos }; bestRank = rank; }
+        if (rank > bestRank) { best = { pos, panel: pnl || null }; bestRank = rank; }
         if (rank === 2) break;
       } catch (e) {}
     }
@@ -1345,6 +1354,7 @@ class Plugin extends AppPlugin {
       pageGuid,
       queryLineGuid,
       queryHostGuid,
+      panel: best.panel, // the .panel the caret was found in (see _handleExpandKey)
       segIndex: span && typeof span.segment_index === "number" ? span.segment_index : null,
       linespanType: span ? span.type : null,
       anchorNode: span ? span.$node : null,

@@ -1,5 +1,9 @@
 # Changelog
 
+## v3.4.2 — 2026-09-21
+
+- **Fixed: Cmd+Down/Up acted on the wrong panel.** With a custom view focused in one half of a split (a calendar list, say) and an editor in the other, Cmd+Down expanded a reference under the editor's old caret and swallowed the key, so the focused view never received it. The shortcut now only acts when its caret is in the focused panel.
+
 ## v3.4.1 — 2026-09-19
 
 - **Fixed: heading descriptions sat too low.** v3.4.0's selection cover added padding inside the description box, and the spacing pass read that padded height as text height (Thymer's global border-box sizing includes padding in computed height), so it pushed every described heading's subtitle about 9px down. The measurement now reads the visible text box, and the gap is back to its tuned 7px. The double-click-to-edit hit area follows the visible text again too.
