@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.5.1 - 2026-11-16
+
+**Fixed**
+- **Expanding a reference works on every page again.** On some pages Thymer hands plugins a list of lines in which two lines each claim the other as a child. The plugin went round that loop until it gave up, so Cmd+Down did nothing at all on such a page, and an embed already there never showed its page. It now notices a line it has already seen and carries on.
+
 ## v3.5.0 - 2026-11-15
 
 **New: an expanded page reference shows the real page**
