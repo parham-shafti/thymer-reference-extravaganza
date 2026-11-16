@@ -346,7 +346,7 @@ class Plugin extends AppPlugin {
     // snapshot right after a restart (server had the new code, the renderer ran
     // the old), so deploy verification must check THIS in the live page, not
     // just md5 the server copy.
-    try { window.__REFX_BUILD = "3.5.0"; } catch (e) {}
+    try { window.__REFX_BUILD = "3.5.1-dev.1"; } catch (e) {}
     this._killStaleObservers(); // clear any observer/cards leaked by a hot-reload
     // Code-load counter: tools/hotpush.mjs requires it to rise, which proves the push reached the
     // running instance and not only the store.
@@ -1521,13 +1521,17 @@ class Plugin extends AppPlugin {
 
   // Find a line item by guid anywhere in the record's tree, with its parent line
   // item (null when the line is top-level).
-  _findWithParent(items, guid, parent) {
+  _findWithParent(items, guid, parent, seen) {
+    seen = seen || new Set();
     for (const it of items || []) {
-      if (it && it.guid === guid) return { item: it, parent: parent || null };
-      if (it && it.children && it.children.length) { const f = this._findWithParent(it.children, guid, it); if (f) return f; }
+      if (!it || seen.has(it.guid)) continue;
+      seen.add(it.guid);
+      if (it.guid === guid) return { item: it, parent: parent || null };
+      if (it.children && it.children.length) { const f = this._findWithParent(it.children, guid, it, seen); if (f) return f; }
     }
     return null;
   }
+
 
   // Synchronously work out which reference (if any) is selected on the current
   // line, and its target. No async (no getLineItems) so the keydown handler can
@@ -1643,7 +1647,7 @@ class Plugin extends AppPlugin {
       if (!host) return this._toast("Couldn't find the page holding this search.");
       let items; try { items = await host.getLineItems(); } catch (e) { items = []; }
       const byGuid = {};
-      const idx = (arr) => { for (const it of arr || []) { if (!it) continue; byGuid[it.guid] = it; if (it.children) idx(it.children); } };
+      const idx = (arr) => { for (const it of arr || []) { if (!it || byGuid[it.guid]) continue; byGuid[it.guid] = it; if (it.children) idx(it.children); } };
       idx(items);
       const qline = byGuid[hit.queryLineGuid];
       if (!qline) return this._toast("Couldn't find the search block.");
@@ -1756,7 +1760,7 @@ class Plugin extends AppPlugin {
       if (host) {
         let hitems = null; try { hitems = await host.getLineItems(); } catch (e) {}
         const ours = [];
-        const walk = (arr) => { for (const it of arr || []) { if (!it) continue; if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.refx_at === hit.lineGuid) ours.push(it); if (it.children) walk(it.children); } };
+        const seenW = new Set(); const walk = (arr) => { for (const it of arr || []) { if (!it || seenW.has(it.guid)) continue; seenW.add(it.guid); if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.refx_at === hit.lineGuid) ours.push(it); if (it.children) walk(it.children); } };
         walk(hitems);
         for (const l of ours) await this._deleteEmbedLine(l);
       }
@@ -1808,14 +1812,21 @@ class Plugin extends AppPlugin {
   }
 
   // Find a line ANYWHERE in a getLineItems() tree (items.find is top-level only).
-  _findLineDeep(items, guid) {
+  // EVERY walk of getLineItems() children carries a `seen` set: the SDK's child lists can form a
+  // RING (his "Reference Extravanganza" page, 2026-11-16: two tasks each listed the other as a child,
+  // a stale child list after a move). Without it the walk recursed until the stack overflowed, the
+  // async command died without a word, and Cmd+Down did nothing on that page.
+  _findLineDeep(items, guid, seen) {
+    seen = seen || new Set();
     for (const it of items || []) {
-      if (!it) continue;
+      if (!it || seen.has(it.guid)) continue;
+      seen.add(it.guid);
       if (it.guid === guid) return it;
-      if (it.children) { const r = this._findLineDeep(it.children, guid); if (r) return r; }
+      if (it.children) { const r = this._findLineDeep(it.children, guid, seen); if (r) return r; }
     }
     return null;
   }
+
 
   // Our transclusion children of `block` that target `targetGuid`.
   _findEmbeds(block, targetGuid) {
@@ -1827,7 +1838,7 @@ class Plugin extends AppPlugin {
   // ancestors (or the line itself).
   _enclosingEmbed(items, lineGuid) {
     const byGuid = {};
-    const index = (arr) => { for (const it of arr || []) { if (!it) continue; byGuid[it.guid] = it; if (it.children) index(it.children); } };
+    const index = (arr) => { for (const it of arr || []) { if (!it || byGuid[it.guid]) continue; byGuid[it.guid] = it; if (it.children) index(it.children); } };
     index(items);
     let cur = byGuid[lineGuid], guard = 0;
     while (cur && guard++ < 300) {
@@ -1958,7 +1969,7 @@ class Plugin extends AppPlugin {
     if (!rec) return this._toast("Open a page first.");
     let items; try { items = await rec.getLineItems(); } catch (e) { return; }
     const all = [];
-    const walk = (arr) => { for (const it of arr || []) { if (!it) continue; if (it.type === "transclusion" && it.props && it.props.refx_embed) all.push(it); if (it.children) walk(it.children); } };
+    const seenW = new Set(); const walk = (arr) => { for (const it of arr || []) { if (!it || seenW.has(it.guid)) continue; seenW.add(it.guid); if (it.type === "transclusion" && it.props && it.props.refx_embed) all.push(it); if (it.children) walk(it.children); } };
     walk(items);
     if (!all.length) return this._toast("No embeds on this page.");
     for (const l of all) await this._deleteEmbedLine(l);
@@ -2577,9 +2588,9 @@ class Plugin extends AppPlugin {
     for (const p of panels) { let r = null; try { r = p.getActiveRecord && p.getActiveRecord(); } catch (e) {} if (r) recs.push(r); }
     if (!recs.length) { const r = this._activeRecord(); if (r) recs.push(r); }
     const found = new Map(), foundQ = new Map(), foundL = new Map();
-    const walk = (arr) => {
+    const seenW = new Set(); const walk = (arr) => {
       for (const it of arr || []) {
-        if (!it) continue;
+        if (!it || seenW.has(it.guid)) continue; seenW.add(it.guid);
         // Keep the walked ITEM (not just the target guid): _collapseAtCaret's DOM
         // fallback needs entry.line, and entries created here without it made
         // Cmd+Up from inside a discover-adopted embed a swallowed dead key.
@@ -2641,9 +2652,9 @@ class Plugin extends AppPlugin {
     for (const p of panels) { let r = null; try { r = p.getActiveRecord && p.getActiveRecord(); } catch (e) {} if (r) recs.push(r); }
     if (!recs.length) { const r = this._activeRecord(); if (r) recs.push(r); }
     const seen = new Set();
-    const walk = (arr) => {
+    const seenW = new Set(); const walk = (arr) => {
       for (const it of arr || []) {
-        if (!it) continue;
+        if (!it || seenW.has(it.guid)) continue; seenW.add(it.guid);
         if (it.type === "transclusion" && it.props && it.props.refx_embed && it.props.itemref && this.data.getRecord(it.props.itemref)) {
           this._cards.set(it.guid, { recordGuid: it.props.itemref, line: it });
         }
